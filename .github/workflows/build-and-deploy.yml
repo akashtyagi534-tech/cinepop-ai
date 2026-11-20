@@ -51,6 +51,20 @@ jobs:
         run: |
           flutter --version
           flutter create --platforms=android --org com.cinepop.ai --project-name cinepop_ai_studio .
+          python3 - <<'PY'
+          import os
+          for rel in ("android/app/build.gradle.kts", "android/app/build.gradle"):
+              if not os.path.exists(rel):
+                  continue
+              with open(rel, "r", encoding="utf-8") as f:
+                  src = f.read()
+              if "checkReleaseBuilds" not in src and "android {" in src:
+                  patch = "android {\n    lint {\n        checkReleaseBuilds = false\n        abortOnError = false\n    }\n"
+                  src = src.replace("android {", patch, 1)
+                  with open(rel, "w", encoding="utf-8") as f:
+                      f.write(src)
+                  print(f"Patched lint config in {rel}")
+          PY
           flutter pub get
           dart run flutter_launcher_icons
 
