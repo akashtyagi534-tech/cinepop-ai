@@ -42,7 +42,7 @@ app.add_middleware(
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "akashtyagi534@gmail.com").lower().strip()
-ADMIN_PIN = os.getenv("ADMIN_PIN", "826904").strip()
+ADMIN_PIN = os.getenv("ADMIN_PIN", "143200").strip()
 UPI_ID = os.getenv("UPI_ID", "8269045143@ybl")
 MOVIE_PRICE_INR = int(os.getenv("MOVIE_PRICE_INR", "50"))
 
@@ -177,6 +177,31 @@ def detect_sfx_type(text: str, location_key: str = "", mood: str = "Action") -> 
     if mood == "Suspense":
         return "footsteps"
     return "none"
+
+
+def build_visual_action_prompt(
+    character: str,
+    dialogue: str,
+    location: str,
+    mood: str = "Action",
+    sfx: str = "none",
+) -> str:
+    clean_loc = (location or "dramatic Bollywood cinema set").strip()
+    if sfx in ("explosion", "punch", "sword"):
+        motion = "high-impact handheld camera shake, fiery sparks flying, kinetic combat motion, dust shockwave"
+    elif sfx in ("rain", "thunder"):
+        motion = "heavy monsoon storm rain splashing, lightning flashes, fast tracking camera through wet street"
+    elif mood == "Action":
+        motion = "character sprinting and charging forward with fierce expression, fast tracking camera, cinematic speed blur"
+    elif mood == "Suspense":
+        motion = "slow creeping dolly-in camera, flickering neon rim lights, drifting fog and dramatic shadows"
+    elif mood == "Comedy":
+        motion = "snappy whip-pan reaction shot, expressive comic energy, vibrant warm Bollywood studio lighting"
+    elif mood == "Romantic":
+        motion = "dreamy sweeping camera tracking, golden hour lens flare, glowing floating bokeh particles"
+    else:
+        motion = "dramatic cinematic push-in close-up, expressive eyes, atmospheric rim lighting, anamorphic film look"
+    return f"Cinematic Bollywood action movie shot of {character} in {clean_loc}, {motion}, 4K film grain, dynamic camera movement"
 
 
 def make_referral_code(email: str) -> str:
@@ -316,6 +341,7 @@ def home():
         "status": "100% Live",
         "gemini_configured": bool(GEMINI_API_KEY),
         "opencv_faceswap": OPENCV_AVAILABLE,
+        "video_engine": "LTX-Video / CogVideoX-5B / SVD + FFmpeg Pro Motion VFX",
         "admin_pin_enabled": True,
         "price_per_movie": f"₹{MOVIE_PRICE_INR}",
     }
@@ -1268,6 +1294,330 @@ def _probe_audio_duration(audio_path: str) -> float:
         return 4.0
 
 
+def _extract_gradio_video_path(res) -> Optional[str]:
+    if isinstance(res, str) and os.path.exists(res):
+        return res
+    if isinstance(res, dict):
+        for k in ("video", "path", "url"):
+            v = res.get(k)
+            if isinstance(v, str) and os.path.exists(v):
+                return v
+    if isinstance(res, (list, tuple)):
+        for item in res:
+            found = _extract_gradio_video_path(item)
+            if found:
+                return found
+    return None
+
+
+def _try_ai_action_i2v_spaces(
+    raw_img_path: str,
+    visual_action_prompt: str,
+    mood: str,
+) -> Optional[str]:
+    """
+    Attempt real Image-to-Video motion clip generation using free HuggingFace Spaces:
+    LTX-Video -> CogVideoX-5B -> Stable Video Diffusion (SVD).
+    Returns local path to generated MP4 if available, else None (fast fallback to FFmpeg Pro Motion VFX).
+    """
+    prompt_txt = (
+        visual_action_prompt.strip()
+        if visual_action_prompt and visual_action_prompt.strip()
+        else f"Cinematic Bollywood {mood} scene, dynamic tracking camera movement, realistic lighting"
+    )
+    i2v_spaces = [
+        ("Lightricks/ltx-video-distilled", "ltx"),
+        ("THUDM/CogVideoX-5B-Space", "cogvideo"),
+        ("multimodalart/stable-video-diffusion", "svd"),
+    ]
+    for space_id, kind in i2v_spaces:
+        try:
+            hf_client = Client(space_id)
+            if kind == "ltx":
+                res = hf_client.predict(
+                    prompt=prompt_txt,
+                    negative_prompt="static image, blurry, distorted face, low quality",
+                    input_image_filepath=handle_file(raw_img_path),
+                    api_name="/image_to_video",
+                )
+            elif kind == "cogvideo":
+                res = hf_client.predict(
+                    prompt=prompt_txt,
+                    image_input=handle_file(raw_img_path),
+                    api_name="/generate",
+                )
+            else:
+                res = hf_client.predict(
+                    image=handle_file(raw_img_path),
+                    seed=random.randint(1, 99999),
+                    randomize_seed=True,
+                    motion_bucket_id=145 if mood == "Action" else 110,
+                    fps_id=8,
+                    api_name="/video",
+                )
+            vid_path = _extract_gradio_video_path(res)
+            if vid_path and os.path.getsize(vid_path) > 2000:
+                return vid_path
+        except Exception:
+            continue
+    return None
+
+
+def _render_pro_motion_vfx_clip(
+    framed_img_path: str,
+    final_audio: str,
+    out_mp4: str,
+    mood: str = "Action",
+    sfx_type: str = "none",
+) -> bool:
+    """
+    High-Octane FFmpeg + OpenCV Pro Motion & VFX Engine (ZERO static still frames):
+    - Smooth zoompan camera tracking & directional dolly
+    - Camera shake / impact jitter on Action / punch / explosion / thunder / sword
+    - Radial action speed lines, dynamic lighting flashes, and glowing particle overlays
+    """
+    dur = _probe_audio_duration(final_audio)
+    fps = 24
+    total_frames = max(36, int(dur * fps))
+    high_impact = (
+        mood == "Action"
+        or sfx_type in ("punch", "explosion", "thunder", "sword")
+    )
+
+    # Path A: OpenCV real-time animated VFX compositor (camera tracking + shake + speed lines + particles + dynamic lighting)
+    if OPENCV_AVAILABLE and cv2 is not None and np is not None:
+        raw_vfx_mp4 = f"{out_mp4}_vfx_raw.mp4"
+        try:
+            base = cv2.imread(framed_img_path)
+            if base is not None:
+                h_out, w_out = 720, 1280
+                # Oversample source for smooth camera tracking & shake without black borders
+                src = cv2.resize(base, (1536, 864), interpolation=cv2.INTER_LINEAR)
+                sh, sw = src.shape[:2]
+
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(raw_vfx_mp4, fourcc, fps, (w_out, h_out))
+
+                rng = random.Random(hash(framed_img_path) & 0xFFFFFFFF)
+                # Pre-seed particles (embers/sparks for Action, rain streaks for Rain, glowing bokeh for Romantic/Comedy)
+                particles = [
+                    {
+                        "x": rng.uniform(0, w_out),
+                        "y": rng.uniform(0, h_out),
+                        "vx": rng.uniform(-7.5, -2.5) if sfx_type in ("rain", "thunder") else rng.uniform(-3.0, 3.0),
+                        "vy": rng.uniform(16.0, 26.0) if sfx_type in ("rain", "thunder") else rng.uniform(-4.2, -1.2),
+                        "r": rng.randint(2, 5),
+                        "phase": rng.uniform(0, 6.28),
+                    }
+                    for _ in range(55 if high_impact or sfx_type in ("rain", "thunder") else 28)
+                ]
+
+                for f_idx in range(total_frames):
+                    t = f_idx / max(1, total_frames - 1)
+                    # 1. Mood-aware smooth camera tracking zoom + pan
+                    if mood == "Action":
+                        zoom = 1.04 + 0.14 * t + 0.015 * math.sin(f_idx * 0.45)
+                        pan_x = math.sin(t * math.pi * 1.4) * 44.0
+                        pan_y = math.cos(t * math.pi * 1.1) * 18.0
+                    elif mood == "Suspense":
+                        zoom = 1.02 + 0.11 * t
+                        pan_x = math.sin(t * math.pi) * 28.0
+                        pan_y = -14.0 * t
+                    elif mood == "Comedy":
+                        zoom = 1.04 + 0.05 * abs(math.sin(f_idx * 0.16))
+                        pan_x = math.sin(f_idx * 0.14) * 32.0
+                        pan_y = math.cos(f_idx * 0.12) * 10.0
+                    elif mood == "Romantic":
+                        zoom = 1.03 + 0.09 * t
+                        pan_x = -34.0 + 68.0 * t
+                        pan_y = math.sin(t * math.pi) * 14.0
+                    else:
+                        zoom = 1.03 + 0.10 * t
+                        pan_x = math.sin(t * math.pi * 0.8) * 22.0
+                        pan_y = -10.0 * t
+
+                    # 2. Camera shake / impact burst on high-impact moments
+                    shake_x = 0.0
+                    shake_y = 0.0
+                    if high_impact:
+                        burst = 1.0 if (f_idx % 24) < 7 else 0.35
+                        amp = (13.0 if sfx_type in ("explosion", "punch") else 7.5) * burst
+                        shake_x = math.sin(f_idx * 1.9) * amp
+                        shake_y = math.cos(f_idx * 2.3) * (amp * 0.72)
+
+                    crop_w = int(sw / zoom)
+                    crop_h = int(sh / zoom)
+                    cx = int(sw / 2 + pan_x + shake_x)
+                    cy = int(sh / 2 + pan_y + shake_y)
+                    x1 = max(0, min(sw - crop_w, cx - crop_w // 2))
+                    y1 = max(0, min(sh - crop_h, cy - crop_h // 2))
+                    frame = cv2.resize(
+                        src[y1 : y1 + crop_h, x1 : x1 + crop_w],
+                        (w_out, h_out),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+
+                    # 3. Dynamic lighting & storm / impact flash modulation
+                    light_boost = 1.0
+                    if sfx_type == "thunder" and (f_idx % 38) in (2, 3, 5):
+                        light_boost = 1.32
+                    elif sfx_type in ("explosion", "punch") and (f_idx % 28) in (1, 2):
+                        light_boost = 1.24
+                    elif mood == "Action":
+                        light_boost = 1.04 + 0.04 * math.sin(f_idx * 0.3)
+
+                    if abs(light_boost - 1.0) > 0.01:
+                        frame = cv2.convertScaleAbs(frame, alpha=light_boost, beta=4 if light_boost > 1.15 else 0)
+
+                    # 4. Speed lines overlay (Action / combat energy)
+                    if high_impact:
+                        overlay = frame.copy()
+                        cx_o, cy_o = w_out // 2, int(h_out * 0.44)
+                        num_lines = 26
+                        for k in range(num_lines):
+                            ang = (k / num_lines) * 2.0 * math.pi + (f_idx * 0.05)
+                            r_in = 340 + int(45 * math.sin(f_idx * 0.4 + k))
+                            r_out = 760
+                            p1 = (int(cx_o + math.cos(ang) * r_in), int(cy_o + math.sin(ang) * r_in))
+                            p2 = (int(cx_o + math.cos(ang) * r_out), int(cy_o + math.sin(ang) * r_out))
+                            line_col = (120, 210, 255) if k % 2 == 0 else (90, 80, 255)
+                            cv2.line(overlay, p1, p2, line_col, 2, cv2.LINE_AA)
+                        cv2.addWeighted(overlay, 0.24, frame, 0.76, 0, frame)
+
+                    # 5. Cinematic particles overlay (sparks, rain, bokeh, suspense dust)
+                    p_overlay = frame.copy()
+                    for p in particles:
+                        p["x"] = (p["x"] + p["vx"]) % w_out
+                        p["y"] = (p["y"] + p["vy"]) % h_out
+                        px, py = int(p["x"]), int(p["y"])
+                        if sfx_type in ("rain", "thunder"):
+                            cv2.line(
+                                p_overlay,
+                                (px, py),
+                                (px - 8, py + 24),
+                                (245, 225, 195),
+                                1,
+                                cv2.LINE_AA,
+                            )
+                        elif high_impact:
+                            # Glowing fiery orange/gold sparks
+                            col = (60, 175, 255) if p["r"] > 3 else (90, 225, 255)
+                            cv2.circle(p_overlay, (px, py), p["r"], col, -1, cv2.LINE_AA)
+                        elif mood in ("Romantic", "Comedy"):
+                            # Warm golden/pink bokeh
+                            col = (180, 130, 255) if p["r"] % 2 == 0 else (110, 220, 255)
+                            cv2.circle(p_overlay, (px, py), p["r"] + 2, col, -1, cv2.LINE_AA)
+                        else:
+                            # Atmospheric cyan/silver dust motes
+                            cv2.circle(p_overlay, (px, py), max(2, p["r"] - 1), (220, 210, 170), -1, cv2.LINE_AA)
+                    cv2.addWeighted(p_overlay, 0.38, frame, 0.62, 0, frame)
+
+                    writer.write(frame)
+
+                writer.release()
+
+                if os.path.exists(raw_vfx_mp4) and os.path.getsize(raw_vfx_mp4) > 2000:
+                    subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-i",
+                            raw_vfx_mp4,
+                            "-i",
+                            final_audio,
+                            "-map",
+                            "0:v:0",
+                            "-map",
+                            "1:a:0",
+                            "-shortest",
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "veryfast",
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-crf",
+                            "25",
+                            "-c:a",
+                            "aac",
+                            "-ar",
+                            "44100",
+                            "-b:a",
+                            "96k",
+                            out_mp4,
+                        ],
+                        check=True,
+                        timeout=60,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000:
+                        return True
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(raw_vfx_mp4):
+                try:
+                    os.remove(raw_vfx_mp4)
+                except Exception:
+                    pass
+
+    # Path B: Pure FFmpeg Pro Motion filtergraph (zoompan camera tracking + camera shake + dynamic lighting EQ)
+    shake_expr_x = (
+        "iw/2-(iw/zoom/2)+sin(on*1.7)*14"
+        if high_impact
+        else "iw/2-(iw/zoom/2)+sin(on*0.09)*22"
+    )
+    shake_expr_y = (
+        "ih/2-(ih/zoom/2)+cos(on*2.1)*10"
+        if high_impact
+        else "ih/2-(ih/zoom/2)+cos(on*0.07)*10"
+    )
+    zoom_rate = "0.0018" if high_impact else "0.0010"
+    zoom_cap = "1.16" if high_impact else "1.10"
+    vf = (
+        f"scale=1536:864,"
+        f"zoompan=z='min(zoom+{zoom_rate},{zoom_cap})':x='{shake_expr_x}':y='{shake_expr_y}':d={total_frames}:s=1280x720:fps={fps},"
+        f"eq=contrast=1.08:saturation=1.15:brightness=0.02,"
+        f"vignette=PI/5"
+    )
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loop",
+            "1",
+            "-i",
+            framed_img_path,
+            "-i",
+            final_audio,
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-shortest",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "25",
+            "-c:a",
+            "aac",
+            "-ar",
+            "44100",
+            "-b:a",
+            "96k",
+            out_mp4,
+        ],
+        check=True,
+        timeout=60,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000
+
+
 def render_exact_face_clip(
     raw_img_path: str,
     framed_img_path: str,
@@ -1275,11 +1625,64 @@ def render_exact_face_clip(
     out_mp4: str,
     mood: str = "Action",
     sfx_type: str = "none",
+    visual_action_prompt: str = "",
 ):
     mixed_tmp = f"{out_mp4}_mix.mp3"
     final_audio = mix_cinematic_audio(audio_path, mood, sfx_type, mixed_tmp)
 
     try:
+        # 1. Try Real AI Action Image-to-Video (LTX-Video / CogVideoX-5B / SVD)
+        ai_video_path = _try_ai_action_i2v_spaces(
+            raw_img_path, visual_action_prompt, mood
+        )
+        if ai_video_path:
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-stream_loop",
+                        "-1",
+                        "-i",
+                        ai_video_path,
+                        "-i",
+                        final_audio,
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a:0",
+                        "-vf",
+                        "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,eq=contrast=1.06:saturation=1.12,vignette=PI/5",
+                        "-r",
+                        "24",
+                        "-shortest",
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "veryfast",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-crf",
+                        "25",
+                        "-c:a",
+                        "aac",
+                        "-ar",
+                        "44100",
+                        "-b:a",
+                        "96k",
+                        out_mp4,
+                    ],
+                    check=True,
+                    timeout=45,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000:
+                    return
+            except Exception:
+                pass
+
+        # 2. Try Talking-Face AI Lip-Sync Spaces (Wav2Lip / SadTalker) for close-up dialogues
         hf_mirrors = ["camenduru/Wav2Lip", "vinthony/SadTalker"]
         for mirror in hf_mirrors:
             try:
@@ -1295,19 +1698,22 @@ def render_exact_face_clip(
                         source_image=handle_file(raw_img_path),
                         driven_audio=handle_file(audio_path),
                         preprocess="crop",
-                        still_mode=True,
+                        still_mode=False,
                         use_enhancer=False,
                         batch_size=1,
                         size_of_image=256,
                         pose_style=0,
                         api_name="/test",
                     )
+                talk_vid = _extract_gradio_video_path(res)
+                if not talk_vid:
+                    continue
                 subprocess.run(
                     [
                         "ffmpeg",
                         "-y",
                         "-i",
-                        res,
+                        talk_vid,
                         "-i",
                         final_audio,
                         "-map",
@@ -1324,7 +1730,7 @@ def render_exact_face_clip(
                         "-preset",
                         "veryfast",
                         "-crf",
-                        "26",
+                        "25",
                         "-c:a",
                         "aac",
                         "-ar",
@@ -1334,7 +1740,7 @@ def render_exact_face_clip(
                         out_mp4,
                     ],
                     check=True,
-                    timeout=30,
+                    timeout=35,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
@@ -1343,82 +1749,9 @@ def render_exact_face_clip(
             except Exception:
                 continue
 
-        # Dynamic Ken Burns camera zoom & pan motion over our real cinematic scene frame
-        dur = _probe_audio_duration(final_audio)
-        frames = max(36, int(dur * 24))
-        try:
-            subprocess.run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-loop",
-                    "1",
-                    "-i",
-                    framed_img_path,
-                    "-i",
-                    final_audio,
-                    "-vf",
-                    f"scale=1440:810,zoompan=z='min(zoom+0.0007,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1280x720:fps=24",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-shortest",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-crf",
-                    "26",
-                    "-c:a",
-                    "aac",
-                    "-ar",
-                    "44100",
-                    "-b:a",
-                    "96k",
-                    out_mp4,
-                ],
-                check=True,
-                timeout=45,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000:
-                return
-        except Exception:
-            pass
-
-        # Fallback fast still-image mux
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-loop",
-                "1",
-                "-i",
-                framed_img_path,
-                "-i",
-                final_audio,
-                "-c:v",
-                "libx264",
-                "-tune",
-                "stillimage",
-                "-shortest",
-                "-r",
-                "24",
-                "-pix_fmt",
-                "yuv420p",
-                "-crf",
-                "26",
-                "-c:a",
-                "aac",
-                "-ar",
-                "44100",
-                "-b:a",
-                "96k",
-                out_mp4,
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        # 3. High-Octane FFmpeg + OpenCV Pro Motion & VFX Engine (Camera tracking + shake + speed lines + particles + dynamic lighting — ZERO static stills!)
+        _render_pro_motion_vfx_clip(
+            framed_img_path, final_audio, out_mp4, mood=mood, sfx_type=sfx_type
         )
     finally:
         if os.path.exists(mixed_tmp):
@@ -1517,6 +1850,7 @@ def parse_manual_script_lines(
                 char_names[len(parsed) % len(char_names)],
             )
             loc_key, loc_label = detect_location_meta(diag, cur_loc_label)
+            sfx_val = detect_sfx_type(diag, loc_key, cur_mood)
             parsed.append(
                 {
                     "character": matched,
@@ -1524,6 +1858,10 @@ def parse_manual_script_lines(
                     "location": loc_label,
                     "location_key": loc_key,
                     "mood": cur_mood,
+                    "sfx": sfx_val,
+                    "visual_action_prompt": build_visual_action_prompt(
+                        matched, diag, loc_label, cur_mood, sfx_val
+                    ),
                 }
             )
     return parsed
@@ -1649,6 +1987,14 @@ async def autonomous_movie_worker(project_id: str):
                         "location": loc_l,
                         "location_key": loc_k,
                         "mood": default_mood,
+                        "sfx": detect_sfx_type(ch["plot"], loc_k, default_mood),
+                        "visual_action_prompt": build_visual_action_prompt(
+                            char_names[i % len(char_names)],
+                            ch["plot"],
+                            loc_l,
+                            default_mood,
+                            detect_sfx_type(ch["plot"], loc_k, default_mood),
+                        ),
                     }
                     for i in range(15)
                 ]
@@ -1661,8 +2007,8 @@ async def autonomous_movie_worker(project_id: str):
                         कैरेक्टर्स: {char_names}
                         भाषा / Dialect: {language} (सभी डायलॉग्स असली {language} अंदाज़ और बोलचाल में लिखो!)
                         इस चैप्टर के लिए 50 से 60 दमदार {language} डायलॉग्स लिखो ताकि 10 मिनट का सीन बने।
-                        हर डायलॉग के साथ उसकी रियल लोकेशन (location: जैसे Gaon ka Khet, Purani Haveli, Mumbai ki Barish, Deep Jungle, Police Station, Outer Space, Royal Palace), mood (Action, Emotional, Suspense, Comedy, Romantic), और sfx (none, rain, thunder, punch, explosion, sword, footsteps) भी दो।
-                        सिर्फ JSON लिस्ट दो: [{{"character": "{char_names[0]}", "dialogue": "डायलॉग...", "location": "Mumbai ki Barish", "mood": "{default_mood}", "sfx": "rain"}}]
+                        हर डायलॉग के साथ उसकी रियल लोकेशन (location: जैसे Gaon ka Khet, Purani Haveli, Mumbai ki Barish, Deep Jungle, Police Station, Outer Space, Royal Palace), mood (Action, Emotional, Suspense, Comedy, Romantic), sfx (none, rain, thunder, punch, explosion, sword, footsteps), और हाई-ऑक्टेन English visual_action_prompt (जैसे: "character running through stormy street, camera tracking, sparks flying") भी दो।
+                        सिर्फ JSON लिस्ट दो: [{{"character": "{char_names[0]}", "dialogue": "डायलॉग...", "location": "Mumbai ki Barish", "mood": "{default_mood}", "sfx": "rain", "visual_action_prompt": "hero running through stormy Mumbai street, fast tracking camera, sparks and rain"}}]
                         """
                         s_res = client.models.generate_content(
                             model="gemini-2.5-flash", contents=script_prompt
@@ -1683,6 +2029,9 @@ async def autonomous_movie_worker(project_id: str):
                             mood_val = normalize_mood(item.get("mood", ""), default_mood)
                             raw_sfx = str(item.get("sfx", "")).lower().strip()
                             sfx_val = raw_sfx if raw_sfx in ALLOWED_SFX else detect_sfx_type(diag_text, lk, mood_val)
+                            vap = str(item.get("visual_action_prompt", "")).strip() or build_visual_action_prompt(
+                                c_name, diag_text, ll, mood_val, sfx_val
+                            )
                             dialogues.append(
                                 {
                                     "character": c_name,
@@ -1691,6 +2040,7 @@ async def autonomous_movie_worker(project_id: str):
                                     "location_key": lk,
                                     "mood": mood_val,
                                     "sfx": sfx_val,
+                                    "visual_action_prompt": vap,
                                 }
                             )
                     except Exception:
@@ -1713,6 +2063,9 @@ async def autonomous_movie_worker(project_id: str):
                 loc_label = d.get("location") or default_location or "Mumbai City Street"
                 scene_mood = normalize_mood(d.get("mood", ""), default_mood)
                 scene_sfx = d.get("sfx") if d.get("sfx") in ALLOWED_SFX else detect_sfx_type(diag_text, loc_key, scene_mood)
+                action_prompt = d.get("visual_action_prompt") or build_visual_action_prompt(
+                    c_name, diag_text, loc_label, scene_mood, scene_sfx
+                )
                 bg_override = d.get("bg_path") or project_custom_bg
                 char_pitch = char_map[c_name].get("pitch", "normal")
 
@@ -1749,6 +2102,7 @@ async def autonomous_movie_worker(project_id: str):
                         v_file,
                         scene_mood,
                         scene_sfx,
+                        action_prompt,
                     )
                     if os.path.exists(a_file):
                         os.remove(a_file)
@@ -2022,6 +2376,14 @@ async def edit_scene(
         v_file,
         scene_mood,
         scene_sfx,
+        old_item.get("visual_action_prompt")
+        or build_visual_action_prompt(
+            char_name,
+            new_dialogue,
+            old_item.get("location", "Mumbai City Street"),
+            scene_mood,
+            scene_sfx,
+        ),
     )
     if os.path.exists(a_file):
         os.remove(a_file)
@@ -2054,6 +2416,7 @@ async def customize_scene(
     location_key: str = Form(""),
     mood: str = Form("Action"),
     sfx: str = Form(""),
+    visual_action_prompt: str = Form(""),
     clear_bg: str = Form("false"),
     bg_image: Optional[UploadFile] = File(None),
 ):
@@ -2083,6 +2446,16 @@ async def customize_scene(
     item["mood"] = normalize_mood(mood, item.get("mood", "Action"))
     if sfx.strip().lower() in ALLOWED_SFX:
         item["sfx"] = sfx.strip().lower()
+    if visual_action_prompt.strip():
+        item["visual_action_prompt"] = visual_action_prompt.strip()[:260]
+    elif not item.get("visual_action_prompt"):
+        item["visual_action_prompt"] = build_visual_action_prompt(
+            char_name,
+            item["dialogue"],
+            item.get("location", "Cinematic Set"),
+            item["mood"],
+            item.get("sfx", "none"),
+        )
 
     if clear_bg.lower() == "true":
         item.pop("bg_path", None)
@@ -2133,6 +2506,7 @@ async def customize_scene(
         v_file,
         scene_mood,
         scene_sfx,
+        item.get("visual_action_prompt", ""),
     )
     if os.path.exists(a_file):
         os.remove(a_file)
@@ -2260,6 +2634,7 @@ async def _dub_project_worker(project_id: str, target_language: str):
                     v_file,
                     scene_mood,
                     scene_sfx,
+                    d.get("visual_action_prompt", ""),
                 )
                 for p in (a_file, f_img):
                     if os.path.exists(p):
