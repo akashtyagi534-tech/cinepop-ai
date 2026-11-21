@@ -42,6 +42,7 @@ jobs:
           TARGET_URL="${RAILWAY_URL_INPUT:-$RAILWAY_URL_SECRET}"
           if [ -n "$TARGET_URL" ]; then
             TARGET_URL="${TARGET_URL%/}"
+            sed -i "s|https://cinepop-ai-production.up.railway.app|${TARGET_URL}|g" lib/main.dart
             sed -i "s|https://YOUR-RAILWAY-APP.up.railway.app|${TARGET_URL}|g" lib/main.dart
             echo "Injected Railway URL into Flutter app."
           fi
