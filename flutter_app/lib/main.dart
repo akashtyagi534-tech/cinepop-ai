@@ -45,7 +45,9 @@ class CinePopHome extends StatefulWidget {
 }
 
 class _CinePopHomeState extends State<CinePopHome> {
-  String serverUrl = "https://YOUR-RAILWAY-APP.up.railway.app";
+  static const String _defaultRailwayUrl =
+      "https://cinepop-ai-production.up.railway.app";
+  String serverUrl = _defaultRailwayUrl;
   bool isServerOnline = false;
   final GoogleSignIn _googleSignIn = GoogleSignIn(scopes: ['email', 'profile']);
 
@@ -197,8 +199,13 @@ class _CinePopHomeState extends State<CinePopHome> {
   Future<void> _initApp() async {
     final prefs = await SharedPreferences.getInstance();
     final savedUrl = prefs.getString('server_url');
-    if (savedUrl != null && savedUrl.isNotEmpty) {
+    if (savedUrl != null &&
+        savedUrl.isNotEmpty &&
+        !savedUrl.contains('YOUR-RAILWAY-APP')) {
       serverUrl = savedUrl;
+    } else {
+      serverUrl = _defaultRailwayUrl;
+      await prefs.setString('server_url', serverUrl);
     }
     serverController.text = serverUrl;
     await _checkServerHealth();
@@ -1298,6 +1305,9 @@ class _CinePopHomeState extends State<CinePopHome> {
     String chosenSfx = "none";
     TextEditingController locNameCtrl =
         TextEditingController(text: "Mumbai ki Barish");
+    TextEditingController actionPromptCtrl = TextEditingController(
+      text: "character running through stormy street, fast tracking camera, sparks flying",
+    );
     File? pickedBg;
 
     await showDialog(
@@ -1411,6 +1421,15 @@ class _CinePopHomeState extends State<CinePopHome> {
                         .toList(),
                     onChanged: (val) => setModalState(() => chosenSfx = val!),
                   ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: actionPromptCtrl,
+                    decoration: const InputDecoration(
+                      labelText: "AI Motion Prompt (LTX-Video / Pro VFX)",
+                      hintText: "e.g. hero charging in rain, camera tracking",
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
                   const SizedBox(height: 10),
                   OutlinedButton.icon(
                     onPressed: () async {
@@ -1460,6 +1479,10 @@ class _CinePopHomeState extends State<CinePopHome> {
                   req.fields['location'] = locNameCtrl.text.trim();
                   req.fields['mood'] = chosenMood;
                   req.fields['sfx'] = chosenSfx;
+                  if (actionPromptCtrl.text.trim().isNotEmpty) {
+                    req.fields['visual_action_prompt'] =
+                        actionPromptCtrl.text.trim();
+                  }
                   if (pickedBg != null) {
                     req.files.add(
                       await http.MultipartFile.fromPath(
