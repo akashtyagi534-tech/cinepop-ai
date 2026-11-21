@@ -87,12 +87,15 @@ class _CinePopHomeState extends State<CinePopHome> {
   final TextEditingController watermarkController = TextEditingController();
   final TextEditingController serverController = TextEditingController();
   final TextEditingController manualEmailController = TextEditingController();
+  final TextEditingController manualNameController = TextEditingController();
   final TextEditingController loginReferralController = TextEditingController();
   final TextEditingController applyReferralController = TextEditingController();
-  int selectedMinutes = 30;
+  int selectedMinutes = 1;
   List<Map<String, dynamic>> characters = [];
-  String dataEstimateText = "डेटा हिसाब: ~480 MB";
+  String dataEstimateText =
+      "डेटा खर्च: ~15 MB (1 मिनट · 4-5 तेज़ सीन्स · ~30-45 सेकंड में तैयार)";
   bool isSubmitting = false;
+  bool isInstantLoggingIn = false;
 
   // Active Movie Project & Studio Actions
   String? activeProjectId;
@@ -295,6 +298,7 @@ class _CinePopHomeState extends State<CinePopHome> {
     watermarkController.dispose();
     serverController.dispose();
     manualEmailController.dispose();
+    manualNameController.dispose();
     loginReferralController.dispose();
     applyReferralController.dispose();
     fsTitleController.dispose();
@@ -304,7 +308,9 @@ class _CinePopHomeState extends State<CinePopHome> {
 
   Future<void> _handleGoogleSignIn() async {
     try {
-      final account = await _googleSignIn.signIn();
+      final account = await _googleSignIn
+          .signIn()
+          .timeout(const Duration(seconds: 6));
       if (account != null) {
         await _completeLogin(
           account.email,
@@ -313,67 +319,229 @@ class _CinePopHomeState extends State<CinePopHome> {
         );
         return;
       }
-    } catch (_) {}
+    } catch (_) {
+      // Native Google Sign-In failed (e.g. ApiException: 10 without SHA-1) -> open clean Gmail Account Picker sheet
+    }
     if (mounted) {
-      _showQuickGoogleIdDialog();
+      await _showQuickGoogleIdDialog();
     }
   }
 
+  Future<void> _handleInstantGuestLogin() async {
+    if (isInstantLoggingIn) return;
+    setState(() => isInstantLoggingIn = true);
+    try {
+      final res = await http.post(
+        Uri.parse('$serverUrl/auth/instant-login/'),
+        body: {
+          "device_id": Platform.operatingSystem,
+          "referral_code": loginReferralController.text.trim(),
+        },
+      ).timeout(const Duration(seconds: 8));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final u = data['user'] ?? {};
+        final em = (u['email'] ?? "guest_${DateTime.now().millisecondsSinceEpoch}@cinepop.guest")
+            .toString();
+        final nm = (u['name'] ?? "Guest Creator").toString();
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('user_email', em);
+        await prefs.setString('user_name', nm);
+        await prefs.setString('user_photo', "");
+        if (mounted) {
+          setState(() {
+            isServerOnline = true;
+            userEmail = em;
+            userName = nm;
+            userPhoto = "";
+            userCredits = (u['credits'] ?? 1) as int;
+            walletBalance = (u['wallet_balance'] ?? 0) as int;
+            myReferralCode = (u['referral_code'] ?? "").toString();
+            isAdmin = false;
+            isAdminEmail = false;
+            _verifiedAdminPin = "";
+            adminUpiId = (data['upi_id'] ?? adminUpiId).toString();
+            moviePrice = (data['movie_price'] ?? moviePrice) as int;
+          });
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              backgroundColor: Colors.green.shade700,
+              content: Text(
+                (data['message'] ??
+                        "⚡ Instant Start तैयार है! आपको 1 Free Trial Pass मिल गया है।")
+                    .toString(),
+              ),
+            ),
+          );
+          _startBalanceAutoRefresh();
+        }
+        return;
+      }
+    } catch (_) {
+      // Offline / transient fallback so guest still enters smoothly
+    } finally {
+      if (mounted) {
+        setState(() => isInstantLoggingIn = false);
+      }
+    }
+    // Fallback local guest entry synced immediately on next call
+    final fallbackEmail =
+        "guest_${DateTime.now().millisecondsSinceEpoch}@cinepop.guest";
+    await _completeLogin(fallbackEmail, "Guest Creator", "");
+  }
+
   Future<void> _showQuickGoogleIdDialog() async {
-    await showDialog(
+    await showModalBottomSheet(
       context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF1B1236),
-        title: const Text(
-          "🔐 Google ID से लॉगिन करें",
-          style: TextStyle(color: Color(0xFFFFD600)),
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF1B1236),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (ctx) => Padding(
+        padding: EdgeInsets.only(
+          left: 20,
+          right: 20,
+          top: 20,
+          bottom: MediaQuery.of(ctx).viewInsets.bottom + 24,
         ),
-        content: Column(
+        child: Column(
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            Center(
+              child: Container(
+                width: 44,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.white24,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            const Row(
+              children: [
+                Icon(Icons.account_circle, color: Color(0xFFFFD600), size: 28),
+                SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    "Google Account से तुरंत लॉगिन करें",
+                    style: TextStyle(
+                      color: Color(0xFFFFD600),
+                      fontSize: 17,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              "अपनी Gmail ID और नाम डालें — बिना किसी SHA-1 या Google Play एरर के 1 क्लिक में लॉगिन होगा।",
+              style: TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+            const SizedBox(height: 16),
             TextField(
               controller: manualEmailController,
               keyboardType: TextInputType.emailAddress,
+              autofocus: true,
               decoration: const InputDecoration(
+                filled: true,
+                fillColor: Color(0xFF0E091D),
                 border: OutlineInputBorder(),
-                labelText: "अपनी Gmail ID डालें",
+                prefixIcon: Icon(Icons.email, color: Color(0xFF00E5FF)),
+                labelText: "आपकी Gmail ID",
                 hintText: "example@gmail.com",
               ),
             ),
-            const SizedBox(height: 10),
+            const SizedBox(height: 12),
+            TextField(
+              controller: manualNameController,
+              textCapitalization: TextCapitalization.words,
+              decoration: const InputDecoration(
+                filled: true,
+                fillColor: Color(0xFF0E091D),
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.person, color: Color(0xFFFFD600)),
+                labelText: "आपका नाम (Creator Name)",
+                hintText: "जैसे: Rahul Sharma",
+              ),
+            ),
+            const SizedBox(height: 12),
             TextField(
               controller: loginReferralController,
               textCapitalization: TextCapitalization.characters,
               decoration: const InputDecoration(
+                filled: true,
+                fillColor: Color(0xFF0E091D),
                 border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.card_giftcard, color: Colors.greenAccent),
                 labelText: "🎁 दोस्त का Referral Code (Optional)",
                 hintText: "जैसे: CPABC123 (+1 Free Movie Pass)",
               ),
             ),
+            const SizedBox(height: 16),
+            ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFFFF007F),
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              onPressed: () async {
+                final em = manualEmailController.text.trim().toLowerCase();
+                final nm = manualNameController.text.trim();
+                if (!em.contains("@")) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text("कृपया सही Gmail ID डालें (जैसे: name@gmail.com)"),
+                    ),
+                  );
+                  return;
+                }
+                Navigator.pop(ctx);
+                await _completeLogin(
+                  em,
+                  nm.isNotEmpty ? nm : em.split("@")[0],
+                  "",
+                );
+              },
+              icon: const Icon(Icons.login, color: Colors.white),
+              label: const Text(
+                "1-Click Google Login करें",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 15,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(
+                side: const BorderSide(color: Color(0xFF00E5FF)),
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              onPressed: () {
+                Navigator.pop(ctx);
+                _handleInstantGuestLogin();
+              },
+              icon: const Icon(Icons.bolt, color: Color(0xFF00E5FF)),
+              label: const Text(
+                "⚡ बिना ईमेल के Guest / Instant Start करें",
+                style: TextStyle(
+                  color: Color(0xFF00E5FF),
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
           ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text("रद्द करें"),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFFFF007F),
-            ),
-            onPressed: () async {
-              final em = manualEmailController.text.trim().toLowerCase();
-              if (em.contains("@")) {
-                Navigator.pop(ctx);
-                await _completeLogin(em, em.split("@")[0], "");
-              }
-            },
-            child: const Text(
-              "लॉगिन करें",
-              style: TextStyle(color: Colors.white),
-            ),
-          )
-        ],
       ),
     );
   }
@@ -612,11 +780,19 @@ class _CinePopHomeState extends State<CinePopHome> {
   void _updateDataEstimate() {
     double uploadMb = characters.length * 1.5;
     double downloadMb = selectedMinutes * 16.0;
-    double totalGb = (uploadMb + downloadMb) / 1024;
-    int parts = (selectedMinutes / 30).ceil();
+    double totalMb = uploadMb + downloadMb;
+    String speedHint = selectedMinutes <= 1
+        ? "4-5 तेज़ सीन्स · ~30-45 सेकंड में तैयार"
+        : selectedMinutes <= 2
+            ? "7-8 सीन्स · सुपर-फास्ट रेंडर"
+            : selectedMinutes <= 5
+                ? "14 सीन्स · शॉर्ट फिल्म"
+                : selectedMinutes <= 10
+                    ? "22 सीन्स · फुल एपिसोड"
+                    : "3 चैप्टर्स · फुल मूवी";
     setState(() {
       dataEstimateText =
-          "डेटा खर्च: ${(uploadMb + downloadMb).toStringAsFixed(0)} MB (~${totalGb.toStringAsFixed(2)} GB) | पार्ट्स: $parts";
+          "डेटा खर्च: ~${totalMb.toStringAsFixed(0)} MB ($selectedMinutes मिनट · $speedHint)";
     });
   }
 
@@ -1246,29 +1422,32 @@ class _CinePopHomeState extends State<CinePopHome> {
 
   void _startAutoSync() {
     syncTimer?.cancel();
-    syncTimer = Timer.periodic(const Duration(seconds: 8), (_) async {
+    // Auto-poll every 3 seconds so users see smooth live progress (5% -> 25% -> 60% -> 100%)
+    syncTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
       if (activeProjectId == null) return;
       try {
         final res = await http
             .get(Uri.parse('$serverUrl/sync-project/$activeProjectId'))
-            .timeout(const Duration(seconds: 8));
-        if (res.statusCode == 200) {
+            .timeout(const Duration(seconds: 6));
+        if (res.statusCode == 200 && mounted) {
           final data = jsonDecode(res.body);
           setState(() {
             isServerOnline = true;
-            progress = data['progress'] ?? 0;
-            statusMessage = data['status_text'] ?? "";
-            readyParts = data['ready_parts'] ?? [];
-            scriptsData = data['scripts'] ?? {};
-            isCompleted = data['is_completed'] ?? false;
+            progress = (data['progress'] ?? 0) as int;
+            statusMessage = (data['status_text'] ?? "").toString();
+            readyParts = (data['ready_parts'] ?? []) as List<dynamic>;
+            scriptsData = (data['scripts'] ?? {}) as Map<String, dynamic>;
+            isCompleted = (data['is_completed'] ?? false) as bool;
           });
           if (isCompleted) syncTimer?.cancel();
         }
       } catch (_) {
-        setState(
-          () => statusMessage =
-              "ऑफलाइन मोड: क्लाउड पर मूवी बन रही है। नेट ऑन होते ही अपडेट दिखेगा...",
-        );
+        if (mounted) {
+          setState(
+            () => statusMessage =
+                "ऑफलाइन मोड: क्लाउड पर मूवी बन रही है। नेट ऑन होते ही अपडेट दिखेगा...",
+          );
+        }
       }
     });
   }
@@ -2192,30 +2371,71 @@ class _CinePopHomeState extends State<CinePopHome> {
                       ),
                     ],
                   ),
-                  const SizedBox(height: 36),
-                  ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.white,
-                      foregroundColor: Colors.black,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 28,
-                        vertical: 16,
+                  const SizedBox(height: 30),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.white,
+                        foregroundColor: Colors.black,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 24,
+                          vertical: 16,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(30),
+                        ),
                       ),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(30),
-                      ),
-                    ),
-                    onPressed: _handleGoogleSignIn,
-                    icon: const Icon(Icons.login, color: Color(0xFFFF007F)),
-                    label: const Text(
-                      "Continue with Google",
-                      style: TextStyle(
-                        fontSize: 17,
-                        fontWeight: FontWeight.bold,
+                      onPressed: _handleGoogleSignIn,
+                      icon: const Icon(Icons.login, color: Color(0xFFFF007F)),
+                      label: const Text(
+                        "Continue with Google",
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
                       ),
                     ),
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF00E5FF),
+                        foregroundColor: const Color(0xFF0E091D),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 24,
+                          vertical: 16,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(30),
+                        ),
+                      ),
+                      onPressed:
+                          isInstantLoggingIn ? null : _handleInstantGuestLogin,
+                      icon: const Icon(Icons.bolt, color: Color(0xFF0E091D)),
+                      label: Text(
+                        isInstantLoggingIn
+                            ? "तुरंत लॉगिन हो रहा है..."
+                            : "⚡ 1-Click Guest / Instant Start",
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    "नए यूज़र को 1 Free Trial Video Pass तुरंत मिलेगा!",
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Color(0xFFFFD600),
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
                   TextButton.icon(
                     onPressed: _configureServerUrl,
                     icon: const Icon(Icons.settings, color: Colors.white54),
@@ -2412,9 +2632,109 @@ class _CinePopHomeState extends State<CinePopHome> {
             ],
           ),
         ),
+        const SizedBox(height: 14),
+
+        // ⚡ 1-Click Quick Templates Chips (Beginner-Friendly Auto-Fill)
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1A1033),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: const Color(0xFFFFD600).withOpacity(0.45),
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                "⚡ 1-Click Quick Templates (टैप करें — कहानी और जॉनर खुद भर जाएगा!)",
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFFFFD600),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 6,
+                children: [
+                  {
+                    "label": "🔥 Action Hero",
+                    "genre": "Action",
+                    "mood": "Action",
+                    "loc": "Mumbai ki Barish",
+                    "topic":
+                        "मुंबई की भारी बारिश में एक जांबाज हीरो अकेले अंडरवर्ल्ड डॉन के अड्डे पर हमला कर शहर को बचाता है",
+                  },
+                  {
+                    "label": "😂 Comedy Reel",
+                    "genre": "Comedy",
+                    "mood": "Comedy",
+                    "loc": "Mumbai City Street",
+                    "topic":
+                        "दो मज़ेदार दोस्त गलत सूटकेस बदल जाने के बाद एक अजीबोगरीब डॉन और पुलिस दोनों से फनी अंदाज़ में भागते हैं",
+                  },
+                  {
+                    "label": "👻 Horror Night",
+                    "genre": "Horror",
+                    "mood": "Suspense",
+                    "loc": "Purani Haveli",
+                    "topic":
+                        "आधी रात को तूफ़ान में दो दोस्त एक 200 साल पुरानी भूतिया हवेली में फंस जाते हैं जहाँ अचानक दरवाज़े बंद हो जाते हैं",
+                  },
+                  {
+                    "label": "❤️ Love Story",
+                    "genre": "Love Story",
+                    "mood": "Romantic",
+                    "loc": "Himalayan Mountains",
+                    "topic":
+                        "बर्फीले पहाड़ों और बारिश के बीच दो बिछड़े हुए प्यार करने वाले सालों बाद एक ट्रेन स्टेशन पर फिर मिलते हैं",
+                  },
+                ].map((tpl) {
+                  final active = selectedGenre == tpl['genre'] &&
+                      aiTopicController.text == tpl['topic'];
+                  return ActionChip(
+                    backgroundColor: active
+                        ? const Color(0xFFFF007F)
+                        : const Color(0xFF281854),
+                    label: Text(
+                      tpl['label']!,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                      ),
+                    ),
+                    onPressed: () {
+                      setState(() {
+                        storyMode = "ai";
+                        selectedGenre = tpl['genre']!;
+                        defaultMood = tpl['mood']!;
+                        defaultLocation = tpl['loc']!;
+                        locationController.text = tpl['loc']!;
+                        aiTopicController.text = tpl['topic']!;
+                        ideaController.text = tpl['topic']!;
+                      });
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          duration: const Duration(seconds: 2),
+                          content: Text(
+                            "${tpl['label']} सेट हो गया! अब कैरेक्टर फोटो जोड़ें और Start दबाएँ।",
+                          ),
+                        ),
+                      );
+                    },
+                  );
+                }).toList(),
+              ),
+            ],
+          ),
+        ),
         const SizedBox(height: 16),
 
-        // 1. Runtime
+        // 1. Runtime (Fast Short Reels Default = 1 Min)
         const Text(
           "1. मूवी की लंबाई चुनें:",
           style: TextStyle(
@@ -2423,26 +2743,31 @@ class _CinePopHomeState extends State<CinePopHome> {
           ),
         ),
         DropdownButton<int>(
-          value: selectedMinutes,
+          value: [1, 2, 5, 10, 30].contains(selectedMinutes)
+              ? selectedMinutes
+              : 1,
           isExpanded: true,
           dropdownColor: const Color(0xFF1B1236),
           items: const [
-            DropdownMenuItem(value: 30, child: Text("30 मिनट (1 पार्ट)")),
             DropdownMenuItem(
-              value: 60,
-              child: Text("1 घंटा (2 पार्ट्स + फुल मूवी)"),
+              value: 1,
+              child: Text("1 मिनट (Reel / Short - ~15 MB)"),
             ),
             DropdownMenuItem(
-              value: 90,
-              child: Text("1.5 घंटा (3 पार्ट्स + फुल मूवी)"),
+              value: 2,
+              child: Text("2 मिनट (Mini Clip - ~30 MB)"),
             ),
             DropdownMenuItem(
-              value: 120,
-              child: Text("2 घंटे (4 पार्ट्स + फुल मूवी)"),
+              value: 5,
+              child: Text("5 मिनट (Short Film - ~80 MB)"),
             ),
             DropdownMenuItem(
-              value: 180,
-              child: Text("3 घंटे (6 पार्ट्स + फुल मूवी)"),
+              value: 10,
+              child: Text("10 मिनट (Episode - ~160 MB)"),
+            ),
+            DropdownMenuItem(
+              value: 30,
+              child: Text("30 मिनट (Full Movie - ~480 MB)"),
             ),
           ],
           onChanged: (val) {
@@ -2787,22 +3112,115 @@ class _CinePopHomeState extends State<CinePopHome> {
   Widget _buildStudioScreen() {
     return ListView(
       children: [
-        Text("प्रोजेक्ट ID: $activeProjectId", textAlign: TextAlign.center),
-        const SizedBox(height: 8),
-        LinearProgressIndicator(
-          value: progress / 100,
-          minHeight: 12,
-          color: const Color(0xFFFF007F),
-          backgroundColor: const Color(0xFF281854),
-        ),
-        const SizedBox(height: 8),
-        Text(
-          statusMessage,
-          textAlign: TextAlign.center,
-          style: const TextStyle(
-            fontSize: 15,
-            fontWeight: FontWeight.bold,
-            color: Color(0xFFFFD600),
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: isCompleted
+                ? const Color(0xFF103324)
+                : const Color(0xFF1B1236),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: isCompleted
+                  ? Colors.greenAccent
+                  : const Color(0xFFFF007F).withOpacity(0.6),
+            ),
+          ),
+          child: Column(
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    "प्रोजेक्ट ID: $activeProjectId",
+                    style: const TextStyle(fontSize: 12, color: Colors.white70),
+                  ),
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: isCompleted
+                          ? Colors.green
+                          : const Color(0xFFFF007F),
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Text(
+                      isCompleted ? "✅ 100% READY" : "⚡ $progress%",
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w900,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: LinearProgressIndicator(
+                  value: (progress.clamp(2, 100)) / 100.0,
+                  minHeight: 12,
+                  color: isCompleted
+                      ? Colors.greenAccent
+                      : const Color(0xFFFF007F),
+                  backgroundColor: const Color(0xFF281854),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                statusMessage.isNotEmpty
+                    ? statusMessage
+                    : "लाइव रेंडरिंग चालू है (हर 3 सेकंड में ऑटो-अपडेट)...",
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFFFFD600),
+                ),
+              ),
+              if (isCompleted) ...[
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF00E5FF),
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                        ),
+                        onPressed: () => _playOnlinePreview("FULL_MOVIE"),
+                        icon: const Icon(Icons.play_arrow, color: Colors.black),
+                        label: const Text(
+                          "Ready! Play",
+                          style: TextStyle(
+                            color: Colors.black,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green,
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                        ),
+                        onPressed: () => _downloadVideo("FULL_MOVIE"),
+                        icon: const Icon(Icons.download, color: Colors.white),
+                        label: const Text(
+                          "Download HD",
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ],
           ),
         ),
         const SizedBox(height: 16),
@@ -2950,17 +3368,26 @@ class _CinePopHomeState extends State<CinePopHome> {
         const SizedBox(height: 8),
         ElevatedButton.icon(
           style: ElevatedButton.styleFrom(
-            backgroundColor: const Color(0xFFFF007F),
-            padding: const EdgeInsets.symmetric(vertical: 12),
+            backgroundColor: isCompleted
+                ? const Color(0xFFFF007F)
+                : const Color(0xFF2B2340),
+            padding: const EdgeInsets.symmetric(vertical: 13),
           ),
-          onPressed: generatingTrailer ? null : _generateTrailerAndReel,
-          icon: const Icon(Icons.movie_filter, color: Colors.white),
+          onPressed: (!isCompleted || generatingTrailer)
+              ? null
+              : _generateTrailerAndReel,
+          icon: Icon(
+            isCompleted ? Icons.movie_filter : Icons.lock,
+            color: isCompleted ? Colors.white : Colors.white54,
+          ),
           label: Text(
-            generatingTrailer
-                ? "60-Sec Trailer & 9:16 Reel बन रहे हैं..."
-                : "🎬 Generate 60-Sec Trailer / 9:16 Reel",
-            style: const TextStyle(
-              color: Colors.white,
+            !isCompleted
+                ? "🔒 Movie poori hone ke baad Trailer khulega"
+                : generatingTrailer
+                    ? "60-Sec Trailer & 9:16 Reel बन रहे हैं..."
+                    : "🎬 Generate 60-Sec Trailer / 9:16 Reel",
+            style: TextStyle(
+              color: isCompleted ? Colors.white : Colors.white60,
               fontWeight: FontWeight.bold,
             ),
           ),

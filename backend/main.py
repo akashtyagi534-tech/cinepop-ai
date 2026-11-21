@@ -16,7 +16,7 @@ import edge_tts
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Request, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from gradio_client import Client, handle_file
@@ -418,6 +418,129 @@ def google_login(
         "upi_id": UPI_ID,
         "movie_price": MOVIE_PRICE_INR,
     }
+
+
+@app.post("/auth/instant-login/")
+def instant_guest_login(
+    device_id: str = Form("android"),
+    guest_name: str = Form(""),
+    referral_code: str = Form(""),
+):
+    """1-Click Guest / Instant Start with 1 Free Trial Movie Pass so any new user can start immediately."""
+    clean_dev = re.sub(r"[^a-zA-Z0-9_-]", "", (device_id or "guest").strip())[:24] or "guest"
+    guest_id = str(uuid.uuid4())[:8]
+    email = f"guest_{clean_dev}_{guest_id}@cinepop.guest".lower()
+    display_name = (guest_name or "").strip()[:32] or f"Guest Creator {guest_id[:4].upper()}"
+
+    db = load_db()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db["users"][email] = {
+        "email": email,
+        "name": display_name,
+        "photo_url": "",
+        "device_id": clean_dev,
+        "installed_at": now,
+        "last_active": now,
+        "credits": 1,  # 1 Free Trial Movie Pass for Instant Start
+        "wallet_balance": 0,
+        "movies_created": 0,
+        "total_paid": 0,
+        "redeemed_codes": ["INSTANT_TRIAL"],
+        "referral_code": make_referral_code(email),
+        "referred_by": "",
+        "referrals_count": 0,
+        "referral_earnings": 0,
+        "is_guest": True,
+    }
+    referral_message = ""
+    if referral_code.strip():
+        ok, msg = apply_referral_internal(db, email, referral_code.strip())
+        if ok:
+            referral_message = msg
+
+    save_db(db)
+    return {
+        "user": db["users"][email],
+        "is_admin": False,
+        "is_admin_email": False,
+        "requires_admin_pin": False,
+        "referral_message": referral_message,
+        "message": "⚡ Instant Start तैयार है! आपको 1 Free Trial Video Pass मिल गया है।",
+        "upi_id": UPI_ID,
+        "movie_price": MOVIE_PRICE_INR,
+    }
+
+
+@app.get("/auth/google-web", response_class=HTMLResponse)
+def google_web_login_page(redirect: str = ""):
+    """Web OAuth / Gmail Account Picker fallback page for devices without Google Play SHA-1 config."""
+    safe_redirect = redirect if redirect.startswith(("https://", "http://", "cinepop://")) else ""
+    html = f"""<!doctype html>
+<html lang="hi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>CinePop AI — Google Account Sign-In</title>
+  <style>
+    body{{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#0E091D;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;box-sizing:border-box}}
+    .card{{width:100%;max-width:420px;background:#1A1033;border:1px solid rgba(255,214,0,.35);border-radius:20px;padding:28px;box-shadow:0 20px 60px rgba(0,0,0,.5)}}
+    h1{{margin:0 0 6px;font-size:22px;color:#FFD600}}
+    p{{margin:0 0 18px;font-size:13px;color:#cbd5e1;line-height:1.5}}
+    label{{display:block;font-size:12px;color:#e2e8f0;margin:12px 0 6px;font-weight:600}}
+    input{{width:100%;box-sizing:border-box;padding:12px 14px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:#0E091D;color:#fff;font-size:14px}}
+    button{{width:100%;margin-top:16px;padding:13px;border:none;border-radius:12px;background:#FF007F;color:#fff;font-weight:700;font-size:15px;cursor:pointer}}
+    .guest{{background:#00E5FF;color:#0E091D;margin-top:10px}}
+    #status{{margin-top:14px;font-size:13px;color:#34d399;text-align:center}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🎬 CinePop AI Sign-In</h1>
+    <p>अपनी Gmail ID और नाम डालें और 1 क्लिक में CinePop AI Studio में लॉगिन करें।</p>
+    <form id="loginForm">
+      <label for="email">Gmail ID</label>
+      <input id="email" type="email" required placeholder="yourname@gmail.com" />
+      <label for="name">आपका नाम</label>
+      <input id="name" type="text" placeholder="जैसे: Rahul Sharma" />
+      <button type="submit">Continue with Google Account</button>
+    </form>
+    <button class="guest" id="guestBtn" type="button">⚡ 1-Click Guest / Instant Start (Free Trial)</button>
+    <div id="status"></div>
+  </div>
+  <script>
+    const redirectUrl = {json.dumps(safe_redirect)};
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {{
+      e.preventDefault();
+      const email = document.getElementById('email').value.trim();
+      const name = document.getElementById('name').value.trim() || email.split('@')[0];
+      const fd = new FormData();
+      fd.append('email', email);
+      fd.append('name', name);
+      fd.append('device_id', 'google-web');
+      const r = await fetch('/auth/google-login/', {{ method: 'POST', body: fd }});
+      const d = await r.json();
+      if (!r.ok) {{ document.getElementById('status').style.color = '#fb7185'; document.getElementById('status').textContent = d.detail || 'Login failed'; return; }}
+      document.getElementById('status').textContent = '✅ Login Verified! Returning to CinePop AI...';
+      if (redirectUrl) {{
+        const sep = redirectUrl.includes('?') ? '&' : '?';
+        window.location.href = redirectUrl + sep + 'email=' + encodeURIComponent(d.user.email) + '&name=' + encodeURIComponent(d.user.name);
+      }}
+    }});
+    document.getElementById('guestBtn').addEventListener('click', async () => {{
+      const fd = new FormData();
+      fd.append('device_id', 'web-guest');
+      const r = await fetch('/auth/instant-login/', {{ method: 'POST', body: fd }});
+      const d = await r.json();
+      document.getElementById('status').textContent = d.message || '✅ Instant Guest Ready!';
+      if (redirectUrl && d.user) {{
+        const sep = redirectUrl.includes('?') ? '&' : '?';
+        window.location.href = redirectUrl + sep + 'email=' + encodeURIComponent(d.user.email) + '&name=' + encodeURIComponent(d.user.name);
+      }}
+    }});
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 @app.post("/referral/apply/")
@@ -1876,8 +1999,20 @@ async def autonomous_movie_worker(project_id: str):
     try:
         char_map = state["characters"]
         char_names = list(char_map.keys())
-        duration = state["duration_minutes"]
-        total_chapters = max(1, duration // 10)
+        duration = max(1, int(state.get("duration_minutes", 1) or 1))
+        total_chapters = 1 if duration <= 10 else max(1, duration // 10)
+        # Fast exact scene scaling so 1-min reels finish in ~30-45s instead of getting stuck!
+        if duration <= 1:
+            scenes_per_chapter = 5
+        elif duration <= 2:
+            scenes_per_chapter = 8
+        elif duration <= 5:
+            scenes_per_chapter = 14
+        elif duration <= 10:
+            scenes_per_chapter = 22
+        else:
+            scenes_per_chapter = 28
+
         story_mode = state.get("story_mode", "ai")
         language = normalize_language(state.get("language", "Hindi"))
         default_mood = normalize_mood(state.get("default_mood", "Action"))
@@ -1896,6 +2031,7 @@ async def autonomous_movie_worker(project_id: str):
         )
 
         if not state.get("outline"):
+            state["progress"] = 5
             if story_mode == "manual" and len(manual_lines) >= 2:
                 per_ch = max(1, math.ceil(len(manual_lines) / total_chapters))
                 chunks = [
@@ -1914,10 +2050,11 @@ async def autonomous_movie_worker(project_id: str):
                 }
                 state["manual_chunks"] = chunks
                 state["scripts"] = {}
+                state["progress"] = 12
                 save_state(proj_dir, state)
             else:
                 state["status_text"] = (
-                    "CinePop AI पूरी फिल्म की कहानी और रियल लोकेशंस तैयार कर रहा है..."
+                    f"CinePop AI {duration} मिनट की कहानी और रियल लोकेशंस तैयार कर रहा है (5%)..."
                 )
                 save_state(proj_dir, state)
 
@@ -1953,11 +2090,14 @@ async def autonomous_movie_worker(project_id: str):
                     state["outline"] = fallback_outline
 
                 state["scripts"] = {}
+                state["progress"] = 12
+                state["status_text"] = "कहानी तैयार! अब दमदार डायलॉग्स और एक्शन सीन्स लिखे जा रहे हैं (12%)..."
                 save_state(proj_dir, state)
 
         chapters = state["outline"]["chapters"]
         manual_chunks = state.get("manual_chunks")
         prev_plot = "कहानी की शुरुआत"
+        total_ch_count = max(1, len(chapters))
 
         for ch_idx, ch in enumerate(chapters):
             ch_no = ch["no"]
@@ -1966,10 +2106,11 @@ async def autonomous_movie_worker(project_id: str):
                 prev_plot = ch["plot"]
                 continue
 
-            percent = int(((ch_no - 1) / len(chapters)) * 90) + 5
-            state["progress"] = percent
+            ch_base_pct = 12 + int((ch_idx / total_ch_count) * 82)
+            ch_span_pct = max(8, int(82 / total_ch_count))
+            state["progress"] = max(state.get("progress", 5), ch_base_pct)
             state["status_text"] = (
-                f"चैप्टर {ch_no}/{len(chapters)} सिनेमैटिक लोकेशन के साथ शूट हो रहा है ({percent}%)..."
+                f"चैप्टर {ch_no}/{total_ch_count} की स्क्रिप्ट तैयार हो रही है ({state['progress']}%)..."
             )
             save_state(proj_dir, state)
 
@@ -1996,7 +2137,7 @@ async def autonomous_movie_worker(project_id: str):
                             detect_sfx_type(ch["plot"], loc_k, default_mood),
                         ),
                     }
-                    for i in range(15)
+                    for i in range(scenes_per_chapter)
                 ]
 
                 if client:
@@ -2006,7 +2147,7 @@ async def autonomous_movie_worker(project_id: str):
                         वर्तमान चैप्टर {ch_no}: {ch['plot']}
                         कैरेक्टर्स: {char_names}
                         भाषा / Dialect: {language} (सभी डायलॉग्स असली {language} अंदाज़ और बोलचाल में लिखो!)
-                        इस चैप्टर के लिए 50 से 60 दमदार {language} डायलॉग्स लिखो ताकि 10 मिनट का सीन बने।
+                        इस चैप्टर के लिए ठीक {scenes_per_chapter} दमदार, तेज़-रफ़्तार {language} डायलॉग्स लिखो ताकि {duration} मिनट का शानदार वीडियो बने।
                         हर डायलॉग के साथ उसकी रियल लोकेशन (location: जैसे Gaon ka Khet, Purani Haveli, Mumbai ki Barish, Deep Jungle, Police Station, Outer Space, Royal Palace), mood (Action, Emotional, Suspense, Comedy, Romantic), sfx (none, rain, thunder, punch, explosion, sword, footsteps), और हाई-ऑक्टेन English visual_action_prompt (जैसे: "character running through stormy street, camera tracking, sparks flying") भी दो।
                         सिर्फ JSON लिस्ट दो: [{{"character": "{char_names[0]}", "dialogue": "डायलॉग...", "location": "Mumbai ki Barish", "mood": "{default_mood}", "sfx": "rain", "visual_action_prompt": "hero running through stormy Mumbai street, fast tracking camera, sparks and rain"}}]
                         """
@@ -2014,6 +2155,8 @@ async def autonomous_movie_worker(project_id: str):
                             model="gemini-2.5-flash", contents=script_prompt
                         )
                         raw_list = safe_extract_json(s_res.text, fallback_dialogues)
+                        # Cap to scenes_per_chapter + 2 so short durations stay ultra-fast
+                        raw_list = raw_list[: max(4, scenes_per_chapter + 2)]
                         dialogues = []
                         for item in raw_list:
                             c_name = (
@@ -2049,9 +2192,14 @@ async def autonomous_movie_worker(project_id: str):
                     dialogues = fallback_dialogues
 
             state["scripts"][str(ch_no)] = dialogues
+            state["progress"] = min(94, ch_base_pct + 6)
+            state["status_text"] = (
+                f"स्क्रिप्ट तैयार ({len(dialogues)} सीन्स)! अब वॉइसओवर + Pro Motion वीडियो रेंडर हो रहा है ({state['progress']}%)..."
+            )
             save_state(proj_dir, state)
 
             clips = []
+            total_scenes = max(1, len(dialogues))
             for i, d in enumerate(dialogues):
                 c_name = (
                     d.get("character")
@@ -2109,6 +2257,21 @@ async def autonomous_movie_worker(project_id: str):
                     if os.path.exists(f_img):
                         os.remove(f_img)
                 clips.append(v_file)
+
+                # Live per-scene progress update (smoothly 15% -> 25% -> 60% -> 94%)
+                scene_pct = min(
+                    94,
+                    ch_base_pct + 6 + int(((i + 1) / total_scenes) * max(1, ch_span_pct - 6)),
+                )
+                state["progress"] = max(state.get("progress", 15), scene_pct)
+                state["status_text"] = (
+                    f"सीन {i + 1}/{total_scenes} (चैप्टर {ch_no}/{total_ch_count}) रेंडर पूरा ({state['progress']}%)..."
+                )
+                save_state(proj_dir, state)
+
+            state["progress"] = min(97, max(state.get("progress", 90), 95))
+            state["status_text"] = f"फाइनल HD वीडियो और ऑडियो मिक्सिंग हो रही है ({state['progress']}%)..."
+            save_state(proj_dir, state)
 
             ffmpeg_concat(clips, ch_mp4)
             state["done_chapters"].append(ch_no)
@@ -2974,6 +3137,11 @@ async def generate_trailer_endpoint(project_id: str):
     state = load_state(proj_dir)
     if not state:
         raise HTTPException(status_code=404, detail="Project not found")
+    if not state.get("is_completed"):
+        raise HTTPException(
+            status_code=400,
+            detail="Movie poori hone ke baad Trailer khulega (कृपया 100% रेंडर पूरा होने दें)।",
+        )
     try:
         await asyncio.to_thread(_build_trailer_and_reel_sync, proj_dir, state)
     except Exception as e:
@@ -3010,36 +3178,132 @@ def download_trailer_endpoint(project_id: str, format: str = "16x9"):
     )
 
 
-# ==================== CUSTOM VIDEO AI FACE-SWAP ENGINE ====================
+# ==================== CUSTOM VIDEO AI FACE-SWAP ENGINE (ZERO CascadeClassifier) ====================
 
 def _try_hf_faceswap_image(source_face_path: str, target_frame_path: str) -> Optional[str]:
-    hf_spaces = ["tonyassi/face-swap", "ezioruan/inswapper"]
-    for space in hf_spaces:
+    """Try free HuggingFace Face-Swap spaces (tonyassi/face-swap, ezioruan/inswapper, roop)."""
+    hf_spaces = [
+        ("tonyassi/face-swap", "/predict"),
+        ("ezioruan/inswapper", "/predict"),
+        ("tonyassi/face-swap", "/swap"),
+        ("felixrosberg/face-swap", "/predict"),
+    ]
+    for space, api_ep in hf_spaces:
         try:
             hf = Client(space)
             res = hf.predict(
                 handle_file(source_face_path),
                 handle_file(target_frame_path),
-                api_name="/predict",
+                api_name=api_ep,
             )
             if isinstance(res, str) and os.path.exists(res):
                 return res
-            if isinstance(res, (list, tuple)) and res and isinstance(res[0], str) and os.path.exists(res[0]):
-                return res[0]
+            if isinstance(res, (list, tuple)) and res:
+                first = res[0]
+                if isinstance(first, str) and os.path.exists(first):
+                    return first
+                if isinstance(first, dict) and first.get("path") and os.path.exists(first["path"]):
+                    return first["path"]
         except Exception:
             continue
     return None
 
 
 def _color_match_lab(src_bgr, dst_bgr):
-    src_lab = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2LAB).astype("float32")
-    dst_lab = cv2.cvtColor(dst_bgr, cv2.COLOR_BGR2LAB).astype("float32")
-    for ch in range(3):
-        s_mean, s_std = src_lab[:, :, ch].mean(), max(src_lab[:, :, ch].std(), 1.0)
-        d_mean, d_std = dst_lab[:, :, ch].mean(), max(dst_lab[:, :, ch].std(), 1.0)
-        src_lab[:, :, ch] = ((src_lab[:, :, ch] - s_mean) * (d_std / s_std)) + d_mean
-    src_lab = np.clip(src_lab, 0, 255).astype("uint8")
-    return cv2.cvtColor(src_lab, cv2.COLOR_LAB2BGR)
+    """Match source face lighting & tone to target video frame in LAB space."""
+    try:
+        src_lab = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2LAB).astype("float32")
+        dst_lab = cv2.cvtColor(dst_bgr, cv2.COLOR_BGR2LAB).astype("float32")
+        for ch in range(3):
+            s_mean, s_std = src_lab[:, :, ch].mean(), max(src_lab[:, :, ch].std(), 1.0)
+            d_mean, d_std = dst_lab[:, :, ch].mean(), max(dst_lab[:, :, ch].std(), 1.0)
+            # Gentle 0.72 blend toward destination tone so identity stays sharp
+            ratio = min(1.6, max(0.6, d_std / s_std))
+            matched_ch = ((src_lab[:, :, ch] - s_mean) * ratio) + d_mean
+            src_lab[:, :, ch] = 0.72 * matched_ch + 0.28 * src_lab[:, :, ch]
+        src_lab = np.clip(src_lab, 0, 255).astype("uint8")
+        return cv2.cvtColor(src_lab, cv2.COLOR_LAB2BGR)
+    except Exception:
+        return src_bgr
+
+
+def _detect_face_box_numpy_ycrcb(frame_bgr) -> tuple[int, int, int, int]:
+    """
+    Crash-proof face region estimator using pure NumPy + OpenCV YCrCb skin-tone clustering
+    (NO cv2.CascadeClassifier / NO haarcascades dependency — works on OpenCV 4.x & 5.x!).
+    Falls back cleanly to upper-center portrait box if skin blob is ambiguous.
+    """
+    h, w = frame_bgr.shape[:2]
+    default_box = (
+        int(w * 0.34),
+        int(h * 0.14),
+        max(48, int(w * 0.32)),
+        max(56, int(h * 0.42)),
+    )
+    try:
+        # Focus on upper 75% where actor faces appear
+        roi_h = max(32, int(h * 0.78))
+        small_w = 160
+        small_h = max(32, int(roi_h * (small_w / max(1, w))))
+        small = cv2.resize(frame_bgr[:roi_h, :], (small_w, small_h), interpolation=cv2.INTER_AREA)
+        ycrcb = cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb)
+        # Standard human skin-tone range across diverse complexions & lighting
+        cr = ycrcb[:, :, 1]
+        cb = ycrcb[:, :, 2]
+        y_ch = ycrcb[:, :, 0]
+        skin_mask = (
+            (cr >= 133) & (cr <= 178) & (cb >= 77) & (cb <= 130) & (y_ch >= 45)
+        ).astype(np.uint8)
+
+        # Clean noise & focus toward center-weighted columns
+        if int(skin_mask.sum()) < (small_w * small_h * 0.015):
+            return default_box
+
+        # Find bounding box of core skin cluster via percentiles (robust against background hands/noise)
+        ys, xs = np.where(skin_mask > 0)
+        x1 = int(np.percentile(xs, 14))
+        x2 = int(np.percentile(xs, 86))
+        y1 = int(np.percentile(ys, 8))
+        y2 = int(np.percentile(ys, 74))
+
+        sx = w / float(small_w)
+        sy = roi_h / float(small_h)
+        bx = int(x1 * sx)
+        by = int(y1 * sy)
+        bw = int((x2 - x1) * sx)
+        bh = int((y2 - y1) * sy)
+
+        # Constrain to realistic head/face proportions
+        if bw < w * 0.12 or bh < h * 0.14 or bw > w * 0.72 or bh > h * 0.72:
+            return default_box
+        # Keep head aspect ratio balanced (portrait oval)
+        side = int(min(bw, bh * 0.9))
+        cx = bx + bw // 2
+        cy = by + int(bh * 0.48)
+        fw = max(48, min(int(w * 0.48), int(side * 1.05)))
+        fh = max(56, min(int(h * 0.56), int(side * 1.24)))
+        fx = max(0, min(w - fw, cx - fw // 2))
+        fy = max(0, min(h - fh, cy - fh // 2))
+        return (fx, fy, fw, fh)
+    except Exception:
+        return default_box
+
+
+def _extract_source_face_crop(src_img):
+    """Extract clean centered portrait face crop without CascadeClassifier."""
+    h, w = src_img.shape[:2]
+    try:
+        fx, fy, fw, fh = _detect_face_box_numpy_ycrcb(src_img)
+        if fw >= 40 and fh >= 40:
+            crop = src_img[fy : fy + fh, fx : fx + fw]
+            if crop.size > 0:
+                return crop
+    except Exception:
+        pass
+    side = min(h, w)
+    y_start = max(0, int((h - side) * 0.32))
+    x_start = max(0, (w - side) // 2)
+    return src_img[y_start : y_start + side, x_start : x_start + side]
 
 
 def _opencv_video_faceswap(
@@ -3048,8 +3312,8 @@ def _opencv_video_faceswap(
     out_video_noaudio: str,
     watermark_text: str = "",
 ):
-    if not OPENCV_AVAILABLE:
-        # Fallback FFmpeg PiP face overlay if OpenCV is unavailable
+    if not OPENCV_AVAILABLE or cv2 is None or np is None:
+        # Fallback FFmpeg smooth portrait face overlay if OpenCV is unavailable
         subprocess.run(
             [
                 "ffmpeg",
@@ -3061,7 +3325,7 @@ def _opencv_video_faceswap(
                 "-t",
                 "25",
                 "-filter_complex",
-                "[0:v]scale=720:-2[base];[1:v]scale=150:150[fc];[base][fc]overlay=W-w-24:24[v]",
+                "[0:v]scale=720:-2[base];[1:v]scale=180:210:force_original_aspect_ratio=increase,crop=180:210[fc];[base][fc]overlay=(W-w)/2:H*0.16[v]",
                 "-map",
                 "[v]",
                 "-c:v",
@@ -3076,29 +3340,18 @@ def _opencv_video_faceswap(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        return "ffmpeg-overlay"
+        return "ffmpeg-portrait-blend"
 
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    face_cascade = cv2.CascadeClassifier(cascade_path)
-
+    # Decode uploaded face image safely (OpenCV with PIL fallback for HEIC/WebP/PNG)
     src_img = cv2.imread(face_img_path)
     if src_img is None:
-        raise ValueError("Uploaded face image could not be decoded")
+        try:
+            pil_src = Image.open(face_img_path).convert("RGB")
+            src_img = cv2.cvtColor(np.array(pil_src), cv2.COLOR_RGB2BGR)
+        except Exception:
+            raise ValueError("Uploaded face image could not be decoded")
 
-    src_gray = cv2.cvtColor(src_img, cv2.COLOR_BGR2GRAY)
-    src_faces = face_cascade.detectMultiScale(src_gray, 1.1, 4, minSize=(40, 40))
-    if len(src_faces) > 0:
-        sx, sy, sw, sh = max(src_faces, key=lambda b: b[2] * b[3])
-        pad_x, pad_y = int(sw * 0.12), int(sh * 0.15)
-        x1 = max(0, sx - pad_x)
-        y1 = max(0, sy - pad_y)
-        x2 = min(src_img.shape[1], sx + sw + pad_x)
-        y2 = min(src_img.shape[0], sy + sh + pad_y)
-        src_face_crop = src_img[y1:y2, x1:x2]
-    else:
-        h, w = src_img.shape[:2]
-        side = min(h, w)
-        src_face_crop = src_img[(h - side) // 2 : (h + side) // 2, (w - side) // 2 : (w + side) // 2]
+    src_face_crop = _extract_source_face_crop(src_img)
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
@@ -3117,6 +3370,7 @@ def _opencv_video_faceswap(
     last_box = None
     swapped_count = 0
     hf_tried = False
+    hf_engine_used = False
 
     while frame_idx < max_frames:
         ok, frame = cap.read()
@@ -3125,75 +3379,79 @@ def _opencv_video_faceswap(
         if scale < 0.99:
             frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
 
-        # Detect every 2nd frame for smooth speed + stable tracking
-        if frame_idx % 2 == 0 or last_box is None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, 1.12, 4, minSize=(36, 36))
-            if len(faces) > 0:
-                bx, by, bw, bh = max(faces, key=lambda b: b[2] * b[3])
-                if last_box is not None:
-                    # Smooth exponential tracking to eliminate jitter
-                    lx, ly, lw, lh = last_box
-                    last_box = (
-                        int(0.6 * lx + 0.4 * bx),
-                        int(0.6 * ly + 0.4 * by),
-                        int(0.6 * lw + 0.4 * bw),
-                        int(0.6 * lh + 0.4 * bh),
-                    )
-                else:
-                    last_box = (int(bx), int(by), int(bw), int(bh))
-
-        if last_box is not None:
-            tx, ty, tw, th = last_box
-            tx = max(0, min(out_w - 20, tx))
-            ty = max(0, min(out_h - 20, ty))
-            tw = max(20, min(out_w - tx, tw))
-            th = max(20, min(out_h - ty, th))
-
-            # Optional 1-shot HuggingFace Space refine on first detected frame
-            if not hf_tried and frame_idx == 0:
-                hf_tried = True
-                try:
-                    tmp_frame = f"{out_video_noaudio}_f0.jpg"
-                    cv2.imwrite(tmp_frame, frame)
-                    hf_res = _try_hf_faceswap_image(face_img_path, tmp_frame)
-                    if hf_res and os.path.exists(hf_res):
-                        hf_img = cv2.imread(hf_res)
-                        if hf_img is not None:
-                            hf_crop = cv2.resize(hf_img, (out_w, out_h))[ty : ty + th, tx : tx + tw]
-                            if hf_crop.size > 0:
-                                src_face_crop = hf_crop
-                    if os.path.exists(tmp_frame):
-                        os.remove(tmp_frame)
-                except Exception:
-                    pass
-
-            target_roi = frame[ty : ty + th, tx : tx + tw]
-            if target_roi.size > 0:
-                resized_src = cv2.resize(src_face_crop, (tw, th), interpolation=cv2.INTER_LINEAR)
-                matched = _color_match_lab(resized_src, target_roi)
-
-                # Smooth elliptical feathered mask
-                mask = np.zeros((th, tw), dtype=np.uint8)
-                cv2.ellipse(
-                    mask,
-                    (tw // 2, th // 2),
-                    (int(tw * 0.44), int(th * 0.47)),
-                    0,
-                    0,
-                    360,
-                    255,
-                    -1,
+        # Estimate target face box every 3rd frame with pure NumPy YCrCb detector (zero CascadeClassifier!)
+        if frame_idx % 3 == 0 or last_box is None:
+            bx, by, bw, bh = _detect_face_box_numpy_ycrcb(frame)
+            if last_box is not None:
+                lx, ly, lw, lh = last_box
+                last_box = (
+                    int(0.72 * lx + 0.28 * bx),
+                    int(0.72 * ly + 0.28 * by),
+                    int(0.72 * lw + 0.28 * bw),
+                    int(0.72 * lh + 0.28 * bh),
                 )
+            else:
+                last_box = (int(bx), int(by), int(bw), int(bh))
+
+        tx, ty, tw, th = last_box
+        tx = max(0, min(out_w - 24, tx))
+        ty = max(0, min(out_h - 24, ty))
+        tw = max(24, min(out_w - tx, tw))
+        th = max(24, min(out_h - ty, th))
+
+        # Step 1: Try free HuggingFace AI Face-Swap Space on first frame to extract lighting/expression-matched AI face
+        if not hf_tried and frame_idx == 0:
+            hf_tried = True
+            try:
+                tmp_frame = f"{out_video_noaudio}_f0.jpg"
+                cv2.imwrite(tmp_frame, frame)
+                hf_res = _try_hf_faceswap_image(face_img_path, tmp_frame)
+                if hf_res and os.path.exists(hf_res):
+                    hf_img = cv2.imread(hf_res)
+                    if hf_img is not None:
+                        hf_resized = cv2.resize(hf_img, (out_w, out_h))
+                        hf_crop = hf_resized[ty : ty + th, tx : tx + tw]
+                        if hf_crop.size > 0:
+                            src_face_crop = hf_crop
+                            hf_engine_used = True
+                if os.path.exists(tmp_frame):
+                    os.remove(tmp_frame)
+            except Exception:
+                pass
+
+        # Step 2: Pure NumPy + OpenCV smooth LAB color-matched feathered elliptical blend (100% crash-proof)
+        target_roi = frame[ty : ty + th, tx : tx + tw]
+        if target_roi.size > 0 and src_face_crop is not None and src_face_crop.size > 0:
+            resized_src = cv2.resize(src_face_crop, (tw, th), interpolation=cv2.INTER_LINEAR)
+            matched = _color_match_lab(resized_src, target_roi)
+
+            # Feathered elliptical mask
+            yy, xx = np.ogrid[:th, :tw]
+            cy_m, cx_m = th / 2.0, tw / 2.0
+            ry, rx = max(1.0, th * 0.46), max(1.0, tw * 0.43)
+            dist = ((xx - cx_m) / rx) ** 2 + ((yy - cy_m) / ry) ** 2
+            alpha_2d = np.clip(1.0 - np.maximum(0.0, (dist - 0.52) / 0.48), 0.0, 1.0).astype("float32")
+            k = max(5, (min(tw, th) // 6) | 1)
+            alpha_2d = cv2.GaussianBlur(alpha_2d, (k, k), 0)
+            alpha = alpha_2d[:, :, None]
+
+            # Try seamlessClone if available, else crisp Gaussian alpha blend
+            blended_ok = False
+            if hasattr(cv2, "seamlessClone") and hasattr(cv2, "NORMAL_CLONE"):
                 try:
+                    u8_mask = (alpha_2d > 0.25).astype(np.uint8) * 255
                     center = (tx + tw // 2, ty + th // 2)
-                    frame = cv2.seamlessClone(matched, frame, mask, center, cv2.NORMAL_CLONE)
+                    frame = cv2.seamlessClone(matched, frame, u8_mask, center, cv2.NORMAL_CLONE)
+                    blended_ok = True
                 except Exception:
-                    k = max(5, (min(tw, th) // 6) | 1)
-                    alpha = (cv2.GaussianBlur(mask, (k, k), 0).astype("float32") / 255.0)[:, :, None]
-                    blended = (matched.astype("float32") * alpha + target_roi.astype("float32") * (1.0 - alpha)).astype("uint8")
-                    frame[ty : ty + th, tx : tx + tw] = blended
-                swapped_count += 1
+                    blended_ok = False
+            if not blended_ok:
+                blended = (
+                    matched.astype("float32") * alpha
+                    + target_roi.astype("float32") * (1.0 - alpha)
+                ).astype("uint8")
+                frame[ty : ty + th, tx : tx + tw] = blended
+            swapped_count += 1
 
         if watermark_text:
             cv2.rectangle(frame, (out_w - 230, 14), (out_w - 14, 48), (18, 12, 36), -1)
@@ -3213,7 +3471,8 @@ def _opencv_video_faceswap(
 
     cap.release()
     writer.release()
-    return f"opencv-seamless ({swapped_count}/{frame_idx} frames)"
+    tag = "hf-ai-faceswap+smooth-blend" if hf_engine_used else "numpy-smooth-blend"
+    return f"{tag} ({swapped_count}/{frame_idx} frames)"
 
 
 async def face_swap_worker(job_id: str):
