@@ -1,4 +1,5 @@
 import os
+import io
 import re
 import hmac
 import math
@@ -11,10 +12,12 @@ import shutil
 import asyncio
 import datetime
 import subprocess
+import urllib.parse
 from typing import Optional
+import requests
 import edge_tts
 from gtts import gTTS
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps, ImageEnhance
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Request, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -110,21 +113,258 @@ def select_character_angle_photo(char_entry: dict, target_angle: str = "front") 
     return str(char_entry.get("image") or "")
 
 
+def open_upright_image(path_or_bytes) -> Image.Image:
+    """Open an image file or bytes and ALWAYS apply EXIF orientation so photos are never 90-degree sideways."""
+    if isinstance(path_or_bytes, (bytes, bytearray)):
+        img = Image.open(io.BytesIO(path_or_bytes))
+    else:
+        img = Image.open(path_or_bytes)
+    img = ImageOps.exif_transpose(img)
+    return img.convert("RGB")
+
+
+def save_upright_image_bytes(raw_bytes: bytes, out_path: str, max_side: int = 1280) -> str:
+    """Save uploaded camera/gallery image upright (EXIF-corrected) so it never renders rotated sideways."""
+    try:
+        img = open_upright_image(raw_bytes)
+        w, h = img.size
+        if max(w, h) > max_side:
+            scale = max_side / float(max(w, h))
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+        img.save(out_path, "JPEG", quality=92)
+    except Exception:
+        with open(out_path, "wb") as f:
+            f.write(raw_bytes)
+    return out_path
+
+
+_DEVANAGARI_FONT_CACHE: dict[str, Optional[str]] = {}
+
+
+def find_devanagari_font_path(bold: bool = True) -> Optional[str]:
+    """Locate an installed Noto Sans Devanagari (or Hindi-capable) TTF/OTF font so Hindi never renders as □□□ boxes."""
+    key = "bold" if bold else "regular"
+    if key in _DEVANAGARI_FONT_CACHE:
+        return _DEVANAGARI_FONT_CACHE[key]
+
+    preferred = (
+        [
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Bold.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagariUI-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSerifDevanagari-Bold.ttf",
+            "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        ]
+        if bold
+        else [
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Regular.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagariUI-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
+            "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ]
+    )
+    for p in preferred:
+        if os.path.exists(p):
+            _DEVANAGARI_FONT_CACHE[key] = p
+            return p
+
+    # Fallback: query fontconfig (`fc-list`) for any installed Devanagari font
+    try:
+        out = subprocess.check_output(
+            ["fc-list", ":lang=hi", "file"],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).decode("utf-8", errors="ignore")
+        candidates = [ln.split(":")[0].strip() for ln in out.splitlines() if ln.strip()]
+        if bold:
+            for c in candidates:
+                if "bold" in c.lower() and os.path.exists(c):
+                    _DEVANAGARI_FONT_CACHE[key] = c
+                    return c
+        for c in candidates:
+            if os.path.exists(c):
+                _DEVANAGARI_FONT_CACHE[key] = c
+                return c
+    except Exception:
+        pass
+
+    _DEVANAGARI_FONT_CACHE[key] = None
+    return None
+
+
+def load_hindi_font(size: int, bold: bool = True) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    fp = find_devanagari_font_path(bold=bold)
+    if fp:
+        try:
+            return ImageFont.truetype(fp, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+SCRIPT_TAG_LINE_RE = re.compile(
+    r"^\s*(?:title|शीर्षक|scene\s*\d*|सीन\s*\d*|location|लोकेशन|action|एक्शन|mood|मूड|sfx|camera|कैमरा|int\.|ext\.|cut\s+to|fade\s+(?:in|out)|narrator|सूत्रधार|background|बैकग्राउंड)\s*[:：\-]?",
+    re.IGNORECASE,
+)
+
+
+def clean_spoken_dialogue(raw_text: str) -> str:
+    """
+    Strip ALL script/stage metadata tags (`Title:`, `Scene 1:`, `Location:`, `Action:`, `[...]`, `(...)`, markdown)
+    so TTS characters NEVER read stage directions or headers aloud!
+    """
+    txt = str(raw_text or "").strip()
+    if not txt:
+        return ""
+    # Remove bracketed & parenthetical stage cues like [Location: ...] or (angrily punches)
+    txt = re.sub(r"\[[^\]]*\]", " ", txt)
+    txt = re.sub(r"\([^)]*(?:action|scene|location|camera|mood|sfx|angry|shouts|runs|punches|laugh|एक्शन|सीन|लोकेशन)[^)]*\)", " ", txt, flags=re.IGNORECASE)
+    # Remove inline script metadata markers
+    txt = re.sub(
+        r"\b(?:Title|Scene\s*\d*|Location|Action|Mood|SFX|Camera|Visual|शीर्षक|सीन\s*\d*|लोकेशन|एक्शन|मूड)\s*[:：]\s*[^\n.।!?]*",
+        " ",
+        txt,
+        flags=re.IGNORECASE,
+    )
+    # Remove markdown formatting & quotes
+    txt = txt.replace("**", "").replace("__", "").replace("##", "").replace("#", "")
+    txt = re.sub(r"^[\-\*•\d\.\)\s]+", "", txt)
+    txt = re.sub(r"\s+", " ", txt).strip(" \"'“”‘’")
+    return txt
+
+
+def detect_speaker_role(speaker_name: str, char_map: dict) -> str:
+    """Classify speaker as 'narrator', 'hero', 'villain', 'saas', 'female', or 'crowd' for distinct voices & visuals."""
+    low = (speaker_name or "").lower().strip()
+    char_names = list(char_map.keys())
+    if any(k in low for k in ("narrator", "sutradhar", "voiceover", "storyteller", "सूत्रधार", "कथावाचक", "नैरेटर")):
+        return "narrator"
+    if any(k in low for k in ("log", "crowd", "public", "villager", "people", "लोग", "भीड़", "जनता", "गाँव वाले", "गांव वाले", "police", "पुलिस")):
+        return "crowd"
+    if any(k in low for k in ("saas", "mother-in-law", "stepmother", "aunty", "chachi", "सास", "सौतेली", "बुआ")):
+        return "saas"
+    if any(k in low for k in ("villain", "don", "kaal", "boss", "gunda", "evil", "enemy", "rakshas", "shaitan", "विलेन", "डॉन", "गुंडा", "दुश्मन", "काल")):
+        return "villain"
+    if any(k in low for k in ("heroine", "priya", "pooja", "anjali", "rani", "maa", "mother", "wife", "bahu", "girl", "woman", "ladki", "lady", "लड़की", "माँ", "रानी", "बहन", "पत्नी", "बहू")):
+        return "female"
+    if char_names and speaker_name == char_names[0]:
+        return "hero"
+    if len(char_names) >= 2 and speaker_name == char_names[1]:
+        entry_v = str(char_map[speaker_name].get("voice", ""))
+        if "Swara" in entry_v or "Neerja" in entry_v:
+            return "female"
+        return "villain"
+    entry = char_map.get(speaker_name) or {}
+    if "Swara" in str(entry.get("voice", "")) or "Neerja" in str(entry.get("voice", "")):
+        return "female"
+    return "hero"
+
+
+def resolve_character_voice_profile(
+    speaker_name: str,
+    char_entry: Optional[dict],
+    char_map: dict,
+    language: str = "Hindi",
+    scene_idx: int = 0,
+) -> tuple[str, str, str]:
+    """
+    Return distinct (edge_tts_voice, pitch_hz, rate_pct) per Pocket FM / Bollywood drama role:
+    - Dramatic Narrator: hi-IN-MadhurNeural, suspense storytelling pitch="-4Hz", rate="+4%"
+    - Hero: hi-IN-MadhurNeural, bold heroic pitch="+3Hz", rate="+2%"
+    - Villain: hi-IN-MadhurNeural, heavy dangerous bass pitch="-14Hz", rate="-6%"
+    - Saas / Sharp Female Villain: hi-IN-SwaraNeural, sharp tone pitch="-4Hz", rate="+3%"
+    - Female / Heroine: hi-IN-SwaraNeural, pitch="+4Hz", rate="+2%"
+    - Crowd / Log: hi-IN-SwaraNeural / pitch variations
+    """
+    lang = normalize_language(language)
+    role = detect_speaker_role(speaker_name, char_map)
+    raw_pitch_key = normalize_pitch((char_entry or {}).get("pitch", "normal"))
+    explicit_voice = str((char_entry or {}).get("voice", "") or "").strip()
+
+    if lang == "English":
+        if role == "narrator":
+            return ("en-IN-PrabhatNeural", "-4Hz", "+4%")
+        if role == "saas":
+            return ("en-IN-NeerjaNeural", "-4Hz", "+3%")
+        if role in ("female", "crowd") or "Swara" in explicit_voice or "Neerja" in explicit_voice:
+            return ("en-IN-NeerjaNeural", "+4Hz" if role == "female" else "+8Hz", "+4%")
+        if role == "villain":
+            return ("en-IN-PrabhatNeural", "-14Hz", "-6%")
+        return ("en-IN-PrabhatNeural", "+3Hz", "+2%")
+
+    # Respect explicit non-normal user pitch preset if chosen
+    if raw_pitch_key != "normal" and raw_pitch_key in PITCH_PRESETS:
+        p = PITCH_PRESETS[raw_pitch_key]
+        v = explicit_voice if explicit_voice else ("hi-IN-SwaraNeural" if role in ("female", "saas", "crowd") else "hi-IN-MadhurNeural")
+        if v == "en-IN-PrabhatNeural":
+            v = "hi-IN-MadhurNeural"
+        return (v, p["pitch"], p["rate"])
+
+    if role == "narrator":
+        return ("hi-IN-MadhurNeural", "-4Hz", "+4%")
+    if role == "villain":
+        return ("hi-IN-MadhurNeural", "-14Hz", "-6%")
+    if role == "saas":
+        return ("hi-IN-SwaraNeural", "-4Hz", "+3%")
+    if role == "crowd":
+        crowd_variants = [
+            ("hi-IN-SwaraNeural", "+6Hz", "+6%"),
+            ("hi-IN-MadhurNeural", "+8Hz", "+8%"),
+            ("hi-IN-SwaraNeural", "-4Hz", "+4%"),
+        ]
+        return crowd_variants[scene_idx % len(crowd_variants)]
+    if role == "female" or "Swara" in explicit_voice:
+        return ("hi-IN-SwaraNeural", "+4Hz", "+2%")
+    # Default Hero bold commanding tone
+    return ("hi-IN-MadhurNeural", "+3Hz", "+2%")
+
+
+def _get_or_create_role_portrait(role_kind: str, proj_dir: str) -> Optional[str]:
+    """
+    Generate and cache a realistic Bollywood Villain or Crowd face portrait ONLY when
+    the script introduces Villain or Log/Crowd speakers that the user did not upload a photo for.
+    Uploaded user characters NEVER use this — they stay 100% locked to the user's 5-angle scan.
+    """
+    clean_role = "crowd" if role_kind == "crowd" else "villain"
+    out_path = safe_project_file(proj_dir, f"auto_role_{clean_role}.jpg")
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 4000:
+        return out_path
+
+    prompt = (
+        "Close-up cinematic portrait of dramatic Indian Bollywood villain man with intense eyes, dark beard, leather jacket, moody rim lighting, 4K film still, photorealistic, looking at camera"
+        if clean_role == "villain"
+        else "Cinematic Bollywood movie shot of expressive Indian street crowd people reacting excitedly in dramatic city night lighting, photorealistic 4K film still, clear faces"
+    )
+    # Fast photorealistic portrait fetch via Pollinations Flux
+    try:
+        encoded = urllib.parse.quote(prompt, safe="")
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=768&model=flux&nologo=true&seed={42 if clean_role == 'villain' else 99}"
+        resp = requests.get(url, timeout=12)
+        if resp.status_code == 200 and len(resp.content) > 5000:
+            save_upright_image_bytes(resp.content, out_path, max_side=960)
+            return out_path
+    except Exception:
+        pass
+    return None
+
+
 def resolve_character_name(raw_name: object, char_map: dict, fallback_idx: int = 0) -> str:
-    """Strictly resolve dialogue speaker to one of the user's uploaded characters (case-insensitive & multi-char aware)."""
+    """Resolve dialogue speaker accurately: preserves Villain/Crowd roles if distinct, and strictly locks user characters."""
     char_names = list(char_map.keys())
     if not char_names:
-        return "Actor"
+        return "Hero"
     raw = str(raw_name or "").strip()
     if raw in char_map:
         return raw
     raw_low = raw.lower()
     if raw_low:
-        # Case-insensitive exact match
         for cn in char_names:
             if cn.lower() == raw_low:
                 return cn
-        # Substring / first-name match (e.g. "Akash Tyagi" <-> "Akash")
         for cn in char_names:
             cn_low = cn.lower()
             if cn_low in raw_low or raw_low in cn_low:
@@ -133,18 +373,22 @@ def resolve_character_name(raw_name: object, char_map: dict, fallback_idx: int =
             raw_first = raw_low.split()[0]
             if len(cn_first) >= 2 and cn_first == raw_first:
                 return cn
-        # Role hint mapping if user named characters Hero / Villain or 2+ characters exist
+        # If user uploaded 2+ characters, map villain mentions to character #2
         if len(char_names) >= 2 and any(k in raw_low for k in ("villain", "don", "boss", "enemy", "विलेन", "डॉन", "दुश्मन")):
             return char_names[1]
-    # Round-robin across user's uploaded characters so all uploaded cast appear naturally
+        # If user uploaded only 1 hero photo and script explicitly has Villain or Crowd/Log, keep distinct speaker label!
+        if any(k in raw_low for k in ("villain", "don", "kaal", "boss", "विलेन", "डॉन", "दुश्मन")):
+            return "Villain"
+        if any(k in raw_low for k in ("log", "crowd", "public", "people", "लोग", "भीड़", "जनता", "गाँव वाले")):
+            return "Log (Crowd)"
     return char_names[fallback_idx % len(char_names)]
 
 PITCH_PRESETS = {
-    "normal": {"pitch": "+0Hz", "rate": "+0%", "label": "Normal"},
-    "hero_deep": {"pitch": "-12Hz", "rate": "-5%", "label": "Heroic Deep"},
-    "heavy_villain": {"pitch": "-24Hz", "rate": "-12%", "label": "Heavy Villain"},
-    "cute_kid": {"pitch": "+30Hz", "rate": "+10%", "label": "Cute Kid"},
-    "fast_comic": {"pitch": "+12Hz", "rate": "+18%", "label": "Fast Comedy"},
+    "normal": {"pitch": "+2Hz", "rate": "+0%", "label": "Hero Clear"},
+    "hero_deep": {"pitch": "-8Hz", "rate": "-3%", "label": "Heroic Deep"},
+    "heavy_villain": {"pitch": "-14Hz", "rate": "-6%", "label": "Heavy Villain"},
+    "cute_kid": {"pitch": "+26Hz", "rate": "+10%", "label": "Cute Kid"},
+    "fast_comic": {"pitch": "+10Hz", "rate": "+14%", "label": "Fast Comedy"},
 }
 
 LOCATION_RULES = [
@@ -1029,16 +1273,20 @@ async def generate_bulletproof_audio(
     out_mp3: str,
     pitch: str = "normal",
     language: str = "Hindi",
+    pitch_override: Optional[str] = None,
+    rate_override: Optional[str] = None,
 ):
-    clean_text = text.strip() or "नमस्ते दोस्तों!"
+    clean_text = clean_spoken_dialogue(text) or "आगे देखो क्या होता है!"
     resolved_voice = _resolve_tts_voice(voice, language)
     preset = PITCH_PRESETS.get(normalize_pitch(pitch), PITCH_PRESETS["normal"])
+    use_pitch = pitch_override if pitch_override else preset["pitch"]
+    use_rate = rate_override if rate_override else preset["rate"]
     try:
         comm = edge_tts.Communicate(
             clean_text,
             resolved_voice,
-            rate=preset["rate"],
-            pitch=preset["pitch"],
+            rate=use_rate,
+            pitch=use_pitch,
         )
         await asyncio.wait_for(comm.save(out_mp3), timeout=18.0)
         if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 500:
@@ -1069,7 +1317,7 @@ async def generate_bulletproof_audio(
             "-i",
             "anullsrc=r=44100:cl=stereo",
             "-t",
-            "3",
+            "3.5",
             "-q:a",
             "9",
             "-acodec",
@@ -1177,63 +1425,87 @@ def generate_sfx_wav(sfx_type: str, duration: float, out_wav: str) -> bool:
 
 
 def mix_cinematic_audio(
-    dialogue_path: str, mood: str, sfx_type: str, out_mixed_mp3: str
+    dialogue_path: str,
+    mood: str,
+    sfx_type: str,
+    out_mixed_mp3: str,
+    target_duration_sec: float = 0.0,
 ) -> str:
-    dur = _probe_audio_duration(dialogue_path)
+    """
+    Mix Hindi character dialogue with Bollywood Action BGM + Rain/Fight Foley SFX
+    using automatic sidechain audio ducking (BGM ducks low during speech, swells in pauses)
+    and optional target_duration_sec pacing for exact ~60s 1-minute reels.
+    """
+    raw_dur = _probe_audio_duration(dialogue_path)
+    total_dur = max(raw_dur + 0.45, min(14.0, float(target_duration_sec or 0.0)))
     bgm_wav = f"{out_mixed_mp3}_bgm.wav"
     sfx_wav = f"{out_mixed_mp3}_sfx.wav"
     try:
-        generate_bgm_wav(mood, dur + 0.25, bgm_wav)
-        has_sfx = generate_sfx_wav(sfx_type, dur + 0.25, sfx_wav)
+        generate_bgm_wav(mood, total_dur + 0.3, bgm_wav)
+        has_sfx = generate_sfx_wav(sfx_type, total_dur + 0.3, sfx_wav)
+        pad_tail = max(0.25, total_dur - raw_dur)
+
         if has_sfx and os.path.exists(sfx_wav):
+            fc = (
+                f"[0:a]apad=pad_dur={pad_tail:.2f},atrim=0:{total_dur:.2f},volume=1.18,asplit=2[dmain][dsc];"
+                f"[1:a]atrim=0:{total_dur:.2f},volume=0.22[braw];"
+                f"[braw][dsc]sidechaincompress=threshold=0.03:ratio=5:attack=15:release=260[bduck];"
+                f"[2:a]atrim=0:{total_dur:.2f},volume=0.28[s];"
+                f"[dmain][bduck][s]amix=inputs=3:duration=first:dropout_transition=2:normalize=0[aout]"
+            )
             cmd = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                dialogue_path,
-                "-i",
-                bgm_wav,
-                "-i",
-                sfx_wav,
-                "-filter_complex",
-                "[0:a]volume=1.0[d];[1:a]volume=0.20[b];[2:a]volume=0.35[s];[d][b][s]amix=inputs=3:duration=first:dropout_transition=2:normalize=0[aout]",
-                "-map",
-                "[aout]",
-                "-c:a",
-                "libmp3lame",
-                "-b:a",
-                "128k",
+                "ffmpeg", "-y",
+                "-i", dialogue_path,
+                "-i", bgm_wav,
+                "-i", sfx_wav,
+                "-filter_complex", fc,
+                "-map", "[aout]",
+                "-c:a", "libmp3lame", "-b:a", "128k",
                 out_mixed_mp3,
             ]
         else:
+            fc = (
+                f"[0:a]apad=pad_dur={pad_tail:.2f},atrim=0:{total_dur:.2f},volume=1.18,asplit=2[dmain][dsc];"
+                f"[1:a]atrim=0:{total_dur:.2f},volume=0.22[braw];"
+                f"[braw][dsc]sidechaincompress=threshold=0.03:ratio=5:attack=15:release=260[bduck];"
+                f"[dmain][bduck]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
+            )
             cmd = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                dialogue_path,
-                "-i",
-                bgm_wav,
-                "-filter_complex",
-                "[0:a]volume=1.0[d];[1:a]volume=0.20[b];[d][b]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]",
-                "-map",
-                "[aout]",
-                "-c:a",
-                "libmp3lame",
-                "-b:a",
-                "128k",
+                "ffmpeg", "-y",
+                "-i", dialogue_path,
+                "-i", bgm_wav,
+                "-filter_complex", fc,
+                "-map", "[aout]",
+                "-c:a", "libmp3lame", "-b:a", "128k",
                 out_mixed_mp3,
             ]
         subprocess.run(
             cmd,
             check=True,
-            timeout=20,
+            timeout=22,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         if os.path.exists(out_mixed_mp3) and os.path.getsize(out_mixed_mp3) > 500:
             return out_mixed_mp3
     except Exception:
-        pass
+        # Clean non-sidechain fallback if older ffmpeg build
+        try:
+            cmd_fb = [
+                "ffmpeg", "-y",
+                "-i", dialogue_path,
+                "-i", bgm_wav,
+                "-filter_complex",
+                f"[0:a]apad=pad_dur={max(0.25, total_dur - raw_dur):.2f},atrim=0:{total_dur:.2f},volume=1.15[d];"
+                f"[1:a]atrim=0:{total_dur:.2f},volume=0.14[b];"
+                f"[d][b]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]",
+                "-map", "[aout]", "-c:a", "libmp3lame", "-b:a", "128k", out_mixed_mp3,
+            ]
+            subprocess.run(cmd_fb, check=True, timeout=18, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(out_mixed_mp3) and os.path.getsize(out_mixed_mp3) > 500:
+                return out_mixed_mp3
+        except Exception:
+            pass
     finally:
         for p in (bgm_wav, sfx_wav):
             if os.path.exists(p):
@@ -1255,108 +1527,135 @@ def _draw_vertical_gradient(img: Image.Image, top_rgb, bottom_rgb):
         draw.line([(0, y), (w, y)], fill=(r, g, b))
 
 
-def render_location_backdrop(location_key: str, mood: str) -> Image.Image:
-    W, H = 1280, 720
-    bg = Image.new("RGB", (W, H), (12, 9, 24))
+def get_aspect_dimensions(aspect_ratio: str = "16:9") -> tuple[int, int]:
+    """Return exact (width, height) for Instagram/Moj 9:16 Vertical (720x1280) vs YouTube 16:9 Landscape (1280x720)."""
+    clean = str(aspect_ratio or "16:9").strip().replace("x", ":").replace("/", ":")
+    if clean in ("9:16", "vertical", "reel", "moj", "instagram", "720:1280"):
+        return (720, 1280)
+    return (1280, 720)
 
+
+def _try_hf_scene_faceswap(scene_img_path: str, actor_face_path: str, out_path: str) -> Optional[str]:
+    """
+    Seamlessly merge the user's scanned face onto the full-screen AI drama scene's hero using
+    100% FREE HuggingFace Face-Swap spaces (`tonyassi/face-swap`, `ezioruan/inswapper`).
+    Returns out_path on success, or None to fall back to seamless skin-tone feathered compositing.
+    """
+    if not scene_img_path or not actor_face_path or not os.path.exists(scene_img_path) or not os.path.exists(actor_face_path):
+        return None
+    for space_id in ("tonyassi/face-swap", "ezioruan/inswapper"):
+        try:
+            hf_client = Client(space_id)
+            res = hf_client.predict(
+                handle_file(actor_face_path),
+                handle_file(scene_img_path),
+                api_name="/predict",
+            )
+            swapped = None
+            if isinstance(res, str) and os.path.exists(res):
+                swapped = res
+            elif isinstance(res, dict):
+                swapped = res.get("path") or res.get("url")
+            elif isinstance(res, (list, tuple)):
+                for item in res:
+                    if isinstance(item, str) and os.path.exists(item):
+                        swapped = item
+                        break
+                    if isinstance(item, dict) and item.get("path") and os.path.exists(item["path"]):
+                        swapped = item["path"]
+                        break
+            if swapped and os.path.exists(swapped) and os.path.getsize(swapped) > 4000:
+                open_upright_image(swapped).save(out_path, "JPEG", quality=93)
+                return out_path
+        except Exception:
+            continue
+    return None
+
+
+def render_location_backdrop(
+    location_key: str,
+    mood: str,
+    prompt_hint: str = "",
+    aspect_ratio: str = "16:9",
+) -> Image.Image:
+    """
+    Generate a FULL-SCREEN Pocket FM / Moj 3D Graphic-Novel / Realistic Bollywood drama scene
+    at exact 9:16 (720x1280) or 16:9 (1280x720) via 100% FREE `image.pollinations.ai` Flux model.
+    ZERO cartoon rectangles/huts and ZERO paid APIs!
+    """
+    W, H = get_aspect_dimensions(aspect_ratio)
+    loc_descriptions = {
+        "village_field": "golden sunset Indian mustard wheat field rural cinematic landscape, dramatic clouds, warm lens flare, 3D graphic novel Bollywood drama scene",
+        "haunted_mansion": "ancient spooky Indian royal haveli mansion at night in blue fog and moonlight, dramatic horror thriller cinema atmosphere, photorealistic",
+        "mumbai_rain": "Mumbai city street in heavy monsoon rain at night, wet asphalt neon reflections, dramatic Bollywood action cinema scene, bokeh",
+        "deep_jungle": "dense misty Indian forest jungle with dramatic volumetric sunbeams through trees, cinematic adventure drama scene",
+        "police_station": "dramatic dark Indian police headquarters interior at night with red and blue siren bokeh reflections, crime thriller cinema scene",
+        "outer_space": "deep cosmic nebula and glowing planet in outer space, realistic IMAX sci-fi drama backdrop",
+        "royal_palace": "grand Rajasthani Indian royal palace hall lit with golden chandeliers and torches, epic Pocket FM Bollywood drama set",
+        "mountains": "dramatic snow-capped Himalayan mountain peaks in twilight mist, epic Bollywood cinema landscape",
+        "desert_fort": "majestic Rajasthan desert sandstone fort at fiery sunset, golden dust atmosphere, cinema background",
+        "courtroom": "dramatic wood-paneled Indian courtroom hall with warm directional sunlight beams, high-stakes Bollywood drama set",
+        "cyber_lab": "dark futuristic high-tech holographic command center lab with cyan rim lighting, sci-fi thriller set",
+        "city_street": "dramatic Indian metropolitan city highway at night with glowing neon bokeh lights and wet road, Bollywood action thriller scene",
+    }
+    desc = loc_descriptions.get(location_key, loc_descriptions["city_street"])
+    hint_clean = re.sub(r"[^a-zA-Z0-9 ,.-]", "", (prompt_hint or "")).strip()[:90]
+    cache_seed_str = f"{location_key}_{mood}_{W}x{H}_{hint_clean[:32]}"
+    cache_key = re.sub(r"[^a-zA-Z0-9_]", "_", cache_seed_str)[:70]
+    cache_path = f"/tmp/cinepop_scene_{cache_key}.jpg"
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 8000:
+        try:
+            return open_upright_image(cache_path).resize((W, H), Image.Resampling.LANCZOS)
+        except Exception:
+            pass
+
+    try:
+        scene_detail = f"{hint_clean}, " if hint_clean else ""
+        full_prompt = (
+            f"{scene_detail}{desc}, {mood} dramatic lighting, Pocket FM graphic novel meets 4K realistic Bollywood cinema still, "
+            f"anamorphic bokeh, ultra detailed, no text, no watermark"
+        )
+        encoded = urllib.parse.quote(full_prompt, safe="")
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model=flux&nologo=true&seed={abs(hash(cache_key)) % 99999}"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200 and len(resp.content) > 8000:
+            bg_img = open_upright_image(resp.content).resize((W, H), Image.Resampling.LANCZOS)
+            bg_img.save(cache_path, "JPEG", quality=91)
+            return bg_img
+    except Exception:
+        pass
+
+    # Fallback: Deep atmospheric photographic film gradient + soft anamorphic bokeh light orbs (NO cartoon shapes!)
+    bg = Image.new("RGB", (W, H), (10, 12, 22))
     palettes = {
-        "village_field": ((30, 58, 95), (231, 111, 81)),
-        "haunted_mansion": ((6, 8, 18), (28, 32, 62)),
-        "mumbai_rain": ((10, 18, 32), (26, 48, 72)),
-        "deep_jungle": ((6, 26, 18), (18, 64, 46)),
-        "police_station": ((15, 23, 42), (30, 41, 59)),
-        "outer_space": ((4, 4, 14), (24, 12, 58)),
-        "royal_palace": ((38, 11, 28), (168, 85, 16)),
-        "mountains": ((15, 23, 42), (100, 116, 139)),
-        "desert_fort": ((67, 20, 7), (217, 119, 6)),
-        "courtroom": ((28, 17, 10), (74, 44, 24)),
-        "cyber_lab": ((4, 12, 26), (12, 48, 78)),
-        "city_street": ((11, 14, 29), (36, 28, 82)),
+        "village_field": ((24, 34, 58), (120, 62, 28)),
+        "haunted_mansion": ((6, 10, 22), (22, 30, 54)),
+        "mumbai_rain": ((8, 16, 30), (18, 42, 68)),
+        "deep_jungle": ((6, 22, 16), (16, 52, 36)),
+        "police_station": ((10, 14, 28), (28, 22, 46)),
+        "outer_space": ((4, 5, 16), (22, 14, 52)),
+        "royal_palace": ((28, 10, 18), (92, 44, 16)),
+        "mountains": ((12, 20, 36), (52, 68, 92)),
+        "desert_fort": ((42, 16, 8), (128, 62, 16)),
+        "courtroom": ((22, 14, 10), (58, 36, 20)),
+        "cyber_lab": ((4, 14, 28), (10, 48, 72)),
+        "city_street": ((10, 14, 28), (32, 22, 58)),
     }
     top_c, bot_c = palettes.get(location_key, palettes["city_street"])
     _draw_vertical_gradient(bg, top_c, bot_c)
-    draw = ImageDraw.Draw(bg, "RGBA")
 
-    if location_key == "village_field":
-        # Golden sunset sun + mustard fields + village huts
-        draw.ellipse([120, 80, 320, 280], fill=(255, 224, 130, 180))
-        draw.rectangle([0, 420, W, H], fill=(56, 94, 18, 255))
-        for row in range(8):
-            y = 430 + row * 28
-            draw.rectangle([0, y, W, y + 12], fill=(234, 179, 8, 95))
-        for hx in [130, 260, 1020]:
-            draw.rectangle([hx, 370, hx + 72, 425], fill=(48, 26, 20, 255))
-            draw.polygon([(hx - 14, 370), (hx + 36, 330), (hx + 86, 370)], fill=(35, 18, 14, 255))
-            draw.rectangle([hx + 28, 392, hx + 44, 412], fill=(251, 191, 36, 220))
-    elif location_key == "haunted_mansion":
-        draw.ellipse([930, 60, 1090, 220], fill=(226, 232, 240, 200))
-        draw.rectangle([90, 220, 350, 560], fill=(10, 12, 24, 245))
-        draw.polygon([(140, 220), (220, 110), (300, 220)], fill=(10, 12, 24, 245))
-        draw.rectangle([150, 280, 180, 330], fill=(251, 146, 60, 190))
-        draw.rectangle([260, 280, 290, 330], fill=(251, 146, 60, 190))
-        draw.rectangle([0, 460, W, H], fill=(148, 163, 184, 42))
-    elif location_key in ("mumbai_rain", "city_street"):
-        for bx, bw, bh in [(20, 115, 360), (150, 130, 430), (295, 95, 310), (885, 115, 390), (1015, 135, 440), (1165, 100, 340)]:
-            draw.rectangle([bx, 520 - bh, bx + bw, 560], fill=(10, 16, 32, 245))
-            for wy in range(540 - bh, 500, 26):
-                for wx in range(bx + 14, bx + bw - 18, 22):
-                    col = (6, 182, 212, 185) if (wx + wy) % 4 == 0 else (251, 191, 36, 155)
-                    draw.rectangle([wx, wy, wx + 10, wy + 12], fill=col)
-        if location_key == "mumbai_rain":
-            for i in range(130):
-                rx = (i * 97) % W
-                ry = (i * 53) % H
-                draw.line([(rx, ry), (rx - 14, ry + 42)], fill=(186, 230, 253, 120), width=2)
-    elif location_key == "deep_jungle":
-        for tx in range(30, W, 145):
-            draw.rectangle([tx, 0, tx + 42, H], fill=(6, 32, 22, 225))
-            draw.ellipse([tx - 65, -40, tx + 115, 170], fill=(10, 48, 34, 215))
-        for f in range(36):
-            fx = (f * 103) % W
-            fy = 120 + (f * 61) % 420
-            draw.ellipse([fx, fy, fx + 7, fy + 7], fill=(250, 204, 21, 210))
-    elif location_key == "outer_space":
-        draw.ellipse([120, 90, 560, 490], fill=(192, 38, 211, 72))
-        for s in range(160):
-            sx = (s * 173) % W
-            sy = (s * 83) % H
-            sz = 3 if s % 5 == 0 else 2
-            draw.rectangle([sx, sy, sx + sz, sy + sz], fill=(255, 255, 255, 210))
-        draw.ellipse([960, 110, 1140, 290], fill=(37, 99, 235, 235))
-        draw.arc([890, 165, 1210, 240], 0, 360, fill=(245, 184, 0, 190), width=7)
-    elif location_key == "royal_palace":
-        for px in range(40, W, 240):
-            draw.rectangle([px, 0, px + 44, H], fill=(64, 18, 32, 230))
-            draw.rectangle([px + 8, 0, px + 14, H], fill=(245, 184, 0, 150))
-            draw.arc([px + 44, 60, px + 240, 260], 180, 360, fill=(251, 191, 36, 175), width=5)
-    elif location_key == "police_station":
-        draw.ellipse([-60, -40, 420, 420], fill=(239, 68, 68, 75))
-        draw.ellipse([W - 420, -40, W + 60, 420], fill=(59, 130, 246, 75))
-        for bx in range(70, 340, 36):
-            draw.rectangle([bx, 70, bx + 8, 560], fill=(148, 163, 184, 90))
-    elif location_key == "mountains":
-        draw.polygon([(-40, H), (180, 210), (420, 390), (680, 170), (960, 370), (1180, 220), (W + 40, H)], fill=(51, 65, 85, 235))
-        draw.polygon([(-40, H), (260, 340), (540, 460), (880, 310), (W + 40, H)], fill=(30, 41, 59, 245))
-    elif location_key == "desert_fort":
-        draw.rectangle([0, 420, W, H], fill=(154, 52, 18, 255))
-        draw.rectangle([80, 260, 360, 430], fill=(67, 20, 7, 245))
-        for bx in range(80, 350, 42):
-            draw.rectangle([bx, 240, bx + 22, 265], fill=(67, 20, 7, 245))
-    elif location_key == "cyber_lab":
-        for gx in range(0, W, 64):
-            draw.line([(gx, 0), (gx, H)], fill=(6, 182, 212, 65), width=1)
-        for gy in range(0, H, 64):
-            draw.line([(0, gy), (W, gy)], fill=(6, 182, 212, 65), width=1)
-        draw.ellipse([110, 190, 290, 370], outline=(34, 211, 238, 165), width=3)
-        draw.ellipse([990, 190, 1170, 370], outline=(34, 211, 238, 165), width=3)
-    elif location_key == "courtroom":
-        for px in range(40, W, 180):
-            draw.rectangle([px, 40, px + 34, 580], fill=(92, 42, 14, 190))
-
-    # Subtle mood atmosphere wash
-    rim = MOOD_RIM_COLORS.get(mood, (255, 59, 92))
-    wash = Image.new("RGBA", (W, H), (rim[0], rim[1], rim[2], 26))
-    bg = Image.alpha_composite(bg.convert("RGBA"), wash).convert("RGB")
+    bokeh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    bdraw = ImageDraw.Draw(bokeh)
+    rim = MOOD_RIM_COLORS.get(mood, (255, 88, 60))
+    rng = random.Random(hash(cache_key) & 0xFFFFFFFF)
+    for _ in range(20):
+        bx = rng.randint(-80, W + 80)
+        by = rng.randint(40, H - 80)
+        br = rng.randint(45, 165)
+        col = (rim[0], rim[1], rim[2], rng.randint(24, 62)) if rng.random() > 0.45 else (40, 180, 240, rng.randint(20, 48))
+        bdraw.ellipse([bx - br, by - br, bx + br, by + br], fill=col)
+    bokeh = bokeh.filter(ImageFilter.GaussianBlur(radius=40))
+    bg = Image.alpha_composite(bg.convert("RGBA"), bokeh).convert("RGB")
     return bg
 
 
@@ -1371,30 +1670,128 @@ def draw_channel_watermark(
     W, H = img.size
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     odraw = ImageDraw.Draw(overlay)
-    try:
-        font_wm = ImageFont.truetype(
-            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf", 20
-        )
-    except Exception:
-        font_wm = ImageFont.load_default()
-    box_w = min(340, max(150, len(text) * 13 + 38))
+    font_wm = load_hindi_font(19 if W < 900 else 20, bold=True)
+    box_w = min(W - 48, max(145, len(text) * 13 + 38))
     box_h = 38
     if watermark_position == "top-left":
-        x1, y1 = 28, 76
+        x1, y1 = 24, 28
     elif watermark_position == "bottom-right":
-        x1, y1 = W - box_w - 28, H - 156
+        x1, y1 = W - box_w - 24, H - (240 if H > W else 156)
     else:
-        x1, y1 = W - box_w - 28, 76
+        x1, y1 = W - box_w - 24, 28
     odraw.rounded_rectangle(
         [x1, y1, x1 + box_w, y1 + box_h],
-        radius=12,
-        fill=(12, 8, 28, 175),
-        outline=(255, 214, 0, 210),
+        radius=10,
+        fill=(12, 8, 28, 165),
+        outline=(255, 214, 0, 195),
         width=2,
     )
-    odraw.text((x1 + 16, y1 + 8), f"★ {text}", fill=(255, 214, 0, 240), font=font_wm)
+    odraw.text((x1 + 14, y1 + 7), f"★ {text}", fill=(255, 214, 0, 240), font=font_wm)
     composited = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
     img.paste(composited)
+
+
+def render_hindi_subtitle_png(
+    speaker_name: str,
+    dialogue: str,
+    out_png_path: str,
+    width: int = 1280,
+    height: int = 148,
+) -> Optional[str]:
+    """
+    Render a crystal-clear transparent PNG Hindi Devanagari subtitle strip (`Speaker: Dialogue`)
+    using PIL + Noto Sans Devanagari font so Hindi akshar NEVER show □□□ tofu boxes!
+    Auto-adapts typography and safe-zone padding for both 9:16 Reels (width=720) and 16:9 YouTube (width=1280).
+    """
+    clean_diag = clean_spoken_dialogue(dialogue)
+    if not clean_diag:
+        return None
+    full_line = f"{speaker_name.strip()}: {clean_diag}" if speaker_name.strip() else clean_diag
+
+    is_vertical = width < 900
+    if is_vertical and height < 220:
+        height = 240
+
+    strip = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(strip)
+
+    # Smooth translucent cinema gradient band at bottom (no harsh blocky box!)
+    for y in range(height):
+        alpha = int(218 * ((y / max(1, height - 1)) ** 1.25))
+        draw.line([(0, y), (width, y)], fill=(6, 6, 14, alpha))
+
+    font_size = 28 if is_vertical else 30
+    font_main = load_hindi_font(font_size, bold=True)
+    max_text_w = width - (76 if is_vertical else 110)
+
+    words = full_line.split()
+    lines: list[str] = []
+    cur = ""
+    for w in words:
+        test = f"{cur} {w}".strip()
+        try:
+            bbox = draw.textbbox((0, 0), test, font=font_main)
+            tw = bbox[2] - bbox[0]
+        except Exception:
+            tw = len(test) * 16
+        if tw > max_text_w and cur:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = test
+    if cur:
+        lines.append(cur)
+    max_lines = 3 if is_vertical else 2
+    lines = lines[:max_lines]
+
+    line_h = 40 if is_vertical else 42
+    bottom_pad = 64 if is_vertical else 22  # Extra safe-zone above Moj/Reels bottom UI
+    start_y = max(18, height - (len(lines) * line_h) - bottom_pad)
+    for idx, ln in enumerate(lines):
+        try:
+            bbox = draw.textbbox((0, 0), ln, font=font_main)
+            tw = bbox[2] - bbox[0]
+        except Exception:
+            tw = len(ln) * 16
+        tx = max(28, (width - tw) // 2)
+        ty = start_y + idx * line_h
+
+        if idx == 0 and ":" in ln and speaker_name.strip():
+            spk_part, rest_part = ln.split(":", 1)
+            spk_label = spk_part + ":"
+            try:
+                sb = draw.textbbox((0, 0), spk_label + " ", font=font_main)
+                spk_w = sb[2] - sb[0]
+            except Exception:
+                spk_w = len(spk_label) * 16
+            draw.text(
+                (tx, ty),
+                spk_label,
+                font=font_main,
+                fill=(255, 214, 0, 255),
+                stroke_width=3,
+                stroke_fill=(0, 0, 0, 240),
+            )
+            draw.text(
+                (tx + spk_w, ty),
+                rest_part.strip(),
+                font=font_main,
+                fill=(255, 255, 255, 255),
+                stroke_width=3,
+                stroke_fill=(0, 0, 0, 240),
+            )
+        else:
+            draw.text(
+                (tx, ty),
+                ln,
+                font=font_main,
+                fill=(255, 255, 255, 255),
+                stroke_width=3,
+                stroke_fill=(0, 0, 0, 240),
+            )
+
+    strip.save(out_png_path, "PNG")
+    return out_png_path
 
 
 def prepare_character_frame(
@@ -1408,72 +1805,95 @@ def prepare_character_frame(
     custom_bg_path: Optional[str] = None,
     watermark_text: str = "",
     watermark_position: str = "top-right",
+    aspect_ratio: str = "16:9",
+    visual_action_prompt: str = "",
 ):
-    W, H = 1280, 720
+    """
+    POCKET FM / MOJ FULL-SCREEN CINEMATIC DRAMA FRAME (720x1280 9:16 OR 1280x720 16:9):
+    - 100% DELETED square photo boxes, sticker frames, and cartoon buildings!
+    - Generates a full-screen 3D/Graphic-Novel/Realistic Bollywood scene via FREE Pollinations Flux.
+    - Seamlessly blends the user's EXIF-upright 5-angle scanned face edge-to-edge into the scene
+      (with optional free HF face-swap + soft cinematic radial lighting & atmospheric color match).
+    - Clean Hindi subtitles are overlaid separately as rock-steady PNG strips AFTER camera motion!
+    """
+    W, H = get_aspect_dimensions(aspect_ratio)
+    is_vertical = H > W
+
     if custom_bg_path and os.path.exists(custom_bg_path):
-        bg = Image.open(custom_bg_path).convert("RGB").resize((W, H), Image.Resampling.LANCZOS)
-        dark = Image.new("RGB", (W, H), (10, 8, 22))
-        bg = Image.blend(bg, dark, 0.25)
+        bg = open_upright_image(custom_bg_path).resize((W, H), Image.Resampling.LANCZOS)
     else:
-        bg = render_location_backdrop(location_key, mood)
-
-    base = Image.open(raw_img_path).convert("RGB")
-    aspect = base.width / max(base.height, 1)
-    new_h = 500
-    new_w = min(500, max(320, int(new_h * aspect)))
-    portrait = base.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    x_offset = (W - new_w) // 2
-    y_offset = 88
-
-    # Mood-colored rim border + drop shadow around foreground actor
-    rim_rgb = MOOD_RIM_COLORS.get(mood, (255, 59, 92))
-    draw = ImageDraw.Draw(bg)
-    draw.rounded_rectangle(
-        [x_offset - 5, y_offset - 5, x_offset + new_w + 5, y_offset + new_h + 5],
-        radius=18,
-        outline=rim_rgb,
-        width=4,
-    )
-
-    # Rounded mask for clean foreground character portrait
-    mask = Image.new("L", (new_w, new_h), 0)
-    mask_draw = ImageDraw.Draw(mask)
-    mask_draw.rounded_rectangle([0, 0, new_w, new_h], radius=16, fill=255)
-    bg.paste(portrait, (x_offset, y_offset), mask)
-
-    try:
-        font_badge = ImageFont.truetype(
-            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf", 24
+        bg = render_location_backdrop(
+            location_key, mood, prompt_hint=visual_action_prompt, aspect_ratio=aspect_ratio
         )
-        font_env = ImageFont.truetype(
-            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf", 19
-        )
-        font_sub = ImageFont.truetype(
-            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf", 27
-        )
-    except Exception:
-        font_badge = ImageFont.load_default()
-        font_env = ImageFont.load_default()
-        font_sub = ImageFont.load_default()
 
-    # Top-left Speaker badge
-    draw.rounded_rectangle([32, 22, 310, 68], radius=12, fill=(225, 29, 116))
-    draw.text((52, 30), char_name[:18], fill=(255, 255, 255), font=font_badge)
+    # Full-bleed edge-to-edge actor framing (NO pasted square box anywhere!)
+    actor = open_upright_image(raw_img_path)
+    aw, ah = actor.size
 
-    # Top-right Location + Mood badge
-    env_label = f"{location_label[:26]} | {mood}"
-    draw.rounded_rectangle([W - 440, 22, W - 32, 66], radius=18, fill=(14, 10, 28))
-    draw.text((W - 420, 32), env_label, fill=(226, 232, 240), font=font_env)
+    # Cover-scale actor generously so head & shoulders fill the full cinema shot naturally
+    if is_vertical:
+        scale = max((W * 1.04) / max(1, aw), (H * 0.72) / max(1, ah))
+    else:
+        scale = max((W * 0.68) / max(1, aw), (H * 1.06) / max(1, ah))
+    target_w = max(W if is_vertical else 720, int(aw * scale))
+    target_h = max(int(H * 0.68), int(ah * scale))
 
-    # Bottom cinema letterbox subtitle bar
-    draw.rectangle([0, 608, W, H], fill=(9, 7, 18))
-    short_diag = dialogue if len(dialogue) <= 84 else dialogue[:81] + "..."
-    draw.text((48, 638), short_diag, fill=(255, 214, 0), font=font_sub)
+    actor_resized = actor.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    actor_resized = ImageEnhance.Contrast(actor_resized).enhance(1.10)
+    actor_resized = ImageEnhance.Color(actor_resized).enhance(1.07)
+
+    # Match ambient lighting tint of the cinematic backdrop onto the actor so they belong to the scene
+    bg_small = bg.resize((16, 16), Image.Resampling.BILINEAR)
+    bg_avg = tuple(int(sum(p[c] for p in bg_small.getdata()) / 256) for c in range(3))
+    tint_layer = Image.new("RGB", actor_resized.size, bg_avg)
+    actor_graded = Image.blend(actor_resized, tint_layer, 0.14)
+
+    # Cinematic shallow depth-of-field background blur + moody contrast
+    bg_cin = bg.filter(ImageFilter.GaussianBlur(radius=3.5))
+    bg_cin = ImageEnhance.Brightness(bg_cin).enhance(0.76)
+    bg_cin = ImageEnhance.Contrast(bg_cin).enhance(1.12)
+
+    canvas_actor = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    px = (W - target_w) // 2
+    py = int(H * 0.06) if is_vertical else max(-45, min(14, int((H - target_h) * 0.18)))
+    canvas_actor.paste(actor_graded.convert("RGBA"), (px, py))
+
+    # Ultra-soft organic full-bleed cinema feather mask (NO visible box or edges!)
+    mask = Image.new("L", (W, H), 0)
+    mdraw = ImageDraw.Draw(mask)
+    if is_vertical:
+        rx = int(W * 0.56)
+        ry = int(H * 0.44)
+        cx, cy = W // 2, int(H * 0.44)
+    else:
+        rx = min(int(target_w * 0.46), int(W * 0.39))
+        ry = int(H * 0.66)
+        cx, cy = W // 2, int(H * 0.48)
+    mdraw.ellipse([cx - rx, cy - ry, cx + rx, cy + ry], fill=255)
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=68 if is_vertical else 72))
+
+    # Dramatic rim glow matching scene mood
+    rim_rgb = MOOD_RIM_COLORS.get(mood, (255, 88, 60))
+    rim_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    rdraw = ImageDraw.Draw(rim_layer)
+    rdraw.ellipse([cx - rx - 45, cy - ry, cx + rx + 45, cy + ry], fill=(rim_rgb[0], rim_rgb[1], rim_rgb[2], 74))
+    rim_layer = rim_layer.filter(ImageFilter.GaussianBlur(radius=76))
+
+    composed = Image.alpha_composite(bg_cin.convert("RGBA"), rim_layer)
+    composed = Image.composite(canvas_actor, composed, mask).convert("RGB")
+
+    # Anamorphic Bollywood teal-orange cinematic vignette
+    vignette = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    vdraw = ImageDraw.Draw(vignette)
+    vdraw.rectangle([0, 0, W, H], fill=(8, 12, 24, 38))
+    vdraw.ellipse([int(W * 0.10), int(H * 0.04), int(W * 0.90), int(H * 0.96)], fill=(0, 0, 0, 0))
+    vignette = vignette.filter(ImageFilter.GaussianBlur(radius=68))
+    composed = Image.alpha_composite(composed.convert("RGBA"), vignette).convert("RGB")
 
     if watermark_text:
-        draw_channel_watermark(bg, watermark_text, watermark_position)
+        draw_channel_watermark(composed, watermark_text, watermark_position)
 
-    bg.save(out_frame_path, "JPEG", quality=92)
+    composed.save(out_frame_path, "JPEG", quality=93)
 
 
 def _probe_audio_duration(audio_path: str) -> float:
@@ -1520,8 +1940,8 @@ def _try_ai_action_i2v_spaces(
     mood: str,
 ) -> Optional[str]:
     """
-    Attempt real Image-to-Video motion clip generation using free HuggingFace Spaces:
-    LTX-Video -> CogVideoX-5B -> Stable Video Diffusion (SVD).
+    Attempt real Image-to-Video motion clip generation using 100% FREE HuggingFace Spaces:
+    Wan-AI/Wan2.1 -> Lightricks/LTX-Video -> THUDM/CogVideoX-5B -> KwaiVGI/LivePortrait.
     Returns local path to generated MP4 if available, else None (fast fallback to FFmpeg Pro Motion VFX).
     """
     prompt_txt = (
@@ -1530,14 +1950,21 @@ def _try_ai_action_i2v_spaces(
         else f"Cinematic Bollywood {mood} scene, dynamic tracking camera movement, realistic lighting"
     )
     i2v_spaces = [
+        ("Wan-AI/Wan2.1", "wan"),
         ("Lightricks/ltx-video-distilled", "ltx"),
         ("THUDM/CogVideoX-5B-Space", "cogvideo"),
-        ("multimodalart/stable-video-diffusion", "svd"),
+        ("KwaiVGI/LivePortrait", "liveportrait"),
     ]
     for space_id, kind in i2v_spaces:
         try:
             hf_client = Client(space_id)
-            if kind == "ltx":
+            if kind == "wan":
+                res = hf_client.predict(
+                    image=handle_file(raw_img_path),
+                    prompt=prompt_txt,
+                    api_name="/predict",
+                )
+            elif kind == "ltx":
                 res = hf_client.predict(
                     prompt=prompt_txt,
                     negative_prompt="static image, blurry, distorted face, low quality",
@@ -1552,15 +1979,173 @@ def _try_ai_action_i2v_spaces(
                 )
             else:
                 res = hf_client.predict(
-                    image=handle_file(raw_img_path),
-                    seed=random.randint(1, 99999),
-                    randomize_seed=True,
-                    motion_bucket_id=145 if mood == "Action" else 110,
-                    fps_id=8,
-                    api_name="/video",
+                    handle_file(raw_img_path),
+                    api_name="/gpu_wrapped_execute_video",
                 )
             vid_path = _extract_gradio_video_path(res)
             if vid_path and os.path.getsize(vid_path) > 2000:
+                return vid_path
+        except Exception:
+            continue
+    return None
+
+
+def _extract_audio_speech_envelope(audio_path: str, total_frames: int, fps: int = 24) -> list[float]:
+    """
+    Compute real per-frame normalized speech amplitude (0.0 .. 1.0) directly from the Hindi
+    dialogue audio using FFmpeg PCM extraction + NumPy so mouth lip-sync opens/closes
+    precisely on every spoken Hindi syllable!
+    """
+    if not audio_path or not os.path.exists(audio_path) or np is None:
+        return [abs(math.sin(i * 0.45)) * 0.7 for i in range(total_frames)]
+    try:
+        raw_pcm = subprocess.check_output(
+            [
+                "ffmpeg", "-v", "error",
+                "-i", audio_path,
+                "-ac", "1", "-ar", "16000",
+                "-f", "s16le", "pipe:1",
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        samples = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        if len(samples) < 320:
+            return [0.0] * total_frames
+        spf = max(1, int(16000 / max(1, fps)))
+        env = []
+        for idx in range(total_frames):
+            s = idx * spf
+            seg = samples[s : s + spf]
+            if len(seg) == 0:
+                env.append(0.0)
+            else:
+                rms = float(np.sqrt(np.mean(seg * seg)))
+                env.append(rms)
+        peak = max(max(env), 0.02)
+        norm = [min(1.0, max(0.0, (v / peak) ** 0.75)) for v in env]
+        # Smooth envelope slightly so lip motion looks organic
+        smoothed = []
+        for i in range(len(norm)):
+            prev_v = norm[i - 1] if i > 0 else norm[i]
+            next_v = norm[i + 1] if i + 1 < len(norm) else norm[i]
+            smoothed.append(0.25 * prev_v + 0.50 * norm[i] + 0.25 * next_v)
+        return smoothed
+    except Exception:
+        return [abs(math.sin(i * 0.45)) * 0.65 for i in range(total_frames)]
+
+
+def _apply_speech_lipsync_mouth_motion(frame_bgr, mouth_open: float, head_box: tuple[int, int, int, int]):
+    """
+    Drive realistic rhythmic mouth-opening & lower-jaw articulation on the speaker's face
+    driven by the real Hindi dialogue RMS amplitude (ZERO CascadeClassifier!).
+    """
+    if cv2 is None or np is None or mouth_open < 0.08:
+        return frame_bgr
+    h, w = frame_bgr.shape[:2]
+    fx, fy, fw, fh = head_box
+    if fw < 40 or fh < 40:
+        return frame_bgr
+
+    # Mouth center sits cleanly around ~73% down the tracked face box
+    mcx = int(fx + fw * 0.50)
+    mcy = int(fy + fh * 0.73)
+    mrw = max(14, int(fw * 0.17))
+    mrh = max(8, int(fh * 0.085))
+
+    x1 = max(0, mcx - mrw * 2)
+    x2 = min(w, mcx + mrw * 2)
+    y1 = max(0, mcy - mrh * 2)
+    y2 = min(h, mcy + mrh * 3)
+    roi_h, roi_w = y2 - y1, x2 - x1
+    if roi_h < 18 or roi_w < 24:
+        return frame_bgr
+
+    roi = frame_bgr[y1:y2, x1:x2].copy()
+    # Local vertical jaw stretch downward proportional to spoken syllable loudness
+    yy, xx = np.mgrid[0:roi_h, 0:roi_w].astype(np.float32)
+    local_cx = float(mcx - x1)
+    local_cy = float(mcy - y1)
+    dx = (xx - local_cx) / max(1.0, float(mrw * 1.35))
+    dy = (yy - local_cy) / max(1.0, float(mrh * 1.75))
+    dist2 = dx * dx + dy * dy
+    falloff = np.exp(-dist2 * 1.45)
+
+    # Pull lower lip/jaw subtly downward & upper lip slightly upward when speaking loudly
+    amp = min(1.0, mouth_open) * max(2.2, mrh * 0.58)
+    direction = np.where(yy >= local_cy, -1.0, 0.35)
+    map_y = np.clip(yy + direction * amp * falloff, 0, roi_h - 1).astype(np.float32)
+    map_x = xx
+    warped = cv2.remap(roi, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+    # Subtle realistic inner mouth cavity shadow when opening mouth on loud vowels
+    if mouth_open > 0.24:
+        cavity = warped.copy()
+        open_h = max(2, int(mrh * 0.62 * min(1.0, mouth_open)))
+        open_w = max(8, int(mrw * 0.72))
+        cv2.ellipse(
+            cavity,
+            (int(local_cx), int(local_cy + open_h * 0.15)),
+            (open_w, open_h),
+            0, 0, 360,
+            (22, 18, 34),
+            -1,
+            cv2.LINE_AA,
+        )
+        # Soft feather inner mouth shadow so it never looks drawn-on
+        cav_alpha = min(0.55, (mouth_open - 0.18) * 0.65)
+        warped = cv2.addWeighted(cavity, cav_alpha, warped, 1.0 - cav_alpha, 0)
+
+    frame_bgr[y1:y2, x1:x2] = warped
+    return frame_bgr
+
+
+def _try_talking_lipsync_spaces(
+    face_img_path: str,
+    dialogue_audio_path: str,
+) -> Optional[str]:
+    """
+    Real AI Talking Lip-Sync via free HuggingFace Spaces:
+    vinthony/SadTalker -> camenduru/Wav2Lip -> KwaiVGI/LivePortrait
+    Returns path to real lip-synced talking-head video if space responds, else None.
+    """
+    if not face_img_path or not os.path.exists(face_img_path) or not dialogue_audio_path or not os.path.exists(dialogue_audio_path):
+        return None
+
+    mirrors = [
+        ("vinthony/SadTalker", "sadtalker"),
+        ("camenduru/Wav2Lip", "wav2lip"),
+        ("KwaiVGI/LivePortrait", "liveportrait"),
+    ]
+    for space_id, kind in mirrors:
+        try:
+            hf_client = Client(space_id)
+            if kind == "sadtalker":
+                res = hf_client.predict(
+                    source_image=handle_file(face_img_path),
+                    driven_audio=handle_file(dialogue_audio_path),
+                    preprocess="crop",
+                    still_mode=False,
+                    use_enhancer=False,
+                    batch_size=1,
+                    size_of_image=256,
+                    pose_style=0,
+                    api_name="/test",
+                )
+            elif kind == "wav2lip":
+                res = hf_client.predict(
+                    face=handle_file(face_img_path),
+                    audio=handle_file(dialogue_audio_path),
+                    api_name="/predict",
+                )
+            else:
+                res = hf_client.predict(
+                    source_image=handle_file(face_img_path),
+                    driving_audio=handle_file(dialogue_audio_path),
+                    api_name="/predict",
+                )
+            vid_path = _extract_gradio_video_path(res)
+            if vid_path and os.path.exists(vid_path) and os.path.getsize(vid_path) > 2000:
                 return vid_path
         except Exception:
             continue
@@ -1573,13 +2158,19 @@ def _render_pro_motion_vfx_clip(
     out_mp4: str,
     mood: str = "Action",
     sfx_type: str = "none",
+    dialogue_audio_path: Optional[str] = None,
+    subtitle_png_path: Optional[str] = None,
+    aspect_ratio: str = "16:9",
 ) -> bool:
     """
-    High-Octane FFmpeg + OpenCV Pro Motion & VFX Engine (ZERO static still frames):
-    - Smooth zoompan camera tracking & directional dolly
-    - Camera shake / impact jitter on Action / punch / explosion / thunder / sword
-    - Radial action speed lines, dynamic lighting flashes, and glowing particle overlays
+    Full-Screen Cinematic Talking Lip-Sync + Pro Motion VFX Engine (Supports both 9:16 720x1280 & 16:9 1280x720):
+    - Real audio-envelope synchronized mouth lip movement + syllable head-nod micro-motion
+    - Fast-paced camera tracking zoom/pan + combat shake on Action/punch/explosion/thunder/sword
+    - Rain streaks, fiery sparks, atmospheric bokeh particles & dynamic lighting flashes
+    - Rock-steady PIL Noto Sans Devanagari PNG Hindi subtitle strip overlaid cleanly at bottom
     """
+    w_out, h_out = get_aspect_dimensions(aspect_ratio)
+    src_w, src_h = int(w_out * 1.2), int(h_out * 1.2)
     dur = _probe_audio_duration(final_audio)
     fps = 24
     total_frames = max(36, int(dur * fps))
@@ -1588,22 +2179,25 @@ def _render_pro_motion_vfx_clip(
         or sfx_type in ("punch", "explosion", "thunder", "sword")
     )
 
-    # Path A: OpenCV real-time animated VFX compositor (camera tracking + shake + speed lines + particles + dynamic lighting)
+    speech_env = _extract_audio_speech_envelope(
+        dialogue_audio_path or final_audio, total_frames, fps=fps
+    )
+
     if OPENCV_AVAILABLE and cv2 is not None and np is not None:
         raw_vfx_mp4 = f"{out_mp4}_vfx_raw.mp4"
         try:
             base = cv2.imread(framed_img_path)
             if base is not None:
-                h_out, w_out = 720, 1280
-                # Oversample source for smooth camera tracking & shake without black borders
-                src = cv2.resize(base, (1536, 864), interpolation=cv2.INTER_LINEAR)
+                src = cv2.resize(base, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
                 sh, sw = src.shape[:2]
+
+                # Track the speaker's face region once on the oversampled frame (ZERO CascadeClassifier!)
+                face_box_src = _detect_skin_face_box(src)
 
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 writer = cv2.VideoWriter(raw_vfx_mp4, fourcc, fps, (w_out, h_out))
 
                 rng = random.Random(hash(framed_img_path) & 0xFFFFFFFF)
-                # Pre-seed particles (embers/sparks for Action, rain streaks for Rain, glowing bokeh for Romantic/Comedy)
                 particles = [
                     {
                         "x": rng.uniform(0, w_out),
@@ -1611,43 +2205,50 @@ def _render_pro_motion_vfx_clip(
                         "vx": rng.uniform(-7.5, -2.5) if sfx_type in ("rain", "thunder") else rng.uniform(-3.0, 3.0),
                         "vy": rng.uniform(16.0, 26.0) if sfx_type in ("rain", "thunder") else rng.uniform(-4.2, -1.2),
                         "r": rng.randint(2, 5),
-                        "phase": rng.uniform(0, 6.28),
                     }
-                    for _ in range(55 if high_impact or sfx_type in ("rain", "thunder") else 28)
+                    for _ in range(52 if high_impact or sfx_type in ("rain", "thunder") else 24)
                 ]
 
                 for f_idx in range(total_frames):
                     t = f_idx / max(1, total_frames - 1)
-                    # 1. Mood-aware smooth camera tracking zoom + pan
-                    if mood == "Action":
-                        zoom = 1.04 + 0.14 * t + 0.015 * math.sin(f_idx * 0.45)
-                        pan_x = math.sin(t * math.pi * 1.4) * 44.0
-                        pan_y = math.cos(t * math.pi * 1.1) * 18.0
-                    elif mood == "Suspense":
-                        zoom = 1.02 + 0.11 * t
-                        pan_x = math.sin(t * math.pi) * 28.0
-                        pan_y = -14.0 * t
-                    elif mood == "Comedy":
-                        zoom = 1.04 + 0.05 * abs(math.sin(f_idx * 0.16))
-                        pan_x = math.sin(f_idx * 0.14) * 32.0
-                        pan_y = math.cos(f_idx * 0.12) * 10.0
-                    elif mood == "Romantic":
-                        zoom = 1.03 + 0.09 * t
-                        pan_x = -34.0 + 68.0 * t
-                        pan_y = math.sin(t * math.pi) * 14.0
-                    else:
-                        zoom = 1.03 + 0.10 * t
-                        pan_x = math.sin(t * math.pi * 0.8) * 22.0
-                        pan_y = -10.0 * t
+                    talk_amp = speech_env[f_idx] if f_idx < len(speech_env) else 0.0
 
-                    # 2. Camera shake / impact burst on high-impact moments
+                    # 1. Apply live speech-synchronized mouth & jaw talking animation on source frame
+                    work_src = _apply_speech_lipsync_mouth_motion(src.copy(), talk_amp, face_box_src)
+
+                    # 2. Natural speaking head-nod micro-motion + active-speaker subtle push-in zoom
+                    nod_y = math.sin(f_idx * 0.55) * (4.8 * talk_amp)
+                    nod_x = math.cos(f_idx * 0.32) * (2.6 * talk_amp)
+                    talk_zoom_boost = 0.014 * talk_amp
+
+                    if mood == "Action":
+                        zoom = 1.05 + 0.12 * t + talk_zoom_boost
+                        pan_x = math.sin(t * math.pi * 1.3) * 34.0 + nod_x
+                        pan_y = math.cos(t * math.pi * 1.1) * 14.0 + nod_y
+                    elif mood == "Suspense":
+                        zoom = 1.03 + 0.10 * t + talk_zoom_boost
+                        pan_x = math.sin(t * math.pi) * 24.0 + nod_x
+                        pan_y = -12.0 * t + nod_y
+                    elif mood == "Comedy":
+                        zoom = 1.04 + 0.05 * abs(math.sin(f_idx * 0.16)) + talk_zoom_boost
+                        pan_x = math.sin(f_idx * 0.14) * 26.0 + nod_x
+                        pan_y = math.cos(f_idx * 0.12) * 10.0 + nod_y
+                    elif mood == "Romantic":
+                        zoom = 1.03 + 0.08 * t + talk_zoom_boost
+                        pan_x = -28.0 + 56.0 * t + nod_x
+                        pan_y = math.sin(t * math.pi) * 12.0 + nod_y
+                    else:
+                        zoom = 1.03 + 0.09 * t + talk_zoom_boost
+                        pan_x = math.sin(t * math.pi * 0.8) * 18.0 + nod_x
+                        pan_y = -8.0 * t + nod_y
+
                     shake_x = 0.0
                     shake_y = 0.0
                     if high_impact:
-                        burst = 1.0 if (f_idx % 24) < 7 else 0.35
-                        amp = (13.0 if sfx_type in ("explosion", "punch") else 7.5) * burst
-                        shake_x = math.sin(f_idx * 1.9) * amp
-                        shake_y = math.cos(f_idx * 2.3) * (amp * 0.72)
+                        burst = 1.0 if (f_idx % 24) < 7 else 0.30
+                        amp_s = (11.5 if sfx_type in ("explosion", "punch") else 6.5) * burst
+                        shake_x = math.sin(f_idx * 1.9) * amp_s
+                        shake_y = math.cos(f_idx * 2.3) * (amp_s * 0.7)
 
                     crop_w = int(sw / zoom)
                     crop_h = int(sh / zoom)
@@ -1656,105 +2257,70 @@ def _render_pro_motion_vfx_clip(
                     x1 = max(0, min(sw - crop_w, cx - crop_w // 2))
                     y1 = max(0, min(sh - crop_h, cy - crop_h // 2))
                     frame = cv2.resize(
-                        src[y1 : y1 + crop_h, x1 : x1 + crop_w],
+                        work_src[y1 : y1 + crop_h, x1 : x1 + crop_w],
                         (w_out, h_out),
                         interpolation=cv2.INTER_LINEAR,
                     )
 
-                    # 3. Dynamic lighting & storm / impact flash modulation
-                    light_boost = 1.0
+                    # 3. Dynamic storm / impact / active-speaker rim lighting pulse
+                    light_boost = 1.0 + 0.03 * talk_amp
                     if sfx_type == "thunder" and (f_idx % 38) in (2, 3, 5):
-                        light_boost = 1.32
+                        light_boost = 1.30
                     elif sfx_type in ("explosion", "punch") and (f_idx % 28) in (1, 2):
-                        light_boost = 1.24
-                    elif mood == "Action":
-                        light_boost = 1.04 + 0.04 * math.sin(f_idx * 0.3)
-
+                        light_boost = 1.22
                     if abs(light_boost - 1.0) > 0.01:
-                        frame = cv2.convertScaleAbs(frame, alpha=light_boost, beta=4 if light_boost > 1.15 else 0)
+                        frame = cv2.convertScaleAbs(frame, alpha=light_boost, beta=3 if light_boost > 1.15 else 0)
 
-                    # 4. Speed lines overlay (Action / combat energy)
-                    if high_impact:
-                        overlay = frame.copy()
-                        cx_o, cy_o = w_out // 2, int(h_out * 0.44)
-                        num_lines = 26
-                        for k in range(num_lines):
-                            ang = (k / num_lines) * 2.0 * math.pi + (f_idx * 0.05)
-                            r_in = 340 + int(45 * math.sin(f_idx * 0.4 + k))
-                            r_out = 760
-                            p1 = (int(cx_o + math.cos(ang) * r_in), int(cy_o + math.sin(ang) * r_in))
-                            p2 = (int(cx_o + math.cos(ang) * r_out), int(cy_o + math.sin(ang) * r_out))
-                            line_col = (120, 210, 255) if k % 2 == 0 else (90, 80, 255)
-                            cv2.line(overlay, p1, p2, line_col, 2, cv2.LINE_AA)
-                        cv2.addWeighted(overlay, 0.24, frame, 0.76, 0, frame)
-
-                    # 5. Cinematic particles overlay (sparks, rain, bokeh, suspense dust)
+                    # 4. Atmospheric particles (rain streaks, fiery combat sparks, cinema bokeh)
                     p_overlay = frame.copy()
                     for p in particles:
                         p["x"] = (p["x"] + p["vx"]) % w_out
                         p["y"] = (p["y"] + p["vy"]) % h_out
                         px, py = int(p["x"]), int(p["y"])
                         if sfx_type in ("rain", "thunder"):
-                            cv2.line(
-                                p_overlay,
-                                (px, py),
-                                (px - 8, py + 24),
-                                (245, 225, 195),
-                                1,
-                                cv2.LINE_AA,
-                            )
+                            cv2.line(p_overlay, (px, py), (px - 8, py + 24), (245, 225, 195), 1, cv2.LINE_AA)
                         elif high_impact:
-                            # Glowing fiery orange/gold sparks
                             col = (60, 175, 255) if p["r"] > 3 else (90, 225, 255)
                             cv2.circle(p_overlay, (px, py), p["r"], col, -1, cv2.LINE_AA)
                         elif mood in ("Romantic", "Comedy"):
-                            # Warm golden/pink bokeh
                             col = (180, 130, 255) if p["r"] % 2 == 0 else (110, 220, 255)
                             cv2.circle(p_overlay, (px, py), p["r"] + 2, col, -1, cv2.LINE_AA)
                         else:
-                            # Atmospheric cyan/silver dust motes
                             cv2.circle(p_overlay, (px, py), max(2, p["r"] - 1), (220, 210, 170), -1, cv2.LINE_AA)
-                    cv2.addWeighted(p_overlay, 0.38, frame, 0.62, 0, frame)
+                    cv2.addWeighted(p_overlay, 0.34, frame, 0.66, 0, frame)
 
                     writer.write(frame)
 
                 writer.release()
 
                 if os.path.exists(raw_vfx_mp4) and os.path.getsize(raw_vfx_mp4) > 2000:
-                    subprocess.run(
-                        [
-                            "ffmpeg",
-                            "-y",
-                            "-i",
-                            raw_vfx_mp4,
-                            "-i",
-                            final_audio,
-                            "-map",
-                            "0:v:0",
-                            "-map",
-                            "1:a:0",
+                    if subtitle_png_path and os.path.exists(subtitle_png_path):
+                        cmd = [
+                            "ffmpeg", "-y",
+                            "-i", raw_vfx_mp4,
+                            "-i", subtitle_png_path,
+                            "-i", final_audio,
+                            "-filter_complex", "[0:v][1:v]overlay=0:H-h[vout]",
+                            "-map", "[vout]",
+                            "-map", "2:a:0",
                             "-shortest",
-                            "-c:v",
-                            "libx264",
-                            "-preset",
-                            "veryfast",
-                            "-pix_fmt",
-                            "yuv420p",
-                            "-crf",
-                            "25",
-                            "-c:a",
-                            "aac",
-                            "-ar",
-                            "44100",
-                            "-b:a",
-                            "96k",
+                            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "24",
+                            "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
                             out_mp4,
-                        ],
-                        check=True,
-                        timeout=60,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
+                        ]
+                    else:
+                        cmd = [
+                            "ffmpeg", "-y",
+                            "-i", raw_vfx_mp4,
+                            "-i", final_audio,
+                            "-map", "0:v:0",
+                            "-map", "1:a:0",
+                            "-shortest",
+                            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "24",
+                            "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
+                            out_mp4,
+                        ]
+                    subprocess.run(cmd, check=True, timeout=65, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000:
                         return True
         except Exception:
@@ -1766,59 +2332,39 @@ def _render_pro_motion_vfx_clip(
                 except Exception:
                     pass
 
-    # Path B: Pure FFmpeg Pro Motion filtergraph (zoompan camera tracking + camera shake + dynamic lighting EQ)
-    shake_expr_x = (
-        "iw/2-(iw/zoom/2)+sin(on*1.7)*14"
-        if high_impact
-        else "iw/2-(iw/zoom/2)+sin(on*0.09)*22"
+    # Path B: Pure FFmpeg Pro Motion + Clean PIL Hindi Subtitle Overlay
+    shake_expr_x = "iw/2-(iw/zoom/2)+sin(on*1.7)*12" if high_impact else "iw/2-(iw/zoom/2)+sin(on*0.09)*18"
+    shake_expr_y = "ih/2-(ih/zoom/2)+cos(on*2.1)*8" if high_impact else "ih/2-(ih/zoom/2)+cos(on*0.07)*8"
+    zoom_rate = "0.0016" if high_impact else "0.0010"
+    zoom_cap = "1.14" if high_impact else "1.10"
+    vf_base = (
+        f"scale={src_w}:{src_h},"
+        f"zoompan=z='min(zoom+{zoom_rate},{zoom_cap})':x='{shake_expr_x}':y='{shake_expr_y}':d={total_frames}:s={w_out}x{h_out}:fps={fps},"
+        f"eq=contrast=1.06:saturation=1.12:brightness=0.01,vignette=PI/5"
     )
-    shake_expr_y = (
-        "ih/2-(ih/zoom/2)+cos(on*2.1)*10"
-        if high_impact
-        else "ih/2-(ih/zoom/2)+cos(on*0.07)*10"
-    )
-    zoom_rate = "0.0018" if high_impact else "0.0010"
-    zoom_cap = "1.16" if high_impact else "1.10"
-    vf = (
-        f"scale=1536:864,"
-        f"zoompan=z='min(zoom+{zoom_rate},{zoom_cap})':x='{shake_expr_x}':y='{shake_expr_y}':d={total_frames}:s=1280x720:fps={fps},"
-        f"eq=contrast=1.08:saturation=1.15:brightness=0.02,"
-        f"vignette=PI/5"
-    )
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-loop",
-            "1",
-            "-i",
-            framed_img_path,
-            "-i",
-            final_audio,
-            "-vf",
-            vf,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-shortest",
-            "-pix_fmt",
-            "yuv420p",
-            "-crf",
-            "25",
-            "-c:a",
-            "aac",
-            "-ar",
-            "44100",
-            "-b:a",
-            "96k",
+    if subtitle_png_path and os.path.exists(subtitle_png_path):
+        cmd_fb = [
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", framed_img_path,
+            "-i", subtitle_png_path,
+            "-i", final_audio,
+            "-filter_complex", f"[0:v]{vf_base}[vm];[vm][1:v]overlay=0:H-h[vout]",
+            "-map", "[vout]", "-map", "2:a:0",
+            "-c:v", "libx264", "-preset", "veryfast", "-shortest", "-pix_fmt", "yuv420p", "-crf", "24",
+            "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
             out_mp4,
-        ],
-        check=True,
-        timeout=60,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+        ]
+    else:
+        cmd_fb = [
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", framed_img_path,
+            "-i", final_audio,
+            "-vf", vf_base,
+            "-c:v", "libx264", "-preset", "veryfast", "-shortest", "-pix_fmt", "yuv420p", "-crf", "24",
+            "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
+            out_mp4,
+        ]
+    subprocess.run(cmd_fb, check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000
 
 
@@ -1832,22 +2378,38 @@ def render_exact_face_clip(
     visual_action_prompt: str = "",
     char_angles: Optional[dict] = None,
     scene_angle: str = "front",
+    speaker_name: str = "",
+    dialogue_text: str = "",
+    target_duration_sec: float = 0.0,
+    aspect_ratio: str = "16:9",
 ):
     """
-    STRICT CHARACTER PHOTO LOCK + MULTI-ANGLE FACE-SWAP PIPELINE (ZERO RANDOM FACES):
-    1. Any AI-generated motion video (LTX-Video / CogVideoX-5B / SVD) MUST pass through
-       mandatory user Face-Swap & Multi-Angle Face Lock so the user's exact uploaded face
-       is preserved in every single frame (random AI faces are strictly blocked!).
-    2. Talking-Face spaces (Wav2Lip / SadTalker) directly animate the exact angle-matched
-       uploaded user photo.
-    3. Guaranteed fallback renders High-Octane Pro Motion & VFX directly from the user's
-       angle-matched character portrait composited onto the cinematic location set.
+    POCKET FM / MOJ FULL-SCREEN TALKING LIP-SYNC + 5-ANGLE FACE-LOCK PIPELINE (9:16 OR 16:9):
+    1. Renders a crisp transparent PIL Devanagari Hindi subtitle strip (`Speaker: Dialogue`) — ZERO □□□ boxes!
+    2. Mixes character's Hindi voice with Bollywood BGM + Rain/Fight SFX using automatic audio ducking.
+    3. Tries 100% FREE HuggingFace Real AI Talking Lip-Sync (`vinthony/SadTalker` -> `camenduru/Wav2Lip` -> `KwaiVGI/LivePortrait`)
+       at the exact chosen ratio (720x1280 or 1280x720).
+    4. Guaranteed fallback runs our Audio-Envelope Talking Mouth Lip-Sync + Head-Nod + Full-Screen Pro Motion VFX engine
+       directly on the speaker's angle-matched full-screen drama frame so characters ALWAYS talk visibly!
     """
+    w_out, h_out = get_aspect_dimensions(aspect_ratio)
     mixed_tmp = f"{out_mp4}_mix.mp3"
-    locked_tmp = f"{out_mp4}_facelocked.mp4"
-    final_audio = mix_cinematic_audio(audio_path, mood, sfx_type, mixed_tmp)
+    sub_png = f"{out_mp4}_sub.png"
+    final_audio = mix_cinematic_audio(
+        audio_path, mood, sfx_type, mixed_tmp, target_duration_sec=target_duration_sec
+    )
+    rendered_sub = (
+        render_hindi_subtitle_png(
+            speaker_name,
+            dialogue_text,
+            sub_png,
+            width=w_out,
+            height=240 if h_out > w_out else 148,
+        )
+        if dialogue_text.strip()
+        else None
+    )
 
-    # Ensure primary face path is ALWAYS a valid uploaded user photo
     effective_angles = dict(char_angles or {})
     if raw_img_path and os.path.exists(raw_img_path):
         effective_angles.setdefault("front", raw_img_path)
@@ -1858,144 +2420,60 @@ def render_exact_face_clip(
     )
 
     try:
-        # 1. Try Real AI Action Image-to-Video (LTX-Video / CogVideoX-5B / SVD) WITH MANDATORY USER FACE LOCK
+        # 1. Try Real AI Talking Lip-Sync (SadTalker / Wav2Lip / LivePortrait) on the speaker's exact face + Hindi audio
         if angle_face_path and os.path.exists(angle_face_path):
-            ai_video_path = _try_ai_action_i2v_spaces(
-                angle_face_path, visual_action_prompt, mood
-            )
-            if ai_video_path and os.path.exists(ai_video_path):
+            talk_vid = _try_talking_lipsync_spaces(angle_face_path, audio_path)
+            if talk_vid and os.path.exists(talk_vid):
                 try:
-                    # CRITICAL LOCK: Never output raw I2V video directly — immediately swap/lock the user's
-                    # exact multi-angle face onto every frame so ZERO random/hallucinated AI faces appear!
-                    _opencv_video_faceswap(
-                        ai_video_path,
-                        angle_face_path,
-                        locked_tmp,
-                        watermark_text="",
-                        char_angles=effective_angles,
-                        preferred_angle=scene_angle,
-                    )
-                    if os.path.exists(locked_tmp) and os.path.getsize(locked_tmp) > 2000:
-                        subprocess.run(
-                            [
-                                "ffmpeg",
-                                "-y",
-                                "-stream_loop",
-                                "-1",
-                                "-i",
-                                locked_tmp,
-                                "-i",
-                                final_audio,
-                                "-map",
-                                "0:v:0",
-                                "-map",
-                                "1:a:0",
-                                "-vf",
-                                "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,eq=contrast=1.06:saturation=1.12,vignette=PI/5",
-                                "-r",
-                                "24",
-                                "-shortest",
-                                "-c:v",
-                                "libx264",
-                                "-preset",
-                                "veryfast",
-                                "-pix_fmt",
-                                "yuv420p",
-                                "-crf",
-                                "25",
-                                "-c:a",
-                                "aac",
-                                "-ar",
-                                "44100",
-                                "-b:a",
-                                "96k",
-                                out_mp4,
-                            ],
-                            check=True,
-                            timeout=45,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
+                    scale_crop = f"scale={w_out}:{h_out}:force_original_aspect_ratio=increase,crop={w_out}:{h_out}"
+                    if rendered_sub and os.path.exists(rendered_sub):
+                        fc = (
+                            f"[0:v]{scale_crop},eq=contrast=1.06:saturation=1.10,vignette=PI/5[vbase];"
+                            f"[vbase][1:v]overlay=0:H-h[vout]"
                         )
-                        if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000:
-                            return
-                except Exception:
-                    # Reject unlocked AI video rather than allowing any random face!
-                    pass
-
-        # 2. Try Talking-Face AI Lip-Sync Spaces (Wav2Lip / SadTalker) directly on exact uploaded user photo
-        if scene_angle == "front" and angle_face_path and os.path.exists(angle_face_path):
-            hf_mirrors = ["camenduru/Wav2Lip", "vinthony/SadTalker"]
-            for mirror in hf_mirrors:
-                try:
-                    hf_client = Client(mirror)
-                    if "Wav2Lip" in mirror:
-                        res = hf_client.predict(
-                            face=handle_file(angle_face_path),
-                            audio=handle_file(audio_path),
-                            api_name="/predict",
-                        )
-                    else:
-                        res = hf_client.predict(
-                            source_image=handle_file(angle_face_path),
-                            driven_audio=handle_file(audio_path),
-                            preprocess="crop",
-                            still_mode=False,
-                            use_enhancer=False,
-                            batch_size=1,
-                            size_of_image=256,
-                            pose_style=0,
-                            api_name="/test",
-                        )
-                    talk_vid = _extract_gradio_video_path(res)
-                    if not talk_vid:
-                        continue
-                    subprocess.run(
-                        [
-                            "ffmpeg",
-                            "-y",
-                            "-i",
-                            talk_vid,
-                            "-i",
-                            final_audio,
-                            "-map",
-                            "0:v:0",
-                            "-map",
-                            "1:a:0",
-                            "-vf",
-                            "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
-                            "-r",
-                            "24",
-                            "-shortest",
-                            "-c:v",
-                            "libx264",
-                            "-preset",
-                            "veryfast",
-                            "-crf",
-                            "25",
-                            "-c:a",
-                            "aac",
-                            "-ar",
-                            "44100",
-                            "-b:a",
-                            "96k",
+                        cmd = [
+                            "ffmpeg", "-y",
+                            "-stream_loop", "-1", "-i", talk_vid,
+                            "-i", rendered_sub,
+                            "-i", final_audio,
+                            "-filter_complex", fc,
+                            "-map", "[vout]", "-map", "2:a:0",
+                            "-r", "24", "-shortest",
+                            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "24",
+                            "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
                             out_mp4,
-                        ],
-                        check=True,
-                        timeout=35,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
+                        ]
+                    else:
+                        cmd = [
+                            "ffmpeg", "-y",
+                            "-stream_loop", "-1", "-i", talk_vid,
+                            "-i", final_audio,
+                            "-map", "0:v:0", "-map", "1:a:0",
+                            "-vf", f"{scale_crop},eq=contrast=1.06:saturation=1.10,vignette=PI/5",
+                            "-r", "24", "-shortest",
+                            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "24",
+                            "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
+                            out_mp4,
+                        ]
+                    subprocess.run(cmd, check=True, timeout=45, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000:
                         return
                 except Exception:
-                    continue
+                    pass
 
-        # 3. 100% Exact-Face Pro Motion & VFX Engine (Built directly from user's angle-matched photo — ZERO random faces!)
+        # 2. Guaranteed Audio-Synchronized Talking Lip-Sync + Full-Screen Cinematic Pro Motion VFX
         _render_pro_motion_vfx_clip(
-            framed_img_path, final_audio, out_mp4, mood=mood, sfx_type=sfx_type
+            framed_img_path,
+            final_audio,
+            out_mp4,
+            mood=mood,
+            sfx_type=sfx_type,
+            dialogue_audio_path=audio_path,
+            subtitle_png_path=rendered_sub,
+            aspect_ratio=aspect_ratio,
         )
     finally:
-        for tmp_p in (mixed_tmp, locked_tmp):
+        for tmp_p in (mixed_tmp, sub_png):
             if os.path.exists(tmp_p):
                 try:
                     os.remove(tmp_p)
@@ -2026,21 +2504,35 @@ def ffmpeg_concat(file_list: list, out_path: str):
 def rebuild_parts_and_full(proj_dir: str, state: dict):
     chapters = state["outline"]["chapters"]
     total_ch = len(chapters)
-    total_parts = (total_ch + 2) // 3
+    is_series = state.get("series_mode", "series") == "series"
     ready_parts = []
-    for p in range(1, total_parts + 1):
-        start_ch = (p - 1) * 3 + 1
-        end_ch = min(p * 3, total_ch)
-        part_clips = [
-            f"{proj_dir}/ch_{k}.mp4"
-            for k in range(start_ch, end_ch + 1)
-            if os.path.exists(f"{proj_dir}/ch_{k}.mp4")
-        ]
-        if len(part_clips) == (end_ch - start_ch + 1):
-            part_file = f"{proj_dir}/PART_{p}.mp4"
-            ffmpeg_concat(part_clips, part_file)
-            ready_parts.append(p)
+
+    if is_series:
+        # Moj / Pocket FM Micro-Drama Mode: 1 Part == 1 Chapter -> Part 1 plays immediately!
+        for p in range(1, total_ch + 1):
+            ch_file = f"{proj_dir}/ch_{p}.mp4"
+            if os.path.exists(ch_file) and os.path.getsize(ch_file) > 500:
+                part_file = f"{proj_dir}/PART_{p}.mp4"
+                shutil.copyfile(ch_file, part_file)
+                ready_parts.append(p)
+    else:
+        total_parts = (total_ch + 2) // 3
+        for p in range(1, total_parts + 1):
+            start_ch = (p - 1) * 3 + 1
+            end_ch = min(p * 3, total_ch)
+            part_clips = [
+                f"{proj_dir}/ch_{k}.mp4"
+                for k in range(start_ch, end_ch + 1)
+                if os.path.exists(f"{proj_dir}/ch_{k}.mp4")
+            ]
+            if len(part_clips) == (end_ch - start_ch + 1):
+                part_file = f"{proj_dir}/PART_{p}.mp4"
+                ffmpeg_concat(part_clips, part_file)
+                ready_parts.append(p)
+
     state["ready_parts"] = ready_parts
+    if 1 in ready_parts:
+        state["part_1_ready"] = True
 
     all_ch = [
         f"{proj_dir}/ch_{c['no']}.mp4"
@@ -2052,7 +2544,14 @@ def rebuild_parts_and_full(proj_dir: str, state: dict):
         state["is_completed"] = True
         state["progress"] = 100
         state["status_text"] = (
-            "पूरी मूवी तैयार है! पहले Play करके चेक करें, फिर Download करें।"
+            f"🔥 सभी {len(ready_parts)} Parts और Full Series तैयार हैं! अभी Play और Download करें।"
+            if is_series and len(ready_parts) > 1
+            else "पूरी मूवी तैयार है! पहले Play करके चेक करें, फिर Download करें।"
+        )
+    elif is_series and ready_parts:
+        state["status_text"] = (
+            f"🔥 Part {ready_parts[-1]} तैयार है — अभी Play करें! "
+            f"Part {min(total_ch, ready_parts[-1] + 1)}/{total_ch} बैकग्राउंड में बन रहा है ({state.get('progress', 35)}%)..."
         )
 
 
@@ -2062,9 +2561,14 @@ def parse_manual_script_lines(
     parsed = []
     cur_loc_key, cur_loc_label = detect_location_meta(default_location, default_location)
     cur_mood = normalize_mood(default_mood, "Action")
+    skip_tags = {
+        "शीर्षक", "title", "scene", "सीन", "location", "लोकेशन",
+        "action", "एक्शन", "mood", "मूड", "sfx", "camera", "कैमरा",
+        "background", "बैकग्राउंड", "int", "ext", "narrator", "सूत्रधार",
+    }
 
     for raw_line in raw_text.splitlines():
-        line = raw_line.strip()
+        line = raw_line.strip().lstrip("*#-• ").strip()
         if not line:
             continue
 
@@ -2081,15 +2585,26 @@ def parse_manual_script_lines(
                 cur_mood = normalize_mood(mood_m.group(1).strip(), cur_mood)
             continue
 
+        # Never treat Title / Scene / Location / Action header lines as spoken dialogue!
+        if SCRIPT_TAG_LINE_RE.match(line):
+            loc_try = re.search(r"(?:location|लोकेशन)\s*[:：]\s*(.+)", line, re.IGNORECASE)
+            if loc_try:
+                cur_loc_key, cur_loc_label = detect_location_meta(loc_try.group(1), loc_try.group(1))
+            continue
+
         m = re.match(r"^([^:：]{1,28})[:：]\s*(.+)$", line)
         if m:
-            speaker_raw = m.group(1).strip()
-            diag = m.group(2).strip()
-            if speaker_raw.lower() in ("शीर्षक", "title", "scene", "location", "mood"):
+            speaker_raw = re.sub(r"[\*\#\_]", "", m.group(1)).strip()
+            speaker_low = speaker_raw.lower()
+            if speaker_low in skip_tags or re.match(r"^(?:scene|सीन)\s*\d+$", speaker_low):
+                continue
+            diag = clean_spoken_dialogue(m.group(2))
+            if len(diag) < 2:
                 continue
             matched = next(
-                (c for c in char_names if c.lower() == speaker_raw.lower()),
-                char_names[len(parsed) % len(char_names)],
+                (c for c in char_names if c.lower() == speaker_low),
+                speaker_raw if any(k in speaker_low for k in ("villain", "don", "log", "crowd", "विलेन", "लोग", "भीड़"))
+                else char_names[len(parsed) % len(char_names)],
             )
             loc_key, loc_label = detect_location_meta(diag, cur_loc_label)
             sfx_val = detect_sfx_type(diag, loc_key, cur_mood)
@@ -2118,19 +2633,28 @@ async def autonomous_movie_worker(project_id: str):
     try:
         char_map = state["characters"]
         char_names = list(char_map.keys())
+        series_mode = state.get("series_mode", "series")
+        aspect_ratio = state.get("aspect_ratio", "9:16")
+        part_duration = max(1, min(2, int(state.get("part_duration_minutes", 1) or 1)))
+        requested_parts = max(1, min(15, int(state.get("total_parts", 3) or 3)))
         duration = max(1, int(state.get("duration_minutes", 1) or 1))
-        total_chapters = 1 if duration <= 10 else max(1, duration // 10)
-        # Fast exact scene scaling so 1-min reels finish in ~30-45s instead of getting stuck!
-        if duration <= 1:
-            scenes_per_chapter = 5
-        elif duration <= 2:
-            scenes_per_chapter = 8
-        elif duration <= 5:
-            scenes_per_chapter = 14
-        elif duration <= 10:
-            scenes_per_chapter = 22
+
+        if series_mode == "series":
+            total_chapters = requested_parts
+            # Pocket FM / Moj fast-paced cuts: 14 scenes (~4.2s each) for 1 Min/Part, 22 scenes for 2 Min/Part
+            scenes_per_chapter = 14 if part_duration <= 1 else 22
         else:
-            scenes_per_chapter = 28
+            total_chapters = 1 if duration <= 10 else max(1, duration // 10)
+            if duration <= 1:
+                scenes_per_chapter = 14
+            elif duration <= 2:
+                scenes_per_chapter = 20
+            elif duration <= 5:
+                scenes_per_chapter = 24
+            elif duration <= 10:
+                scenes_per_chapter = 28
+            else:
+                scenes_per_chapter = 30
 
         story_mode = state.get("story_mode", "ai")
         language = normalize_language(state.get("language", "Hindi"))
@@ -2140,7 +2664,6 @@ async def autonomous_movie_worker(project_id: str):
         watermark_text = state.get("watermark_text", "")
         watermark_position = state.get("watermark_position", "top-right")
 
-        # Manual verbatim script mode: preserve user's exact lines without changing story
         manual_lines = (
             parse_manual_script_lines(
                 state["idea"], char_names, default_location, default_mood
@@ -2158,11 +2681,12 @@ async def autonomous_movie_worker(project_id: str):
                     for i in range(0, len(manual_lines), per_ch)
                 ]
                 state["outline"] = {
-                    "title": "Custom Script Movie",
+                    "title": "Custom Script Series",
                     "chapters": [
                         {
                             "no": i + 1,
-                            "plot": f"सीन {i + 1}: {chunks[i][0]['location']}",
+                            "title": f"Part {i + 1}",
+                            "plot": f"Part {i + 1}: {chunks[i][0]['location']}",
                         }
                         for i in range(len(chunks))
                     ],
@@ -2172,37 +2696,66 @@ async def autonomous_movie_worker(project_id: str):
                 state["progress"] = 12
                 save_state(proj_dir, state)
             else:
+                mode_label = (
+                    f"{total_chapters}-Part Pocket FM / Moj Micro-Drama Series ({part_duration} Min/Part)"
+                    if series_mode == "series"
+                    else f"{duration} मिनट की मूवी"
+                )
                 state["status_text"] = (
-                    f"CinePop AI {duration} मिनट की कहानी और रियल लोकेशंस तैयार कर रहा है (5%)..."
+                    f"CinePop AI {mode_label} और सस्पेंस क्लिफहैंगर्स तैयार कर रहा है (5%)..."
                 )
                 save_state(proj_dir, state)
 
                 fallback_outline = {
                     "title": "CinePop Blockbuster",
                     "chapters": [
-                        {"no": i + 1, "plot": f"{state['idea']} - भाग {i + 1}"}
+                        {
+                            "no": i + 1,
+                            "title": f"Part {i + 1}",
+                            "plot": f"{state['idea']} - Part {i + 1} (रोमांचक मोड़ और सस्पेंस क्लिफहैंगर)",
+                        }
                         for i in range(total_chapters)
                     ],
                 }
                 if client:
                     try:
                         strict_note = (
-                            "महत्वपूर्ण: यूज़र की लिखी कहानी को बिल्कुल मत बदलो, उसी कहानी के आधार पर चैप्टर्स बनाओ।"
+                            "महत्वपूर्ण: यूज़र की लिखी कहानी को बिल्कुल मत बदलो, उसी कहानी के आधार पर पार्ट्स बनाओ।"
                             if story_mode == "manual"
                             else f"Genre: {state.get('genre', 'Action')}."
                         )
+                        cliff_note = (
+                            f"यह Pocket FM / Moj स्टाइल {total_chapters}-Part Micro-Drama Series ({part_duration} Min/Part) है। "
+                            f"हर Part के अंत में एक ज़बरदस्त Cliffhanger / Suspense मोड़ ज़रूर रखो ताकि दर्शक तुरंत अगला Part देखें!"
+                            if series_mode == "series"
+                            else f"यह {duration} मिनट की दमदार बॉलीवुड फिल्म है।"
+                        )
                         prompt = f"""
-                        तुम एक बॉलीवुड मूवी डायरेक्टर हो। '{state['idea']}' पर {duration} मिनट की फिल्म की रूपरेखा बनाओ।
+                        तुम एक Pocket FM / Moj और बॉलीवुड डायरेक्टर हो। '{state['idea']}' पर कहानी की रूपरेखा बनाओ।
                         {strict_note}
+                        {cliff_note}
                         कैरेक्टर्स: {char_names}
-                        कहानी को ठीक {total_chapters} बराबर चैप्टर्स में बांटो।
+                        कहानी को ठीक {total_chapters} बराबर Parts/Chapters में बांटो।
                         सिर्फ शुद्ध JSON दो:
-                        {{"title": "फिल्म का नाम", "chapters": [{{"no": 1, "plot": "विस्तार से कहानी और लोकेशन"}}]}}
+                        {{"title": "सीरीज़/फिल्म का दमदार नाम", "chapters": [{{"no": 1, "title": "Part 1: धमाकेदार शुरुआत", "plot": "विस्तार से कहानी, ट्विस्ट और अंत का सस्पेंस"}}]}}
                         """
                         res = client.models.generate_content(
                             model="gemini-2.5-flash", contents=prompt
                         )
-                        state["outline"] = safe_extract_json(res.text, fallback_outline)
+                        parsed_out = safe_extract_json(res.text, fallback_outline)
+                        if not isinstance(parsed_out, dict) or not parsed_out.get("chapters"):
+                            parsed_out = fallback_outline
+                        parsed_out["chapters"] = parsed_out["chapters"][:total_chapters]
+                        while len(parsed_out["chapters"]) < total_chapters:
+                            idx_m = len(parsed_out["chapters"]) + 1
+                            parsed_out["chapters"].append(
+                                {
+                                    "no": idx_m,
+                                    "title": f"Part {idx_m}",
+                                    "plot": f"{state['idea']} - Part {idx_m}",
+                                }
+                            )
+                        state["outline"] = parsed_out
                     except Exception:
                         state["outline"] = fallback_outline
                 else:
@@ -2210,7 +2763,7 @@ async def autonomous_movie_worker(project_id: str):
 
                 state["scripts"] = {}
                 state["progress"] = 12
-                state["status_text"] = "कहानी तैयार! अब दमदार डायलॉग्स और एक्शन सीन्स लिखे जा रहे हैं (12%)..."
+                state["status_text"] = "कहानी तैयार! अब Part 1 के तेज़-रफ़्तार डायलॉग्स और एक्शन सीन्स बन रहे हैं (12%)..."
                 save_state(proj_dir, state)
 
         chapters = state["outline"]["chapters"]
@@ -2229,7 +2782,9 @@ async def autonomous_movie_worker(project_id: str):
             ch_span_pct = max(8, int(82 / total_ch_count))
             state["progress"] = max(state.get("progress", 5), ch_base_pct)
             state["status_text"] = (
-                f"चैप्टर {ch_no}/{total_ch_count} की स्क्रिप्ट तैयार हो रही है ({state['progress']}%)..."
+                f"Part {ch_no}/{total_ch_count} की स्क्रिप्ट तैयार हो रही है ({state['progress']}%)..."
+                if series_mode == "series"
+                else f"चैप्टर {ch_no}/{total_ch_count} की स्क्रिप्ट तैयार हो रही है ({state['progress']}%)..."
             )
             save_state(proj_dir, state)
 
@@ -2243,11 +2798,16 @@ async def autonomous_movie_worker(project_id: str):
                 fallback_dialogues = [
                     {
                         "character": char_names[i % len(char_names)],
-                        "dialogue": f"{ch['plot']} - सीन {i+1} का दमदार संवाद।",
+                        "dialogue": (
+                            f"आगे क्या होगा? इस राज़ से पर्दा उठेगा अगले एपिसोड में — देखिए Part {ch_no + 1} में!"
+                            if (series_mode == "series" and ch_no < total_ch_count and i == scenes_per_chapter - 1)
+                            else f"{ch['plot']} - सीन {i+1} का दमदार संवाद।"
+                        ),
                         "location": loc_l,
                         "location_key": loc_k,
                         "mood": default_mood,
                         "sfx": detect_sfx_type(ch["plot"], loc_k, default_mood),
+                        "camera_angle": ["front", "left", "right", "up", "down"][i % 5],
                         "visual_action_prompt": build_visual_action_prompt(
                             char_names[i % len(char_names)],
                             ch["plot"],
@@ -2261,27 +2821,39 @@ async def autonomous_movie_worker(project_id: str):
 
                 if client:
                     try:
+                        cliff_instruction = (
+                            f"अंतिम सीन (आखिरी डायलॉग) में Narrator की आवाज़ में ज़बरदस्त सस्पेंस Cliffhanger ज़रूर डालो: "
+                            f"जैसे 'आगे क्या होगा? देखिए Part {ch_no + 1} में...'"
+                            if (series_mode == "series" and ch_no < total_ch_count)
+                            else "अंतिम सीन में धमाकेदार क्लाइमैक्स डायलॉग रखो।"
+                        )
                         script_prompt = f"""
-                        फिल्म: {state['outline']['title']} | पिछला सीन: {prev_plot}
-                        वर्तमान चैप्टर {ch_no}: {ch['plot']}
-                        सख्त नियम — सिर्फ यही अपलोड किए गए कैरेक्टर नाम इस्तेमाल करो (कोई नया नाम मत जोड़ो): {char_names}
-                        भाषा / Dialect: {language} (सभी डायलॉग्स असली {language} अंदाज़ और बोलचाल में लिखो!)
-                        इस चैप्टर के लिए ठीक {scenes_per_chapter} दमदार, तेज़-रफ़्तार {language} डायलॉग्स लिखो ताकि {duration} मिनट का शानदार वीडियो बने।
-                        हर डायलॉग के साथ उसकी रियल लोकेशन (location), mood (Action, Emotional, Suspense, Comedy, Romantic), sfx (none, rain, thunder, punch, explosion, sword, footsteps), camera_angle (front, left, right, up, down — क्लोज़अप के लिए front, साइड एक्शन/दौड़ने के लिए left या right, ऊपर देखने के लिए up, नीचे देखने के लिए down), और हाई-ऑक्टेन English visual_action_prompt दो।
-                        सिर्फ JSON लिस्ट दो: [{{"character": "{char_names[0]}", "dialogue": "डायलॉग...", "location": "Mumbai ki Barish", "mood": "{default_mood}", "sfx": "rain", "camera_angle": "front", "visual_action_prompt": "hero running through stormy Mumbai street, fast tracking camera, sparks and rain"}}]
+                        सीरीज़/फिल्म: {state['outline']['title']} | पिछला सीन: {prev_plot}
+                        वर्तमान Part {ch_no}/{total_ch_count}: {ch['plot']}
+                        मुख्य अपलोड किए गए कैरेक्टर: {char_names} (ज़रूरत पड़ने पर Narrator, Villain, Saas या Log/Crowd भी बोल सकते हैं)।
+                        भाषा / Dialect: {language} (सभी डायलॉग्स असली {language} अंदाज़ में छोटे, तेज़-रफ़्तार और पंचदार हों — हर डायलॉग 3-4 सेकंड का हो!)
+                        सख्त नियम: डायलॉग के अंदर कभी भी 'Title:', 'Scene 1:', 'Location:', 'Action:' जैसे स्क्रिप्ट टैग मत लिखो — सिर्फ बोले जाने वाले डायलॉग लिखो!
+                        {cliff_instruction}
+                        ठीक {scenes_per_chapter} फास्ट-कट सीन्स लिखो (हर सीन में अलग कैमरा एंगल: Hero close-up, Villain angry reaction, Ring/Car zoom, Action cut)।
+                        हर सीन के साथ location, mood (Action, Emotional, Suspense, Comedy, Romantic), sfx (none, rain, thunder, punch, explosion, sword, footsteps), camera_angle (front, left, right, up, down), और dramatic English visual_action_prompt दो।
+                        सिर्फ JSON लिस्ट दो: [{{"character": "{char_names[0]}", "dialogue": "डायलॉग...", "location": "Mumbai ki Barish", "mood": "{default_mood}", "sfx": "rain", "camera_angle": "front", "visual_action_prompt": "dramatic close-up in rain, neon reflections, intense thriller lighting"}}]
                         """
                         s_res = client.models.generate_content(
                             model="gemini-2.5-flash", contents=script_prompt
                         )
                         raw_list = safe_extract_json(s_res.text, fallback_dialogues)
-                        # Cap to scenes_per_chapter + 2 so short durations stay ultra-fast
-                        raw_list = raw_list[: max(4, scenes_per_chapter + 2)]
+                        raw_list = raw_list[: max(6, scenes_per_chapter + 2)]
                         dialogues = []
                         for idx_d, item in enumerate(raw_list):
-                            c_name = resolve_character_name(
-                                item.get("character"), char_map, idx_d
-                            )
-                            diag_text = str(item.get("dialogue", "कहानी आगे बढ़ती है..."))
+                            raw_spk = str(item.get("character", "")).strip()
+                            low_spk = raw_spk.lower()
+                            if any(k in low_spk for k in ("narrator", "sutradhar", "villain", "saas", "don", "log", "crowd", "सूत्रधार", "विलेन", "सास", "लोग", "भीड़")):
+                                c_name = raw_spk
+                            else:
+                                c_name = resolve_character_name(raw_spk, char_map, idx_d)
+                            diag_text = clean_spoken_dialogue(str(item.get("dialogue", "")))
+                            if len(diag_text) < 2:
+                                continue
                             lk, ll = detect_location_meta(
                                 f"{item.get('location', '')} {diag_text}",
                                 item.get("location") or default_location,
@@ -2310,24 +2882,55 @@ async def autonomous_movie_worker(project_id: str):
                                     "visual_action_prompt": vap,
                                 }
                             )
+                        if not dialogues:
+                            dialogues = fallback_dialogues
                     except Exception:
                         dialogues = fallback_dialogues
                 else:
                     dialogues = fallback_dialogues
 
+                # Guarantee Cliffhanger ending on Part k < N in Series Mode
+                if series_mode == "series" and ch_no < total_ch_count and dialogues:
+                    last_line = dialogues[-1]["dialogue"]
+                    if f"Part {ch_no + 1}" not in last_line and "पार्ट" not in last_line:
+                        dialogues.append(
+                            {
+                                "character": "Narrator",
+                                "dialogue": f"आगे क्या होने वाला है? यह राज़ खुलेगा अगले एपिसोड में — देखिए Part {ch_no + 1} में!",
+                                "location": dialogues[-1].get("location", "Mumbai City Street"),
+                                "location_key": dialogues[-1].get("location_key", "city_street"),
+                                "mood": "Suspense",
+                                "sfx": "thunder",
+                                "camera_angle": "front",
+                                "visual_action_prompt": "dramatic cliffhanger freeze-frame suspense thriller lighting, dark stormy atmosphere",
+                            }
+                        )
+
             state["scripts"][str(ch_no)] = dialogues
-            state["progress"] = min(94, ch_base_pct + 6)
+            state["progress"] = min(94, ch_base_pct + 5)
             state["status_text"] = (
-                f"स्क्रिप्ट तैयार ({len(dialogues)} सीन्स)! अब 3D Face Lock + Pro Motion वीडियो रेंडर हो रहा है ({state['progress']}%)..."
+                f"Part {ch_no}/{total_ch_count} स्क्रिप्ट तैयार ({len(dialogues)} फास्ट-कट सीन्स)! फुल-स्क्रीन AI Lip-Sync वीडियो रेंडर हो रहा है ({state['progress']}%)..."
             )
             save_state(proj_dir, state)
 
             clips = []
             total_scenes = max(1, len(dialogues))
+            # Fast-paced Pocket FM / Moj cut pacing: ~60s for 1-Min Part, ~120s for 2-Min Part
+            if series_mode == "series":
+                target_scene_sec = max(3.2, min(5.5, (part_duration * 60.0) / total_scenes))
+            elif duration == 1:
+                target_scene_sec = max(3.5, 60.0 / total_scenes)
+            else:
+                target_scene_sec = 0.0
+
             for i, d in enumerate(dialogues):
-                c_name = resolve_character_name(d.get("character"), char_map, i)
-                char_entry = char_map[c_name]
-                diag_text = d.get("dialogue", "कहानी आगे बढ़ती है...")
+                raw_spk = str(d.get("character", "")).strip()
+                c_name = (
+                    raw_spk
+                    if raw_spk in char_map or any(k in raw_spk.lower() for k in ("narrator", "sutradhar", "villain", "saas", "log", "crowd", "सूत्रधार", "विलेन", "सास", "लोग", "भीड़"))
+                    else resolve_character_name(raw_spk, char_map, i)
+                )
+                diag_text = clean_spoken_dialogue(d.get("dialogue", "")) or "अब असली खेल शुरू होगा!"
                 loc_key = d.get("location_key") or "city_street"
                 loc_label = d.get("location") or default_location or "Mumbai City Street"
                 scene_mood = normalize_mood(d.get("mood", ""), default_mood)
@@ -2340,10 +2943,28 @@ async def autonomous_movie_worker(project_id: str):
                     if d.get("camera_angle") in ALLOWED_FACE_ANGLES
                     else detect_scene_angle(action_prompt, diag_text, scene_mood, scene_sfx, i)
                 )
-                # STRICT MULTI-ANGLE CHARACTER PHOTO LOCK (ZERO random faces!)
-                exact_char_photo = select_character_angle_photo(char_entry, scene_angle)
+
+                # Uploaded user characters strictly use their 5-angle scanned photo; Narrator uses lead hero dramatic shot; unuploaded Villain/Saas/Crowd get realistic role portraits
+                char_entry = char_map.get(c_name)
+                if char_entry:
+                    exact_char_photo = select_character_angle_photo(char_entry, scene_angle)
+                    char_angles_dict = char_entry.get("angles")
+                else:
+                    role_kind = detect_speaker_role(c_name, char_map)
+                    if role_kind == "narrator":
+                        primary_hero = char_map[char_names[0]]
+                        exact_char_photo = select_character_angle_photo(primary_hero, scene_angle)
+                        char_angles_dict = primary_hero.get("angles")
+                    else:
+                        role_photo = await asyncio.to_thread(_get_or_create_role_portrait, role_kind, proj_dir)
+                        primary_fallback = char_map[char_names[0]]
+                        exact_char_photo = role_photo or select_character_angle_photo(primary_fallback, scene_angle)
+                        char_angles_dict = {"front": exact_char_photo}
+
                 bg_override = d.get("bg_path") or project_custom_bg
-                char_pitch = char_entry.get("pitch", "normal")
+                tts_voice, tts_pitch, tts_rate = resolve_character_voice_profile(
+                    c_name, char_entry, char_map, language=language, scene_idx=i
+                )
 
                 a_file = f"{ch_temp}/a_{i}.mp3"
                 f_img = f"{ch_temp}/f_{i}.jpg"
@@ -2352,10 +2973,12 @@ async def autonomous_movie_worker(project_id: str):
                 if not os.path.exists(v_file):
                     await generate_bulletproof_audio(
                         diag_text,
-                        char_entry["voice"],
+                        tts_voice,
                         a_file,
-                        pitch=char_pitch,
+                        pitch=(char_entry or {}).get("pitch", "normal"),
                         language=language,
+                        pitch_override=tts_pitch,
+                        rate_override=tts_rate,
                     )
                     await asyncio.to_thread(
                         prepare_character_frame,
@@ -2369,6 +2992,8 @@ async def autonomous_movie_worker(project_id: str):
                         bg_override,
                         watermark_text,
                         watermark_position,
+                        aspect_ratio,
+                        action_prompt,
                     )
                     await asyncio.to_thread(
                         render_exact_face_clip,
@@ -2379,8 +3004,12 @@ async def autonomous_movie_worker(project_id: str):
                         scene_mood,
                         scene_sfx,
                         action_prompt,
-                        char_entry.get("angles"),
+                        char_angles_dict,
                         scene_angle,
+                        c_name,
+                        diag_text,
+                        target_scene_sec,
+                        aspect_ratio,
                     )
                     if os.path.exists(a_file):
                         os.remove(a_file)
@@ -2388,20 +3017,20 @@ async def autonomous_movie_worker(project_id: str):
                         os.remove(f_img)
                 clips.append(v_file)
 
-                # Live per-scene progress update (smoothly 15% -> 25% -> 60% -> 94%)
                 scene_pct = min(
                     94,
-                    ch_base_pct + 6 + int(((i + 1) / total_scenes) * max(1, ch_span_pct - 6)),
+                    ch_base_pct + 5 + int(((i + 1) / total_scenes) * max(1, ch_span_pct - 5)),
                 )
                 state["progress"] = max(state.get("progress", 15), scene_pct)
+                ready_hint = (
+                    " (Part 1 तैयार — अभी Play करें!)"
+                    if (series_mode == "series" and 1 in state.get("ready_parts", []) and ch_no > 1)
+                    else ""
+                )
                 state["status_text"] = (
-                    f"सीन {i + 1}/{total_scenes} (चैप्टर {ch_no}/{total_ch_count}) रेंडर पूरा ({state['progress']}%)..."
+                    f"Part {ch_no}/{total_ch_count} · सीन {i + 1}/{total_scenes} रेंडर पूरा ({state['progress']}%){ready_hint}"
                 )
                 save_state(proj_dir, state)
-
-            state["progress"] = min(97, max(state.get("progress", 90), 95))
-            state["status_text"] = f"फाइनल HD वीडियो और ऑडियो मिक्सिंग हो रही है ({state['progress']}%)..."
-            save_state(proj_dir, state)
 
             ffmpeg_concat(clips, ch_mp4)
             state["done_chapters"].append(ch_no)
@@ -2433,6 +3062,11 @@ async def start_movie(
     default_location: str = Form(""),
     watermark_text: str = Form(""),
     watermark_position: str = Form("top-right"),
+    aspect_ratio: str = Form("9:16"),
+    platform: str = Form("instagram"),
+    series_mode: str = Form("series"),
+    part_duration_minutes: int = Form(1),
+    total_parts: int = Form(3),
     admin_pin: str = Form(""),
     custom_bg: Optional[UploadFile] = File(None),
 ):
@@ -2511,8 +3145,7 @@ async def start_movie(
         if not raw_img_bytes:
             raise HTTPException(status_code=400, detail=f"Character '{c_name}' की फोटो खाली है।")
         img_path = safe_project_file(proj_dir, f"char_{idx}_front.jpg")
-        with open(img_path, "wb") as f:
-            f.write(raw_img_bytes)
+        save_upright_image_bytes(raw_img_bytes, img_path)
         char_map[c_name] = {
             "image": img_path,
             "voice": c_voice,
@@ -2522,7 +3155,7 @@ async def start_movie(
         }
         ordered_names.append(c_name)
 
-    # Save optional 3D Multi-Angle Face Scan photos (front, left, right, up, down) per character
+    # Save optional 3D Multi-Angle Face Scan photos (front, left, right, up, down) UPRIGHT (EXIF-transposed)
     if angle_images:
         try:
             parsed_angle_meta = json.loads(angle_meta) if angle_meta.strip() else []
@@ -2538,7 +3171,6 @@ async def start_movie(
             meta_item = parsed_angle_meta[a_idx] if a_idx < len(parsed_angle_meta) and isinstance(parsed_angle_meta[a_idx], dict) else {}
             angle_key = str(meta_item.get("angle", "")).lower().strip()
             if angle_key not in ALLOWED_FACE_ANGLES:
-                # Try parsing from filename e.g. char0_left.jpg
                 fname_low = (a_file.filename or "").lower()
                 angle_key = next((ang for ang in ALLOWED_FACE_ANGLES if ang in fname_low), "front")
             target_char = None
@@ -2555,8 +3187,7 @@ async def start_movie(
             if target_char and target_char in char_map:
                 c_slot = ordered_names.index(target_char)
                 a_path = safe_project_file(proj_dir, f"char_{c_slot}_{angle_key}.jpg")
-                with open(a_path, "wb") as f:
-                    f.write(raw_a)
+                save_upright_image_bytes(raw_a, a_path)
                 char_map[target_char]["angles"][angle_key] = a_path
                 if angle_key == "front":
                     char_map[target_char]["image"] = a_path
@@ -2567,11 +3198,15 @@ async def start_movie(
         raw_bytes = await custom_bg.read()
         if raw_bytes:
             custom_bg_path = safe_project_file(proj_dir, "custom_bg.jpg")
-            with open(custom_bg_path, "wb") as f:
-                f.write(raw_bytes)
+            save_upright_image_bytes(raw_bytes, custom_bg_path, max_side=1600)
 
     clean_lang = normalize_language(language)
     wm_pos = watermark_position if watermark_position in ("top-right", "bottom-right", "top-left") else "top-right"
+    clean_ratio = "9:16" if str(aspect_ratio).strip() in ("9:16", "vertical", "instagram", "moj") else "16:9"
+    clean_platform = "instagram" if clean_ratio == "9:16" else "youtube"
+    clean_series_mode = "series" if str(series_mode).strip().lower() == "series" else "single"
+    clean_part_dur = 2 if int(part_duration_minutes or 1) >= 2 else 1
+    clean_total_parts = max(1, min(15, int(total_parts or 3))) if clean_series_mode == "series" else 1
 
     initial_state = {
         "project_id": project_id,
@@ -2584,14 +3219,24 @@ async def start_movie(
         "default_location": default_location.strip(),
         "watermark_text": watermark_text.strip()[:30],
         "watermark_position": wm_pos,
+        "aspect_ratio": clean_ratio,
+        "platform": clean_platform,
+        "series_mode": clean_series_mode,
+        "part_duration_minutes": clean_part_dur,
+        "total_parts": clean_total_parts,
+        "part_1_ready": False,
         "custom_bg_path": custom_bg_path,
-        "duration_minutes": duration_minutes,
+        "duration_minutes": (clean_part_dur * clean_total_parts) if clean_series_mode == "series" else duration_minutes,
         "characters": char_map,
         "done_chapters": [],
         "ready_parts": [],
         "scripts": {},
         "progress": 2,
-        "status_text": f"प्रोजेक्ट शुरू! {clean_lang} भाषा, Auto-BGM + Foley SFX और रियल लोकेशंस के साथ मूवी बन रही है...",
+        "status_text": (
+            f"📱 {clean_total_parts}-Part Micro-Drama ({clean_ratio}) शुरू! Part 1 सबसे पहले तैयार हो रहा है..."
+            if clean_series_mode == "series"
+            else f"प्रोजेक्ट शुरू! {clean_lang} भाषा ({clean_ratio}) में फुल-स्क्रीन मूवी बन रही है..."
+        ),
         "is_completed": False,
         "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "remaining_credits": user["credits"],
@@ -2706,6 +3351,7 @@ async def edit_scene(
     )
     scene_mood = old_item.get("mood", state.get("default_mood", "Action"))
     scene_sfx = old_item.get("sfx", detect_sfx_type(new_dialogue, old_item.get("location_key", ""), scene_mood))
+    proj_ratio = state.get("aspect_ratio", "16:9")
     await asyncio.to_thread(
         prepare_character_frame,
         char_info["image"],
@@ -2718,6 +3364,8 @@ async def edit_scene(
         old_item.get("bg_path") or state.get("custom_bg_path"),
         state.get("watermark_text", ""),
         state.get("watermark_position", "top-right"),
+        proj_ratio,
+        old_item.get("visual_action_prompt", ""),
     )
     await asyncio.to_thread(
         render_exact_face_clip,
@@ -2735,6 +3383,12 @@ async def edit_scene(
             scene_mood,
             scene_sfx,
         ),
+        char_info.get("angles"),
+        old_item.get("camera_angle", "front"),
+        char_name,
+        new_dialogue,
+        0.0,
+        proj_ratio,
     )
     if os.path.exists(a_file):
         os.remove(a_file)
@@ -2836,6 +3490,7 @@ async def customize_scene(
     )
     scene_mood = item.get("mood", "Action")
     scene_sfx = item.get("sfx", detect_sfx_type(item["dialogue"], item.get("location_key", ""), scene_mood))
+    proj_ratio = state.get("aspect_ratio", "16:9")
     await asyncio.to_thread(
         prepare_character_frame,
         char_info["image"],
@@ -2848,6 +3503,8 @@ async def customize_scene(
         item.get("bg_path") or state.get("custom_bg_path"),
         state.get("watermark_text", ""),
         state.get("watermark_position", "top-right"),
+        proj_ratio,
+        item.get("visual_action_prompt", ""),
     )
     await asyncio.to_thread(
         render_exact_face_clip,
@@ -2858,6 +3515,12 @@ async def customize_scene(
         scene_mood,
         scene_sfx,
         item.get("visual_action_prompt", ""),
+        char_info.get("angles"),
+        item.get("camera_angle", "front"),
+        char_name,
+        item["dialogue"],
+        0.0,
+        proj_ratio,
     )
     if os.path.exists(a_file):
         os.remove(a_file)
@@ -2964,6 +3627,7 @@ async def _dub_project_worker(project_id: str, target_language: str):
                     pitch=char_map[c_name].get("pitch", "normal"),
                     language=lang,
                 )
+                proj_ratio = state.get("aspect_ratio", "16:9")
                 await asyncio.to_thread(
                     prepare_character_frame,
                     char_map[c_name]["image"],
@@ -2976,6 +3640,8 @@ async def _dub_project_worker(project_id: str, target_language: str):
                     d.get("bg_path") or project_custom_bg,
                     wm_text,
                     wm_pos,
+                    proj_ratio,
+                    d.get("visual_action_prompt", ""),
                 )
                 await asyncio.to_thread(
                     render_exact_face_clip,
@@ -2986,6 +3652,12 @@ async def _dub_project_worker(project_id: str, target_language: str):
                     scene_mood,
                     scene_sfx,
                     d.get("visual_action_prompt", ""),
+                    char_map[c_name].get("angles"),
+                    d.get("camera_angle", "front"),
+                    c_name,
+                    diag_text,
+                    0.0,
+                    proj_ratio,
                 )
                 for p in (a_file, f_img):
                     if os.path.exists(p):
@@ -3061,7 +3733,7 @@ def _render_bollywood_poster(proj_dir: str, state: dict) -> str:
             if not img_p or not os.path.exists(img_p):
                 continue
             try:
-                p_img = Image.open(img_p).convert("RGB")
+                p_img = open_upright_image(img_p)
                 p_img = p_img.resize((slot_w, slot_h), Image.Resampling.LANCZOS)
                 x = start_x + idx * (slot_w + 24)
                 y = 270 + (0 if idx == 0 else 40)
@@ -3078,14 +3750,9 @@ def _render_bollywood_poster(proj_dir: str, state: dict) -> str:
                 continue
 
     draw = ImageDraw.Draw(poster)
-    try:
-        font_super = ImageFont.truetype("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf", 72)
-        font_sub = ImageFont.truetype("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf", 34)
-        font_meta = ImageFont.truetype("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf", 26)
-    except Exception:
-        font_super = ImageFont.load_default()
-        font_sub = ImageFont.load_default()
-        font_meta = ImageFont.load_default()
+    font_super = load_hindi_font(72, bold=True)
+    font_sub = load_hindi_font(34, bold=True)
+    font_meta = load_hindi_font(26, bold=False)
 
     # Top Bollywood banner
     genre_txt = f"★ CINEPOP AI PRESENTS • {state.get('genre', 'ACTION').upper()} • {state.get('language', 'HINDI').upper()} ★"
@@ -3158,12 +3825,8 @@ def _make_title_card_clip(
     img = Image.new("RGB", (W, H), (10, 6, 24))
     _draw_vertical_gradient(img, (26, 9, 51), (10, 6, 22))
     draw = ImageDraw.Draw(img)
-    try:
-        f_big = ImageFont.truetype("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf", 54 if not vertical else 44)
-        f_sm = ImageFont.truetype("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf", 28 if not vertical else 24)
-    except Exception:
-        f_big = ImageFont.load_default()
-        f_sm = ImageFont.load_default()
+    f_big = load_hindi_font(54 if not vertical else 44, bold=True)
+    f_sm = load_hindi_font(28 if not vertical else 24, bold=False)
 
     draw.rectangle([40, H // 2 - 120, W - 40, H // 2 + 120], outline=(255, 214, 0), width=4)
     draw.text((70, H // 2 - 70), title[:30], fill=(255, 214, 0), font=f_big)
@@ -3876,11 +4539,10 @@ async def start_face_swap(
     os.makedirs(job_dir, exist_ok=True)
 
     vid_path = safe_project_file(job_dir, f"input_{video.filename or 'clip.mp4'}")
-    face_path = safe_project_file(job_dir, f"face_front_{face_image.filename or 'face.jpg'}")
+    face_path = safe_project_file(job_dir, "face_front.jpg")
     with open(vid_path, "wb") as f:
         f.write(video_bytes)
-    with open(face_path, "wb") as f:
-        f.write(face_bytes)
+    save_upright_image_bytes(face_bytes, face_path)
 
     face_angles: dict[str, str] = {"front": face_path}
     if angle_images:
@@ -3900,8 +4562,7 @@ async def start_face_swap(
                 fname_low = (a_up.filename or "").lower()
                 ang = next((k for k in ALLOWED_FACE_ANGLES if k in fname_low), "front")
             a_path = safe_project_file(job_dir, f"face_{ang}.jpg")
-            with open(a_path, "wb") as f:
-                f.write(a_bytes)
+            save_upright_image_bytes(a_bytes, a_path)
             face_angles[ang] = a_path
 
     job_meta = {

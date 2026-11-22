@@ -56,18 +56,52 @@ jobs:
           flutter --version
           flutter create --platforms=android --org com.cinepop.ai --project-name cinepop_ai_studio .
           python3 - <<'PY'
-          import os
+          import os, re
+          # Ensure ProGuard keeps ML Kit Face Detection & Camera classes intact in release APK
+          pg_path = "android/app/proguard-rules.pro"
+          with open(pg_path, "w", encoding="utf-8") as pg:
+              pg.write(
+                  "-keep class com.google.mlkit.** { *; }\n"
+                  "-dontwarn com.google.mlkit.**\n"
+                  "-keep class com.google.android.gms.** { *; }\n"
+                  "-dontwarn com.google.android.gms.**\n"
+                  "-keep class io.flutter.plugins.camera.** { *; }\n"
+                  "-keep class studio.midoridesign.gyawun.** { *; }\n"
+              )
+
           for rel in ("android/app/build.gradle.kts", "android/app/build.gradle"):
               if not os.path.exists(rel):
                   continue
               with open(rel, "r", encoding="utf-8") as f:
                   src = f.read()
+              # Enforce minSdk >= 21 for camera + google_mlkit_face_detection + gal
+              src = re.sub(r"minSdk\s*=\s*flutter\.minSdkVersion", "minSdk = 21", src)
+              src = re.sub(r"minSdkVersion\s+flutter\.minSdkVersion", "minSdkVersion 21", src)
               if "checkReleaseBuilds" not in src and "android {" in src:
-                  patch = "android {\n    lint {\n        checkReleaseBuilds = false\n        abortOnError = false\n    }\n"
+                  patch = (
+                      "android {\n"
+                      "    lint {\n"
+                      "        checkReleaseBuilds = false\n"
+                      "        abortOnError = false\n"
+                      "    }\n"
+                  )
                   src = src.replace("android {", patch, 1)
-                  with open(rel, "w", encoding="utf-8") as f:
-                      f.write(src)
-                  print(f"Patched lint config in {rel}")
+              # Disable R8 stripping on release if not set so ML Kit native models work out of the box
+              if rel.endswith(".kts") and "isMinifyEnabled" not in src and "release {" in src:
+                  src = src.replace(
+                      "release {",
+                      "release {\n            isMinifyEnabled = false\n            isShrinkResources = false",
+                      1,
+                  )
+              elif rel.endswith(".gradle") and "minifyEnabled" not in src and "release {" in src:
+                  src = src.replace(
+                      "release {",
+                      "release {\n            minifyEnabled false\n            shrinkResources false",
+                      1,
+                  )
+              with open(rel, "w", encoding="utf-8") as f:
+                  f.write(src)
+              print(f"Patched Gradle config in {rel}")
           PY
           flutter pub get
           dart run flutter_launcher_icons

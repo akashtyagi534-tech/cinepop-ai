@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -10,6 +12,28 @@ import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 import 'package:chewie/chewie.dart';
 import 'package:google_sign_in/google_sign_in.dart';
+import 'package:camera/camera.dart';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:image/image.dart' as img;
+import 'package:gal/gal.dart';
+
+/// Ensures camera/gallery face photos are ALWAYS upright portrait (never 90° rotated).
+Future<File> _fixUprightPortrait(File rawFile) async {
+  try {
+    final bytes = await rawFile.readAsBytes();
+    final decoded = img.decodeImage(bytes);
+    if (decoded == null) return rawFile;
+    final upright = img.bakeOrientation(decoded);
+    final tempDir = await getTemporaryDirectory();
+    final outPath =
+        "${tempDir.path}/upright_${DateTime.now().microsecondsSinceEpoch}.jpg";
+    final outFile = File(outPath);
+    await outFile.writeAsBytes(img.encodeJpg(upright, quality: 90), flush: true);
+    return outFile;
+  } catch (_) {
+    return rawFile;
+  }
+}
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -91,14 +115,21 @@ class _CinePopHomeState extends State<CinePopHome> {
   final TextEditingController loginReferralController = TextEditingController();
   final TextEditingController applyReferralController = TextEditingController();
   int selectedMinutes = 1;
+  String selectedAspectRatio = "9:16"; // "9:16" Instagram/Moj | "16:9" YouTube
+  String selectedSeriesMode = "series"; // "series" (Moj/Pocket FM default) | "single"
+  int selectedPartDuration = 1; // 1 or 2 Min / Part
+  int selectedTotalParts = 3; // 3, 5, 10, 15 Parts
   List<Map<String, dynamic>> characters = [];
   String dataEstimateText =
-      "डेटा खर्च: ~15 MB (1 मिनट · 4-5 तेज़ सीन्स · ~30-45 सेकंड में तैयार)";
+      "📱 3 Parts × 1 Min (9:16 Moj/Reels) · Part 1 ~35 सेकंड में Play के लिए तैयार";
   bool isSubmitting = false;
   bool isInstantLoggingIn = false;
 
   // Active Movie Project & Studio Actions
   String? activeProjectId;
+  String activeAspectRatio = "9:16";
+  String activeSeriesMode = "series";
+  int activeTotalParts = 3;
   int progress = 0;
   String statusMessage = "";
   List<dynamic> readyParts = [];
@@ -107,6 +138,7 @@ class _CinePopHomeState extends State<CinePopHome> {
   bool generatingTrailer = false;
   bool generatingPoster = false;
   bool dubbingMovie = false;
+  bool _autoNextTriggered = false;
   Timer? syncTimer;
   Timer? balanceTimer;
 
@@ -778,21 +810,33 @@ class _CinePopHomeState extends State<CinePopHome> {
   }
 
   void _updateDataEstimate() {
+    final String ratioLabel = selectedAspectRatio == "9:16"
+        ? "9:16 Instagram/Moj"
+        : "16:9 YouTube HD";
+    if (selectedSeriesMode == "series") {
+      final int totalMins = selectedPartDuration * selectedTotalParts;
+      final double totalMb = characters.length * 1.5 + totalMins * 14.0;
+      setState(() {
+        dataEstimateText =
+            "📱 $selectedTotalParts Parts × $selectedPartDuration Min ($ratioLabel · ~${totalMb.toStringAsFixed(0)} MB) · Part 1 सबसे पहले ~35s में Play होगा";
+      });
+      return;
+    }
     double uploadMb = characters.length * 1.5;
     double downloadMb = selectedMinutes * 16.0;
     double totalMb = uploadMb + downloadMb;
     String speedHint = selectedMinutes <= 1
-        ? "4-5 तेज़ सीन्स · ~30-45 सेकंड में तैयार"
+        ? "12-14 तेज़ सीन्स · ~35-45 सेकंड में तैयार"
         : selectedMinutes <= 2
-            ? "7-8 सीन्स · सुपर-फास्ट रेंडर"
+            ? "18-22 तेज़ सीन्स · सुपर-फास्ट रेंडर"
             : selectedMinutes <= 5
-                ? "14 सीन्स · शॉर्ट फिल्म"
+                ? "तेज़ कट्स · शॉर्ट फिल्म"
                 : selectedMinutes <= 10
-                    ? "22 सीन्स · फुल एपिसोड"
-                    : "3 चैप्टर्स · फुल मूवी";
+                    ? "फुल एपिसोड"
+                    : "फुल मूवी";
     setState(() {
       dataEstimateText =
-          "डेटा खर्च: ~${totalMb.toStringAsFixed(0)} MB ($selectedMinutes मिनट · $speedHint)";
+          "🎬 $selectedMinutes Min ($ratioLabel · ~${totalMb.toStringAsFixed(0)} MB · $speedHint)";
     });
   }
 
@@ -1408,310 +1452,16 @@ class _CinePopHomeState extends State<CinePopHome> {
   }
 
   Future<void> _openLive5AngleFaceScan() async {
-    final picker = ImagePicker();
-    final Map<String, File> capturedAngles = {};
-    int stepIdx = 0;
-
     if (!mounted) return;
-    final bool? completed = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (dlgCtx) => StatefulBuilder(
-        builder: (ctx, setDlgState) {
-          final current = _faceAngleSteps[stepIdx];
-          final String currentKey = current["key"]!;
-          final File? currentFile = capturedAngles[currentKey];
-          final int doneCount = capturedAngles.length;
-          final bool allDone = doneCount >= 5;
-
-          return AlertDialog(
-            backgroundColor: const Color(0xFF140D29),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(20),
-              side: BorderSide(
-                color: allDone
-                    ? Colors.greenAccent
-                    : const Color(0xFFFF007F),
-                width: 1.5,
-              ),
-            ),
-            title: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Expanded(
-                  child: Text(
-                    "🎭 3D Face Scan (5 Angles)",
-                    style: TextStyle(
-                      color: Color(0xFFFFD600),
-                      fontSize: 15,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ),
-                Text(
-                  "$doneCount/5",
-                  style: TextStyle(
-                    color: allDone
-                        ? Colors.greenAccent
-                        : const Color(0xFF00E5FF),
-                    fontWeight: FontWeight.bold,
-                    fontSize: 14,
-                  ),
-                ),
-              ],
-            ),
-            content: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  LinearProgressIndicator(
-                    value: doneCount / 5.0,
-                    backgroundColor: Colors.white12,
-                    color: allDone
-                        ? Colors.greenAccent
-                        : const Color(0xFFFF007F),
-                    minHeight: 6,
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  const SizedBox(height: 16),
-                  // Circular Face-ID KYC Frame
-                  Container(
-                    width: 170,
-                    height: 170,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: const Color(0xFF0B0718),
-                      border: Border.all(
-                        color: allDone
-                            ? Colors.greenAccent
-                            : (currentFile != null
-                                ? Colors.greenAccent
-                                : const Color(0xFF00E5FF)),
-                        width: 4,
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: (allDone
-                                  ? Colors.greenAccent
-                                  : const Color(0xFFFF007F))
-                              .withOpacity(0.35),
-                          blurRadius: 18,
-                          spreadRadius: 2,
-                        ),
-                      ],
-                    ),
-                    child: ClipOval(
-                      child: currentFile != null
-                          ? Image.file(currentFile, fit: BoxFit.cover)
-                          : Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(
-                                  _angleIcon(currentKey),
-                                  size: 46,
-                                  color: const Color(0xFF00E5FF),
-                                ),
-                                const SizedBox(height: 6),
-                                Text(
-                                  "Step ${stepIdx + 1}/5",
-                                  style: const TextStyle(
-                                    color: Colors.white70,
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                              ],
-                            ),
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-                  if (allDone)
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 10,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.green.withOpacity(0.18),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: Colors.greenAccent),
-                      ),
-                      child: const Row(
-                        children: [
-                          Icon(
-                            Icons.verified,
-                            color: Colors.greenAccent,
-                            size: 20,
-                          ),
-                          SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              "✅ 5-Angle 3D Face Profile Ready!",
-                              style: TextStyle(
-                                color: Colors.greenAccent,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 13,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    )
-                  else
-                    Container(
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF1F1440),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Column(
-                        children: [
-                          Text(
-                            "${stepIdx + 1}. ${current['hi']}",
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold,
-                              fontSize: 14,
-                            ),
-                          ),
-                          const SizedBox(height: 3),
-                          Text(
-                            current['hint']!,
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                              color: Colors.white70,
-                              fontSize: 11,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  const SizedBox(height: 12),
-                  // 5-angle mini pill selector
-                  Wrap(
-                    spacing: 6,
-                    runSpacing: 6,
-                    alignment: WrapAlignment.center,
-                    children: List.generate(_faceAngleSteps.length, (i) {
-                      final st = _faceAngleSteps[i];
-                      final k = st['key']!;
-                      final hasImg = capturedAngles.containsKey(k);
-                      final isSel = i == stepIdx;
-                      return GestureDetector(
-                        onTap: () => setDlgState(() => stepIdx = i),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 5,
-                          ),
-                          decoration: BoxDecoration(
-                            color: hasImg
-                                ? Colors.green.withOpacity(0.25)
-                                : (isSel
-                                    ? const Color(0xFFFF007F).withOpacity(0.25)
-                                    : const Color(0xFF1E143B)),
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(
-                              color: hasImg
-                                  ? Colors.greenAccent
-                                  : (isSel
-                                      ? const Color(0xFFFF007F)
-                                      : Colors.white24),
-                            ),
-                          ),
-                          child: Text(
-                            "${hasImg ? '✓ ' : ''}${st['label']}",
-                            style: TextStyle(
-                              color: hasImg ? Colors.greenAccent : Colors.white,
-                              fontSize: 11,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ),
-                      );
-                    }),
-                  ),
-                  const SizedBox(height: 14),
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFFFF007F),
-                        padding: const EdgeInsets.symmetric(vertical: 12),
-                      ),
-                      onPressed: () async {
-                        final XFile? pic = await picker.pickImage(
-                          source: ImageSource.camera,
-                          preferredCameraDevice: CameraDevice.front,
-                          imageQuality: 85,
-                        );
-                        if (pic != null) {
-                          setDlgState(() {
-                            capturedAngles[currentKey] = File(pic.path);
-                            // Auto-advance to next uncaptured angle
-                            for (int next = 0;
-                                next < _faceAngleSteps.length;
-                                next++) {
-                              final nk = _faceAngleSteps[next]['key']!;
-                              if (!capturedAngles.containsKey(nk)) {
-                                stepIdx = next;
-                                break;
-                              }
-                            }
-                          });
-                        }
-                      },
-                      icon: const Icon(Icons.camera_alt, color: Colors.white),
-                      label: Text(
-                        currentFile != null
-                            ? "Retake ${current['label']} Pose"
-                            : "📸 Capture: ${current['label']}",
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(dlgCtx, false),
-                child: const Text(
-                  "रद्द करें",
-                  style: TextStyle(color: Colors.white60),
-                ),
-              ),
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: allDone
-                      ? Colors.green
-                      : const Color(0xFF00E5FF),
-                ),
-                onPressed: capturedAngles.isEmpty
-                    ? null
-                    : () => Navigator.pop(dlgCtx, true),
-                child: Text(
-                  allDone
-                      ? "आगे बढ़ें (5/5 Ready)"
-                      : "Save (${capturedAngles.length}/5)",
-                  style: TextStyle(
-                    color: allDone ? Colors.white : Colors.black,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ),
-            ],
-          );
-        },
+    final Map<String, File>? scannedAngles =
+        await Navigator.push<Map<String, File>>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => const HandsFreeFaceIdScannerPage(),
       ),
     );
-
-    if (completed == true && capturedAngles.isNotEmpty && mounted) {
-      await _showCharacterDetailsDialog(capturedAngles);
+    if (scannedAngles != null && scannedAngles.isNotEmpty && mounted) {
+      await _showCharacterDetailsDialog(scannedAngles);
     }
   }
 
@@ -1811,8 +1561,10 @@ class _CinePopHomeState extends State<CinePopHome> {
                             imageQuality: 85,
                           );
                           if (pic != null) {
+                            final uprightFile =
+                                await _fixUprightPortrait(File(pic.path));
                             setDlgState(() {
-                              selectedAngles[k] = File(pic.path);
+                              selectedAngles[k] = uprightFile;
                             });
                           }
                         },
@@ -2028,7 +1780,15 @@ class _CinePopHomeState extends State<CinePopHome> {
       request.fields['default_location'] = locationController.text.trim();
       request.fields['watermark_text'] = watermarkController.text.trim();
       request.fields['watermark_position'] = watermarkPosition;
-      request.fields['duration_minutes'] = selectedMinutes.toString();
+      request.fields['aspect_ratio'] = selectedAspectRatio;
+      request.fields['platform'] =
+          selectedAspectRatio == "9:16" ? "instagram" : "youtube";
+      request.fields['series_mode'] = selectedSeriesMode;
+      request.fields['part_duration_minutes'] = selectedPartDuration.toString();
+      request.fields['total_parts'] = selectedTotalParts.toString();
+      request.fields['duration_minutes'] = selectedSeriesMode == "series"
+          ? (selectedPartDuration * selectedTotalParts).toString()
+          : selectedMinutes.toString();
       request.fields['char_names'] =
           characters.map((c) => c['name']).join(',');
       request.fields['voices'] = characters.map((c) => c['voice']).join(',');
@@ -2131,6 +1891,15 @@ class _CinePopHomeState extends State<CinePopHome> {
             readyParts = (data['ready_parts'] ?? []) as List<dynamic>;
             scriptsData = (data['scripts'] ?? {}) as Map<String, dynamic>;
             isCompleted = (data['is_completed'] ?? false) as bool;
+            if (data['aspect_ratio'] != null) {
+              activeAspectRatio = data['aspect_ratio'].toString();
+            }
+            if (data['series_mode'] != null) {
+              activeSeriesMode = data['series_mode'].toString();
+            }
+            if (data['total_parts'] is int) {
+              activeTotalParts = data['total_parts'] as int;
+            }
           });
           if (isCompleted) syncTimer?.cancel();
         }
@@ -2145,16 +1914,51 @@ class _CinePopHomeState extends State<CinePopHome> {
     });
   }
 
+  void _onVideoPlayerTick() {
+    final ctrl = _videoController;
+    final playing = currentlyPlayingType;
+    if (ctrl == null || playing == null || _autoNextTriggered) return;
+    final val = ctrl.value;
+    if (!val.isInitialized || val.duration <= const Duration(seconds: 1)) return;
+    if (val.position >= val.duration - const Duration(milliseconds: 450)) {
+      if (playing.startsWith("PART_")) {
+        final int? currPart = int.tryParse(playing.replaceFirst("PART_", ""));
+        if (currPart != null && readyParts.contains(currPart + 1)) {
+          _autoNextTriggered = true;
+          final nextPart = currPart + 1;
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                duration: const Duration(seconds: 2),
+                content: Text("⏭️ Auto-Next: Part $nextPart शुरू हो रहा है..."),
+              ),
+            );
+          }
+          Future.microtask(() => _playOnlinePreview("PART_$nextPart"));
+        }
+      }
+    }
+  }
+
   Future<void> _playOnlinePreview(String fileType) async {
     try {
       final streamUrl = "$serverUrl/stream/$activeProjectId/$fileType";
+      _autoNextTriggered = false;
+      _videoController?.removeListener(_onVideoPlayerTick);
       _videoController?.dispose();
       _chewieController?.dispose();
 
       _videoController = VideoPlayerController.networkUrl(Uri.parse(streamUrl));
       await _videoController!.initialize();
+      _videoController!.addListener(_onVideoPlayerTick);
+      final double fallbackRatio =
+          activeAspectRatio == "9:16" ? (9 / 16) : (16 / 9);
+      final double vidRatio = _videoController!.value.aspectRatio > 0
+          ? _videoController!.value.aspectRatio
+          : fallbackRatio;
       _chewieController = ChewieController(
         videoPlayerController: _videoController!,
+        aspectRatio: vidRatio,
         autoPlay: true,
         looping: false,
       );
@@ -2510,16 +2314,62 @@ class _CinePopHomeState extends State<CinePopHome> {
     );
   }
 
+  Future<String> _saveDownloadedFileToGallery(
+    File tempFile,
+    String fileName,
+  ) async {
+    final lower = fileName.toLowerCase();
+    final bool isImage = lower.endsWith(".jpg") ||
+        lower.endsWith(".jpeg") ||
+        lower.endsWith(".png") ||
+        lower.endsWith(".webp");
+    try {
+      bool hasAccess = await Gal.hasAccess(toAlbum: true);
+      if (!hasAccess) {
+        hasAccess = await Gal.requestAccess(toAlbum: true);
+      }
+      if (hasAccess) {
+        if (isImage) {
+          await Gal.putImage(tempFile.path, album: 'CinePopAI');
+          return "Phone Gallery (Pictures/CinePopAI)";
+        } else {
+          await Gal.putVideo(tempFile.path, album: 'CinePopAI');
+          return "Phone Gallery (Movies/CinePopAI)";
+        }
+      }
+    } catch (_) {}
+
+    // Fallback: save directly into public Movies/CinePopAI or app storage
+    try {
+      final pubDir = Directory(
+        isImage
+            ? "/storage/emulated/0/Pictures/CinePopAI"
+            : "/storage/emulated/0/Movies/CinePopAI",
+      );
+      if (!await pubDir.exists()) {
+        await pubDir.create(recursive: true);
+      }
+      final dest = "${pubDir.path}/$fileName";
+      await tempFile.copy(dest);
+      return isImage ? "Pictures/CinePopAI" : "Movies/CinePopAI";
+    } catch (_) {
+      final fallbackDir = await getExternalStorageDirectory() ??
+          await getApplicationDocumentsDirectory();
+      final dest = "${fallbackDir.path}/$fileName";
+      await tempFile.copy(dest);
+      return dest;
+    }
+  }
+
   Future<void> _downloadVideo(String fileType) async {
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text("$fileType डाउनलोड शुरू हो रहा है...")),
+      SnackBar(content: Text("$fileType Phone Gallery में डाउनलोड हो रहा है...")),
     );
     try {
-      final dir = await getExternalStorageDirectory() ??
-          await getApplicationDocumentsDirectory();
-      final savePath = "${dir.path}/CinePop_${activeProjectId}_$fileType.mp4";
-      final file = File(savePath);
-      final sink = file.openWrite();
+      final tempDir = await getTemporaryDirectory();
+      final fileName = "CinePop_${activeProjectId}_$fileType.mp4";
+      final tempFile = File("${tempDir.path}/$fileName");
+      final sink = tempFile.openWrite();
 
       final request = http.Request(
         'GET',
@@ -2532,13 +2382,26 @@ class _CinePopHomeState extends State<CinePopHome> {
           sink.add(chunk);
         }
         await sink.close();
+        final savedLocation =
+            await _saveDownloadedFileToGallery(tempFile, fileName);
+        try {
+          if (await tempFile.exists()) await tempFile.delete();
+        } catch (_) {}
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("✅ सेव हो गया: $savePath")),
+            SnackBar(
+              backgroundColor: Colors.green.shade700,
+              content: Text("✅ $savedLocation में सेव हो गया!"),
+            ),
           );
         }
       } else {
         await sink.close();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("डाउनलोड फेल (${response.statusCode})")),
+          );
+        }
       }
     } catch (e) {
       if (mounted) {
@@ -2551,23 +2414,29 @@ class _CinePopHomeState extends State<CinePopHome> {
 
   Future<void> _downloadDirectUrl(String url, String fileName) async {
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text("$fileName डाउनलोड शुरू हो रहा है...")),
+      SnackBar(content: Text("$fileName Phone Gallery में डाउनलोड हो रहा है...")),
     );
     try {
-      final dir = await getExternalStorageDirectory() ??
-          await getApplicationDocumentsDirectory();
-      final savePath = "${dir.path}/$fileName";
-      final file = File(savePath);
-      final sink = file.openWrite();
+      final tempDir = await getTemporaryDirectory();
+      final tempFile = File("${tempDir.path}/$fileName");
+      final sink = tempFile.openWrite();
       final response = await http.Request('GET', Uri.parse(url)).send();
       if (response.statusCode == 200) {
         await for (var chunk in response.stream) {
           sink.add(chunk);
         }
         await sink.close();
+        final savedLocation =
+            await _saveDownloadedFileToGallery(tempFile, fileName);
+        try {
+          if (await tempFile.exists()) await tempFile.delete();
+        } catch (_) {}
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("✅ सेव हो गया: $savePath")),
+            SnackBar(
+              backgroundColor: Colors.green.shade700,
+              content: Text("✅ $savedLocation में सेव हो गया!"),
+            ),
           );
         }
       } else {
@@ -3362,6 +3231,14 @@ class _CinePopHomeState extends State<CinePopHome> {
                         "मुंबई की भारी बारिश में एक जांबाज हीरो अकेले अंडरवर्ल्ड डॉन के अड्डे पर हमला कर शहर को बचाता है",
                   },
                   {
+                    "label": "💰 Ghar Jamai Twist",
+                    "genre": "Thriller",
+                    "mood": "Suspense",
+                    "loc": "Royal Palace",
+                    "topic":
+                        "ससुराल में जिसे सब गरीब घर जमाई समझकर अपमानित करते थे, शादी की सालगिरह पर अचानक पता चलता है कि वो पूरे शहर का सबसे बड़ा अरबपति मालिक है",
+                  },
+                  {
                     "label": "😂 Comedy Reel",
                     "genre": "Comedy",
                     "mood": "Comedy",
@@ -3376,14 +3253,6 @@ class _CinePopHomeState extends State<CinePopHome> {
                     "loc": "Purani Haveli",
                     "topic":
                         "आधी रात को तूफ़ान में दो दोस्त एक 200 साल पुरानी भूतिया हवेली में फंस जाते हैं जहाँ अचानक दरवाज़े बंद हो जाते हैं",
-                  },
-                  {
-                    "label": "❤️ Love Story",
-                    "genre": "Love Story",
-                    "mood": "Romantic",
-                    "loc": "Himalayan Mountains",
-                    "topic":
-                        "बर्फीले पहाड़ों और बारिश के बीच दो बिछड़े हुए प्यार करने वाले सालों बाद एक ट्रेन स्टेशन पर फिर मिलते हैं",
                   },
                 ].map((tpl) {
                   final active = selectedGenre == tpl['genre'] &&
@@ -3414,7 +3283,7 @@ class _CinePopHomeState extends State<CinePopHome> {
                         SnackBar(
                           duration: const Duration(seconds: 2),
                           content: Text(
-                            "${tpl['label']} सेट हो गया! अब कैरेक्टर फोटो जोड़ें और Start दबाएँ।",
+                            "${tpl['label']} सेट हो गया! अब 3D Face Scan करें और Start दबाएँ।",
                           ),
                         ),
                       );
@@ -3427,47 +3296,336 @@ class _CinePopHomeState extends State<CinePopHome> {
         ),
         const SizedBox(height: 16),
 
-        // 1. Runtime (Fast Short Reels Default = 1 Min)
+        // 1A. Video Platform & Aspect Ratio Selector (Instagram 9:16 vs YouTube 16:9)
         const Text(
-          "1. मूवी की लंबाई चुनें:",
+          "1. वीडियो प्लेटफ़ॉर्म और साइज़ चुनें (Platform & Ratio):",
           style: TextStyle(
             fontWeight: FontWeight.bold,
             color: Color(0xFF00E5FF),
           ),
         ),
-        DropdownButton<int>(
-          value: [1, 2, 5, 10, 30].contains(selectedMinutes)
-              ? selectedMinutes
-              : 1,
-          isExpanded: true,
-          dropdownColor: const Color(0xFF1B1236),
-          items: const [
-            DropdownMenuItem(
-              value: 1,
-              child: Text("1 मिनट (Reel / Short - ~15 MB)"),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: GestureDetector(
+                onTap: () {
+                  selectedAspectRatio = "9:16";
+                  _updateDataEstimate();
+                },
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    gradient: selectedAspectRatio == "9:16"
+                        ? const LinearGradient(
+                            colors: [Color(0xFF3E1148), Color(0xFF1F123A)],
+                          )
+                        : null,
+                    color: selectedAspectRatio == "9:16"
+                        ? null
+                        : const Color(0xFF160F2D),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                      color: selectedAspectRatio == "9:16"
+                          ? const Color(0xFFFF007F)
+                          : Colors.white24,
+                      width: selectedAspectRatio == "9:16" ? 2 : 1,
+                    ),
+                  ),
+                  child: Column(
+                    children: [
+                      Container(
+                        width: 40,
+                        height: 40,
+                        decoration: BoxDecoration(
+                          gradient: const LinearGradient(
+                            colors: [
+                              Color(0xFFF58529),
+                              Color(0xFFDD2A7B),
+                              Color(0xFF8134AF),
+                            ],
+                          ),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: const Icon(
+                          Icons.smartphone,
+                          color: Colors.white,
+                          size: 22,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        "Instagram / Moj Reels",
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 12,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      const Text(
+                        "9:16 Vertical · 720×1280",
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Color(0xFFFFD600),
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             ),
-            DropdownMenuItem(
-              value: 2,
-              child: Text("2 मिनट (Mini Clip - ~30 MB)"),
-            ),
-            DropdownMenuItem(
-              value: 5,
-              child: Text("5 मिनट (Short Film - ~80 MB)"),
-            ),
-            DropdownMenuItem(
-              value: 10,
-              child: Text("10 मिनट (Episode - ~160 MB)"),
-            ),
-            DropdownMenuItem(
-              value: 30,
-              child: Text("30 मिनट (Full Movie - ~480 MB)"),
+            const SizedBox(width: 10),
+            Expanded(
+              child: GestureDetector(
+                onTap: () {
+                  selectedAspectRatio = "16:9";
+                  _updateDataEstimate();
+                },
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    gradient: selectedAspectRatio == "16:9"
+                        ? const LinearGradient(
+                            colors: [Color(0xFF3E101F), Color(0xFF1F123A)],
+                          )
+                        : null,
+                    color: selectedAspectRatio == "16:9"
+                        ? null
+                        : const Color(0xFF160F2D),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                      color: selectedAspectRatio == "16:9"
+                          ? const Color(0xFFFF1744)
+                          : Colors.white24,
+                      width: selectedAspectRatio == "16:9" ? 2 : 1,
+                    ),
+                  ),
+                  child: Column(
+                    children: [
+                      Container(
+                        width: 40,
+                        height: 40,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFF0000),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: const Icon(
+                          Icons.play_arrow_rounded,
+                          color: Colors.white,
+                          size: 28,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        "YouTube / Mini Series",
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 12,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      const Text(
+                        "16:9 Landscape · 1280×720",
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Color(0xFF00E5FF),
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             ),
           ],
-          onChanged: (val) {
-            selectedMinutes = val!;
-            _updateDataEstimate();
-          },
         ),
+        const SizedBox(height: 14),
+
+        // 1B. Moj / Pocket FM Part-Wise Micro-Drama Series Mode (Default) vs Single Movie Mode
+        Row(
+          children: [
+            Expanded(
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: selectedSeriesMode == "series"
+                      ? const Color(0xFFFF007F)
+                      : const Color(0xFF1B1236),
+                  padding: const EdgeInsets.symmetric(vertical: 11),
+                ),
+                onPressed: () {
+                  selectedSeriesMode = "series";
+                  _updateDataEstimate();
+                },
+                child: const Text(
+                  "📱 Part-Wise Series (Default)",
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 11,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: selectedSeriesMode == "single"
+                      ? const Color(0xFF00E5FF)
+                      : const Color(0xFF1B1236),
+                  padding: const EdgeInsets.symmetric(vertical: 11),
+                ),
+                onPressed: () {
+                  selectedSeriesMode = "single";
+                  _updateDataEstimate();
+                },
+                child: Text(
+                  "🎬 Single Movie Mode",
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: selectedSeriesMode == "single"
+                        ? Colors.black
+                        : Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 11,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        if (selectedSeriesMode == "series") ...[
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1B1236),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: const Color(0xFFFF007F).withOpacity(0.45)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  "🔥 Pocket FM / Moj Micro-Drama Series Settings:",
+                  style: TextStyle(
+                    color: Color(0xFFFFD600),
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [1, 2].map((mins) {
+                    final active = selectedPartDuration == mins;
+                    return Expanded(
+                      child: Padding(
+                        padding: EdgeInsets.only(right: mins == 1 ? 8 : 0),
+                        child: OutlinedButton(
+                          style: OutlinedButton.styleFrom(
+                            backgroundColor: active
+                                ? const Color(0xFFFF007F).withOpacity(0.25)
+                                : const Color(0xFF120B24),
+                            side: BorderSide(
+                              color: active
+                                  ? const Color(0xFFFF007F)
+                                  : Colors.white24,
+                            ),
+                          ),
+                          onPressed: () {
+                            selectedPartDuration = mins;
+                            _updateDataEstimate();
+                          },
+                          child: Text(
+                            "$mins Min / Part",
+                            style: TextStyle(
+                              color: active ? Colors.white : Colors.white70,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 6,
+                  children: [3, 5, 10, 15].map((cnt) {
+                    final active = selectedTotalParts == cnt;
+                    return ChoiceChip(
+                      label: Text(
+                        "$cnt Parts",
+                        style: TextStyle(
+                          color: active ? Colors.black : Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 12,
+                        ),
+                      ),
+                      selected: active,
+                      selectedColor: const Color(0xFF00E5FF),
+                      backgroundColor: const Color(0xFF281854),
+                      onSelected: (_) {
+                        selectedTotalParts = cnt;
+                        _updateDataEstimate();
+                      },
+                    );
+                  }).toList(),
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  "⚡ Part 1 सबसे पहले (~35s में) Play के लिए तैयार होगा · हर Part के अंत में Cliffhanger सस्पेंस और Auto-Next!",
+                  style: TextStyle(color: Colors.white70, fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+        ] else ...[
+          DropdownButton<int>(
+            value: [1, 2, 5, 10, 30].contains(selectedMinutes)
+                ? selectedMinutes
+                : 1,
+            isExpanded: true,
+            dropdownColor: const Color(0xFF1B1236),
+            items: const [
+              DropdownMenuItem(
+                value: 1,
+                child: Text("1 मिनट (Reel / Short - ~15 MB)"),
+              ),
+              DropdownMenuItem(
+                value: 2,
+                child: Text("2 मिनट (Mini Clip - ~30 MB)"),
+              ),
+              DropdownMenuItem(
+                value: 5,
+                child: Text("5 मिनट (Short Film - ~80 MB)"),
+              ),
+              DropdownMenuItem(
+                value: 10,
+                child: Text("10 मिनट (Episode - ~160 MB)"),
+              ),
+              DropdownMenuItem(
+                value: 30,
+                child: Text("30 मिनट (Full Movie - ~480 MB)"),
+              ),
+            ],
+            onChanged: (val) {
+              selectedMinutes = val!;
+              _updateDataEstimate();
+            },
+          ),
+        ],
+        const SizedBox(height: 8),
         Container(
           padding: const EdgeInsets.all(10),
           decoration: BoxDecoration(
@@ -3943,6 +4101,55 @@ class _CinePopHomeState extends State<CinePopHome> {
                   color: Color(0xFFFFD600),
                 ),
               ),
+              if (!isCompleted && readyParts.contains(1)) ...[
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Colors.green.withOpacity(0.18),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.greenAccent),
+                  ),
+                  child: Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          "🔥 Part 1 तैयार है — अभी Play करें! बाकी Parts बैकग्राउंड में बन रहे हैं...",
+                          style: TextStyle(
+                            color: Colors.greenAccent,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF00E5FF),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 8,
+                          ),
+                        ),
+                        onPressed: () => _playOnlinePreview("PART_1"),
+                        icon: const Icon(
+                          Icons.play_arrow,
+                          color: Colors.black,
+                          size: 18,
+                        ),
+                        label: const Text(
+                          "Play Part 1",
+                          style: TextStyle(
+                            color: Colors.black,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               if (isCompleted) ...[
                 const SizedBox(height: 12),
                 Row(
@@ -3953,7 +4160,11 @@ class _CinePopHomeState extends State<CinePopHome> {
                           backgroundColor: const Color(0xFF00E5FF),
                           padding: const EdgeInsets.symmetric(vertical: 12),
                         ),
-                        onPressed: () => _playOnlinePreview("FULL_MOVIE"),
+                        onPressed: () => _playOnlinePreview(
+                          activeSeriesMode == "series" && readyParts.contains(1)
+                              ? "PART_1"
+                              : "FULL_MOVIE",
+                        ),
                         icon: const Icon(Icons.play_arrow, color: Colors.black),
                         label: const Text(
                           "Ready! Play",
@@ -3988,20 +4199,97 @@ class _CinePopHomeState extends State<CinePopHome> {
             ],
           ),
         ),
-        const SizedBox(height: 16),
-        if (_chewieController != null &&
-            _videoController!.value.isInitialized) ...[
-          Text(
-            "प्रिव्यू चल रहा है: $currentlyPlayingType",
-            style: const TextStyle(
-              fontWeight: FontWeight.bold,
-              color: Color(0xFF00E5FF),
+        const SizedBox(height: 12),
+        // Moj / Pocket FM Top Part Tabs ([Part 1] [Part 2] [Part 3]...) with Auto-Next
+        if (readyParts.isNotEmpty) ...[
+          SizedBox(
+            height: 40,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              children: [
+                ...readyParts.map((p) {
+                  final key = "PART_$p";
+                  final isCurrent = currentlyPlayingType == key;
+                  return Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: ChoiceChip(
+                      label: Text(
+                        "Part $p",
+                        style: TextStyle(
+                          color: isCurrent ? Colors.white : Colors.white70,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 12,
+                        ),
+                      ),
+                      selected: isCurrent,
+                      selectedColor: const Color(0xFFFF007F),
+                      backgroundColor: const Color(0xFF1B1236),
+                      onSelected: (_) => _playOnlinePreview(key),
+                    ),
+                  );
+                }),
+                if (isCompleted)
+                  ChoiceChip(
+                    label: Text(
+                      "🎬 Full",
+                      style: TextStyle(
+                        color: currentlyPlayingType == "FULL_MOVIE"
+                            ? Colors.black
+                            : Colors.white70,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                      ),
+                    ),
+                    selected: currentlyPlayingType == "FULL_MOVIE",
+                    selectedColor: const Color(0xFFFFD600),
+                    backgroundColor: const Color(0xFF1B1236),
+                    onSelected: (_) => _playOnlinePreview("FULL_MOVIE"),
+                  ),
+              ],
             ),
           ),
+          const SizedBox(height: 10),
+        ],
+        if (_chewieController != null &&
+            _videoController!.value.isInitialized) ...[
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                "प्रिव्यू चल रहा है: $currentlyPlayingType (${activeAspectRatio == "9:16" ? "9:16 Reels" : "16:9 HD"})",
+                style: const TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFF00E5FF),
+                  fontSize: 12,
+                ),
+              ),
+              if (activeSeriesMode == "series")
+                const Text(
+                  "Auto-Next ON",
+                  style: TextStyle(
+                    color: Colors.greenAccent,
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+            ],
+          ),
           const SizedBox(height: 8),
-          AspectRatio(
-            aspectRatio: _videoController!.value.aspectRatio,
-            child: Chewie(controller: _chewieController!),
+          Center(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxHeight: activeAspectRatio == "9:16" ? 500 : 280,
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(14),
+                child: AspectRatio(
+                  aspectRatio: _videoController!.value.aspectRatio > 0
+                      ? _videoController!.value.aspectRatio
+                      : (activeAspectRatio == "9:16" ? 9 / 16 : 16 / 9),
+                  child: Chewie(controller: _chewieController!),
+                ),
+              ),
+            ),
           ),
           const SizedBox(height: 10),
           Row(
@@ -4047,15 +4335,15 @@ class _CinePopHomeState extends State<CinePopHome> {
               onPressed: () => _downloadVideo(currentlyPlayingType!),
               icon: const Icon(Icons.download, color: Colors.white),
               label: const Text(
-                "HD वीडियो डाउनलोड करें",
-                style: TextStyle(color: Colors.white),
+                "📥 Phone Gallery (Movies/CinePopAI) में सेव करें",
+                style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
               ),
             ),
           ),
           const Divider(height: 24),
         ],
         const Text(
-          "तैयार पार्ट्स (पहले Play करके चेक करें, फिर Download करें):",
+          "तैयार पार्ट्स (पहले Play करके चेक करें, फिर Gallery में Download करें):",
           style: TextStyle(fontWeight: FontWeight.bold),
         ),
         const SizedBox(height: 8),
@@ -4063,7 +4351,11 @@ class _CinePopHomeState extends State<CinePopHome> {
           (p) => Card(
             color: const Color(0xFF1B1236),
             child: ListTile(
-              title: Text("पार्ट $p (30 मिनट)"),
+              title: Text(
+                activeSeriesMode == "series"
+                    ? "📱 Part $p (Micro-Drama · Auto-Next)"
+                    : "पार्ट $p",
+              ),
               trailing: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -5351,3 +5643,614 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
     );
   }
 }
+
+// ==================== IPHONE FACE ID HANDS-FREE 5-ANGLE 3D SCANNER ====================
+
+class HandsFreeFaceIdScannerPage extends StatefulWidget {
+  const HandsFreeFaceIdScannerPage({super.key});
+
+  @override
+  State<HandsFreeFaceIdScannerPage> createState() =>
+      _HandsFreeFaceIdScannerPageState();
+}
+
+class _HandsFreeFaceIdScannerPageState
+    extends State<HandsFreeFaceIdScannerPage> {
+  static const List<Map<String, String>> _steps = [
+    {
+      "key": "front",
+      "arrow": "🎯",
+      "hi": "🎯 सामने देखें (Look Straight)",
+      "hint": "चेहरा सर्कल के बीच में रखें — Auto-Capture होगा",
+    },
+    {
+      "key": "left",
+      "arrow": "⬅️",
+      "hi": "⬅️ थोड़ा बाएं मुड़ें (Turn Left)",
+      "hint": "चेहरा धीरे से बाईं ओर घुमाएँ — बिना बटन दबाए कैप्चर होगा",
+    },
+    {
+      "key": "right",
+      "arrow": "➡️",
+      "hi": "➡️ थोड़ा दाएं मुड़ें (Turn Right)",
+      "hint": "चेहरा धीरे से दाईं ओर घुमाएँ — Auto-Capture होगा",
+    },
+    {
+      "key": "up",
+      "arrow": "⬆️",
+      "hi": "⬆️ थोड़ा ऊपर देखें (Look Up)",
+      "hint": "ठुड्डी हल्की सी ऊपर उठाएँ — Auto-Capture होगा",
+    },
+    {
+      "key": "down",
+      "arrow": "⬇️",
+      "hi": "⬇️ थोड़ा नीचे देखें (Look Down)",
+      "hint": "चेहरा हल्का सा नीचे झुकाएँ — 5वां और आखिरी एंगल",
+    },
+  ];
+
+  CameraController? _cameraController;
+  CameraDescription? _frontCamera;
+  late final FaceDetector _faceDetector;
+  final Map<String, File> _captured = {};
+
+  int _currentStepIdx = 0;
+  int _matchedStreak = 0;
+  bool _isInitializing = true;
+  bool _isProcessingFrame = false;
+  bool _isCapturing = false;
+  bool _faceDetected = false;
+  double _liveYaw = 0;
+  double _livePitch = 0;
+  String? _cameraError;
+
+  @override
+  void initState() {
+    super.initState();
+    _faceDetector = FaceDetector(
+      options: FaceDetectorOptions(
+        enableTracking: true,
+        performanceMode: FaceDetectorMode.fast,
+      ),
+    );
+    _initFrontCamera();
+  }
+
+  Future<void> _initFrontCamera() async {
+    try {
+      final cams = await availableCameras();
+      if (cams.isEmpty) {
+        if (mounted) {
+          setState(() {
+            _isInitializing = false;
+            _cameraError = "इस डिवाइस में कैमरा नहीं मिला।";
+          });
+        }
+        return;
+      }
+      _frontCamera = cams.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.front,
+        orElse: () => cams.first,
+      );
+      _cameraController = CameraController(
+        _frontCamera!,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: Platform.isAndroid
+            ? ImageFormatGroup.nv21
+            : ImageFormatGroup.bgra8888,
+      );
+      await _cameraController!.initialize();
+      if (!mounted) return;
+      setState(() => _isInitializing = false);
+      await _startLiveFaceTracking();
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isInitializing = false;
+          _cameraError = "फ्रंट कैमरा शुरू करने में समस्या: $e";
+        });
+      }
+    }
+  }
+
+  Future<void> _startLiveFaceTracking() async {
+    final ctrl = _cameraController;
+    if (ctrl == null || !ctrl.value.isInitialized) return;
+    if (ctrl.value.isStreamingImages) return;
+    try {
+      await ctrl.startImageStream(_processCameraFrame);
+    } catch (_) {}
+  }
+
+  InputImage? _toInputImage(CameraImage image) {
+    final cam = _frontCamera;
+    if (cam == null) return null;
+    final rotation =
+        InputImageRotationValue.fromRawValue(cam.sensorOrientation) ??
+            InputImageRotation.rotation270deg;
+    final format = InputImageFormatValue.fromRawValue(image.format.raw) ??
+        (Platform.isAndroid
+            ? InputImageFormat.nv21
+            : InputImageFormat.bgra8888);
+
+    final WriteBuffer allBytes = WriteBuffer();
+    for (final Plane plane in image.planes) {
+      allBytes.putUint8List(plane.bytes);
+    }
+    final bytes = allBytes.done().buffer.asUint8List();
+
+    return InputImage.fromBytes(
+      bytes: bytes,
+      metadata: InputImageMetadata(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        rotation: rotation,
+        format: format,
+        bytesPerRow: image.planes.first.bytesPerRow,
+      ),
+    );
+  }
+
+  bool _matchesAngle(String key, double yaw, double pitch) {
+    switch (key) {
+      case "front":
+        return yaw.abs() <= 13.0 && pitch.abs() <= 13.0;
+      case "left":
+        return yaw >= 14.0;
+      case "right":
+        return yaw <= -14.0;
+      case "up":
+        return pitch >= 10.0;
+      case "down":
+        return pitch <= -10.0;
+      default:
+        return true;
+    }
+  }
+
+  Future<void> _processCameraFrame(CameraImage image) async {
+    if (_isProcessingFrame || _isCapturing || _captured.length >= 5) return;
+    _isProcessingFrame = true;
+    try {
+      final inputImage = _toInputImage(image);
+      if (inputImage == null) {
+        _isProcessingFrame = false;
+        return;
+      }
+      final faces = await _faceDetector.processImage(inputImage);
+      if (!mounted) return;
+
+      if (faces.isEmpty) {
+        if (_faceDetected || _matchedStreak > 0) {
+          setState(() {
+            _faceDetected = false;
+            _matchedStreak = 0;
+          });
+        }
+      } else {
+        final face = faces.first;
+        final double yaw = face.headEulerAngleY ?? 0.0;
+        final double pitch = face.headEulerAngleX ?? 0.0;
+        final String targetKey = _steps[_currentStepIdx]["key"]!;
+        final bool matched = _matchesAngle(targetKey, yaw, pitch);
+
+        setState(() {
+          _faceDetected = true;
+          _liveYaw = yaw;
+          _livePitch = pitch;
+          _matchedStreak = matched ? (_matchedStreak + 1) : 0;
+        });
+
+        // 2 consecutive steady frames -> 100% Hands-Free Auto-Capture!
+        if (_matchedStreak >= 2 && !_isCapturing) {
+          await _captureCurrentAngle(auto: true);
+        }
+      }
+    } catch (_) {
+    } finally {
+      _isProcessingFrame = false;
+    }
+  }
+
+  Future<void> _captureCurrentAngle({bool auto = false}) async {
+    if (_isCapturing || _cameraController == null) return;
+    if (!_cameraController!.value.isInitialized) return;
+    setState(() {
+      _isCapturing = true;
+      _matchedStreak = 0;
+    });
+
+    try {
+      if (_cameraController!.value.isStreamingImages) {
+        await _cameraController!.stopImageStream();
+      }
+      final XFile shot = await _cameraController!.takePicture();
+      final File uprightFile = await _fixUprightPortrait(File(shot.path));
+      final String angleKey = _steps[_currentStepIdx]["key"]!;
+
+      await HapticFeedback.heavyImpact();
+      await SystemSound.play(SystemSoundType.click);
+
+      if (!mounted) return;
+      setState(() {
+        _captured[angleKey] = uprightFile;
+        // Advance to next uncaptured angle
+        for (int i = 0; i < _steps.length; i++) {
+          if (!_captured.containsKey(_steps[i]["key"]!)) {
+            _currentStepIdx = i;
+            break;
+          }
+        }
+      });
+
+      if (_captured.length >= 5) {
+        await Future.delayed(const Duration(milliseconds: 700));
+        if (mounted) {
+          Navigator.pop(context, Map<String, File>.from(_captured));
+        }
+        return;
+      }
+
+      await Future.delayed(const Duration(milliseconds: 350));
+      if (mounted) {
+        setState(() => _isCapturing = false);
+        await _startLiveFaceTracking();
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() => _isCapturing = false);
+        await _startLiveFaceTracking();
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _cameraController?.dispose();
+    _faceDetector.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final step = _steps[_currentStepIdx];
+    final bool allDone = _captured.length >= 5;
+    final List<bool> completedSegments =
+        _steps.map((s) => _captured.containsKey(s["key"]!)).toList();
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0A0614),
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        title: const Text(
+          "🎭 3D Face ID Auto-Scan",
+          style: TextStyle(
+            color: Color(0xFFFFD600),
+            fontWeight: FontWeight.bold,
+            fontSize: 16,
+          ),
+        ),
+        actions: [
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.only(right: 16),
+              child: Text(
+                "${_captured.length}/5",
+                style: TextStyle(
+                  color: allDone
+                      ? const Color(0xFF00E676)
+                      : const Color(0xFF00E5FF),
+                  fontWeight: FontWeight.w900,
+                  fontSize: 15,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+          child: Column(
+            children: [
+              // Directional Prompt Banner
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: allDone
+                      ? const Color(0xFF00E676).withOpacity(0.16)
+                      : const Color(0xFF191030),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                    color: allDone
+                        ? const Color(0xFF00E676)
+                        : (_faceDetected
+                            ? const Color(0xFF00E5FF)
+                            : const Color(0xFFFF007F)),
+                  ),
+                ),
+                child: Column(
+                  children: [
+                    Text(
+                      allDone
+                          ? "✅ 5-Angle 3D Face Profile Ready!"
+                          : step["hi"]!,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: allDone
+                            ? const Color(0xFF00E676)
+                            : Colors.white,
+                        fontSize: 17,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      allDone
+                          ? "सभी 5 एंगल Upright Portrait में लॉक हो गए!"
+                          : step["hint"]!,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 22),
+
+              // Live Circular Front Camera Preview + 5-Segment Green Face ID Ring
+              Expanded(
+                child: Center(
+                  child: _isInitializing
+                      ? const CircularProgressIndicator(
+                          color: Color(0xFF00E5FF),
+                        )
+                      : _cameraError != null
+                          ? Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(
+                                  Icons.videocam_off,
+                                  color: Colors.redAccent,
+                                  size: 48,
+                                ),
+                                const SizedBox(height: 12),
+                                Text(
+                                  _cameraError!,
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                              ],
+                            )
+                          : SizedBox(
+                              width: 280,
+                              height: 280,
+                              child: Stack(
+                                alignment: Alignment.center,
+                                children: [
+                                  CustomPaint(
+                                    size: const Size(280, 280),
+                                    painter: _FaceIdRingPainter(
+                                      completedSegments: completedSegments,
+                                      activeIndex: _currentStepIdx,
+                                      faceDetected: _faceDetected,
+                                    ),
+                                  ),
+                                  ClipOval(
+                                    child: SizedBox(
+                                      width: 244,
+                                      height: 244,
+                                      child: FittedBox(
+                                        fit: BoxFit.cover,
+                                        child: SizedBox(
+                                          width: _cameraController!
+                                                  .value.previewSize?.height ??
+                                              480,
+                                          height: _cameraController!
+                                                  .value.previewSize?.width ??
+                                              640,
+                                          child: CameraPreview(
+                                            _cameraController!,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                  if (!allDone)
+                                    Positioned(
+                                      bottom: 14,
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 12,
+                                          vertical: 5,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: Colors.black.withOpacity(0.72),
+                                          borderRadius:
+                                              BorderRadius.circular(20),
+                                          border: Border.all(
+                                            color: _faceDetected
+                                                ? const Color(0xFF00E676)
+                                                : Colors.white30,
+                                          ),
+                                        ),
+                                        child: Text(
+                                          _isCapturing
+                                              ? "📸 Auto-Capturing..."
+                                              : (_faceDetected
+                                                  ? "${step['arrow']} Face Locked · Yaw ${_liveYaw.toStringAsFixed(0)}°"
+                                                  : "चेहरा सर्कल के अंदर लाएँ"),
+                                          style: TextStyle(
+                                            color: _faceDetected
+                                                ? const Color(0xFF00E676)
+                                                : Colors.white70,
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                ),
+              ),
+
+              const SizedBox(height: 14),
+              // 5 Angle Step Pills
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                alignment: WrapAlignment.center,
+                children: List.generate(_steps.length, (i) {
+                  final s = _steps[i];
+                  final done = _captured.containsKey(s["key"]!);
+                  final active = i == _currentStepIdx;
+                  return GestureDetector(
+                    onTap: () => setState(() => _currentStepIdx = i),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: done
+                            ? const Color(0xFF00E676).withOpacity(0.22)
+                            : (active
+                                ? const Color(0xFFFF007F).withOpacity(0.25)
+                                : const Color(0xFF1A1132)),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(
+                          color: done
+                              ? const Color(0xFF00E676)
+                              : (active
+                                  ? const Color(0xFFFF007F)
+                                  : Colors.white24),
+                        ),
+                      ),
+                      child: Text(
+                        "${done ? '✓ ' : '${s['arrow']} '}${s['key']!.toUpperCase()}",
+                        style: TextStyle(
+                          color: done ? const Color(0xFF00E676) : Colors.white,
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  );
+                }),
+              ),
+              const SizedBox(height: 14),
+
+              // Bottom Row: Fallback manual tap + Save
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        side: const BorderSide(color: Colors.white24),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                      onPressed: (_isCapturing || _cameraController == null)
+                          ? null
+                          : () => _captureCurrentAngle(auto: false),
+                      icon: const Icon(
+                        Icons.camera,
+                        color: Color(0xFF00E5FF),
+                        size: 18,
+                      ),
+                      label: const Text(
+                        "Manual Tap (Optional)",
+                        style: TextStyle(color: Colors.white70, fontSize: 12),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: allDone
+                            ? const Color(0xFF00E676)
+                            : const Color(0xFFFF007F),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                      onPressed: _captured.isEmpty
+                          ? null
+                          : () => Navigator.pop(
+                                context,
+                                Map<String, File>.from(_captured),
+                              ),
+                      child: Text(
+                        allDone
+                            ? "✅ Done (5/5 Ready)"
+                            : "Save (${_captured.length}/5)",
+                        style: TextStyle(
+                          color: allDone ? Colors.black : Colors.white,
+                          fontWeight: FontWeight.w900,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _FaceIdRingPainter extends CustomPainter {
+  final List<bool> completedSegments;
+  final int activeIndex;
+  final bool faceDetected;
+
+  _FaceIdRingPainter({
+    required this.completedSegments,
+    required this.activeIndex,
+    required this.faceDetected,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = (size.width / 2) - 8;
+    final rect = Rect.fromCircle(center: center, radius: radius);
+    const int total = 5;
+    const double gap = 0.14;
+    final double sweep = (2 * math.pi / total) - gap;
+
+    for (int i = 0; i < total; i++) {
+      final startAngle = -math.pi / 2 + i * (2 * math.pi / total) + gap / 2;
+      final bool isDone =
+          i < completedSegments.length && completedSegments[i];
+      final bool isActive = i == activeIndex;
+      final paint = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = isDone ? 9.0 : (isActive ? 8.0 : 5.5)
+        ..strokeCap = StrokeCap.round
+        ..color = isDone
+            ? const Color(0xFF00E676)
+            : (isActive
+                ? (faceDetected
+                    ? const Color(0xFF00E5FF)
+                    : const Color(0xFFFF007F))
+                : Colors.white24);
+      canvas.drawArc(rect, startAngle, sweep, false, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _FaceIdRingPainter oldDelegate) => true;
+}
+
