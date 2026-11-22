@@ -128,10 +128,6 @@ jobs:
                       gradlePluginPortal()
                   }
               }
-              repositories {
-                  google()
-                  mavenCentral()
-              }
           }
           GRADLE
           flutter build apk --release --split-per-abi --no-tree-shake-icons || (sleep 10 && flutter build apk --release --split-per-abi --no-tree-shake-icons)
