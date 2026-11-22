@@ -17,13 +17,28 @@ import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:image/image.dart' as img;
 import 'package:gal/gal.dart';
 
-/// Ensures camera/gallery face photos are ALWAYS upright portrait (never 90° rotated).
-Future<File> _fixUprightPortrait(File rawFile) async {
+/// Ensures camera/gallery face photos are ALWAYS upright portrait (never 90° rotated or sideways).
+Future<File> _fixUprightPortrait(
+  File rawFile, {
+  int? sensorOrientation,
+  bool isFrontCamera = false,
+}) async {
   try {
     final bytes = await rawFile.readAsBytes();
     final decoded = img.decodeImage(bytes);
     if (decoded == null) return rawFile;
-    final upright = img.bakeOrientation(decoded);
+    img.Image upright = img.bakeOrientation(decoded);
+    // On some Android OEM front cameras, raw JPEG pixels are saved landscape (width > height)
+    // without an EXIF orientation tag. Enforce upright portrait rotation using sensorOrientation.
+    if (sensorOrientation != null && upright.width > upright.height) {
+      final int rot = (sensorOrientation == 90 || sensorOrientation == 270)
+          ? sensorOrientation
+          : 270;
+      upright = img.copyRotate(upright, angle: rot);
+    }
+    if (isFrontCamera) {
+      upright = img.flipHorizontal(upright);
+    }
     final tempDir = await getTemporaryDirectory();
     final outPath =
         "${tempDir.path}/upright_${DateTime.now().microsecondsSinceEpoch}.jpg";
@@ -3140,13 +3155,31 @@ class _CinePopHomeState extends State<CinePopHome> {
           ),
           child: Row(
             children: [
-              CircleAvatar(
-                backgroundImage: (userPhoto != null && userPhoto!.isNotEmpty)
-                    ? NetworkImage(userPhoto!)
-                    : null,
-                child: (userPhoto == null || userPhoto!.isEmpty)
-                    ? const Icon(Icons.person)
-                    : null,
+              ClipOval(
+                child: SizedBox(
+                  width: 44,
+                  height: 44,
+                  child: (userPhoto != null && userPhoto!.isNotEmpty)
+                      ? Image.network(
+                          userPhoto!,
+                          fit: BoxFit.cover,
+                          alignment: Alignment.topCenter,
+                          errorBuilder: (_, __, ___) => Container(
+                            color: const Color(0xFF3A1D6E),
+                            child: const Icon(Icons.person, color: Colors.white),
+                          ),
+                        )
+                      : (characters.isNotEmpty && characters.first['file'] is File)
+                          ? Image.file(
+                              characters.first['file'] as File,
+                              fit: BoxFit.cover,
+                              alignment: Alignment.topCenter,
+                            )
+                          : Container(
+                              color: const Color(0xFF3A1D6E),
+                              child: const Icon(Icons.person, color: Colors.white),
+                            ),
+                ),
               ),
               const SizedBox(width: 12),
               Expanded(
@@ -3701,9 +3734,16 @@ class _CinePopHomeState extends State<CinePopHome> {
                 ),
                 child: Row(
                   children: [
-                    CircleAvatar(
-                      radius: 22,
-                      backgroundImage: FileImage(c['file'] as File),
+                    ClipOval(
+                      child: SizedBox(
+                        width: 44,
+                        height: 44,
+                        child: Image.file(
+                          c['file'] as File,
+                          fit: BoxFit.cover,
+                          alignment: Alignment.topCenter,
+                        ),
+                      ),
                     ),
                     const SizedBox(width: 10),
                     Expanded(
@@ -5865,7 +5905,11 @@ class _HandsFreeFaceIdScannerPageState
         await _cameraController!.stopImageStream();
       }
       final XFile shot = await _cameraController!.takePicture();
-      final File uprightFile = await _fixUprightPortrait(File(shot.path));
+      final File uprightFile = await _fixUprightPortrait(
+        File(shot.path),
+        sensorOrientation: _frontCamera?.sensorOrientation,
+        isFrontCamera: true,
+      );
       final String angleKey = _steps[_currentStepIdx]["key"]!;
 
       await HapticFeedback.heavyImpact();

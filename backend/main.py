@@ -149,9 +149,11 @@ def find_devanagari_font_path(bold: bool = True) -> Optional[str]:
 
     preferred = (
         [
+            "/app/fonts/NotoSansDevanagari-Bold.ttf",
             "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
             "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Bold.otf",
             "/usr/share/fonts/truetype/noto/NotoSansDevanagariUI-Bold.ttf",
+            "/app/fonts/NotoSansDevanagari-Regular.ttf",
             "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
             "/usr/share/fonts/truetype/noto/NotoSerifDevanagari-Bold.ttf",
             "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
@@ -159,18 +161,41 @@ def find_devanagari_font_path(bold: bool = True) -> Optional[str]:
         ]
         if bold
         else [
+            "/app/fonts/NotoSansDevanagari-Regular.ttf",
             "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
             "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Regular.otf",
             "/usr/share/fonts/truetype/noto/NotoSansDevanagariUI-Regular.ttf",
+            "/app/fonts/NotoSansDevanagari-Bold.ttf",
             "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
             "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
             "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
         ]
     )
     for p in preferred:
-        if os.path.exists(p):
+        if os.path.exists(p) and os.path.getsize(p) > 20000:
             _DEVANAGARI_FONT_CACHE[key] = p
             return p
+
+    # Recursive scan of /usr/share/fonts for any Devanagari TTF/OTF
+    try:
+        found_deva: list[str] = []
+        for root, _, files in os.walk("/usr/share/fonts"):
+            for fn in files:
+                low = fn.lower()
+                if ("devanagari" in low or "deva" in low) and low.endswith((".ttf", ".otf")):
+                    fp = os.path.join(root, fn)
+                    if os.path.getsize(fp) > 20000:
+                        found_deva.append(fp)
+        if bold:
+            for fp in found_deva:
+                if "bold" in os.path.basename(fp).lower():
+                    _DEVANAGARI_FONT_CACHE[key] = fp
+                    return fp
+        if found_deva:
+            _DEVANAGARI_FONT_CACHE[key] = found_deva[0]
+            return found_deva[0]
+    except Exception:
+        pass
 
     # Fallback: query fontconfig (`fc-list`) for any installed Devanagari font
     try:
@@ -182,11 +207,11 @@ def find_devanagari_font_path(bold: bool = True) -> Optional[str]:
         candidates = [ln.split(":")[0].strip() for ln in out.splitlines() if ln.strip()]
         if bold:
             for c in candidates:
-                if "bold" in c.lower() and os.path.exists(c):
+                if "bold" in c.lower() and os.path.exists(c) and os.path.getsize(c) > 20000:
                     _DEVANAGARI_FONT_CACHE[key] = c
                     return c
         for c in candidates:
-            if os.path.exists(c):
+            if os.path.exists(c) and os.path.getsize(c) > 20000:
                 _DEVANAGARI_FONT_CACHE[key] = c
                 return c
     except Exception:
@@ -664,9 +689,11 @@ def home():
     return {
         "app": "CinePop AI — Pocket Bollywood & Face-Swap Studio",
         "status": "100% Live",
+        "engine_version": "v5-pocketfm-fullscreen-faceswap-pil-subtitles",
+        "devanagari_font": find_devanagari_font_path(bold=True) or "not-found",
         "gemini_configured": bool(GEMINI_API_KEY),
         "opencv_faceswap": OPENCV_AVAILABLE,
-        "video_engine": "LTX-Video / CogVideoX-5B / SVD + FFmpeg Pro Motion VFX",
+        "video_engine": "Pollinations Flux + HF Face-Swap + SadTalker/Wav2Lip + PIL Hindi Subtitles",
         "admin_pin_enabled": True,
         "price_per_movie": f"₹{MOVIE_PRICE_INR}",
     }
@@ -1577,10 +1604,12 @@ def render_location_backdrop(
     mood: str,
     prompt_hint: str = "",
     aspect_ratio: str = "16:9",
+    include_hero: bool = False,
+    hero_role: str = "hero",
 ) -> Image.Image:
     """
     Generate a FULL-SCREEN Pocket FM / Moj 3D Graphic-Novel / Realistic Bollywood drama scene
-    at exact 9:16 (720x1280) or 16:9 (1280x720) via 100% FREE `image.pollinations.ai` Flux model.
+    at exact 9:16 (720x1280) or 16:9 (1280x720) via 100% FREE `image.pollinations.ai` Flux/Turbo model.
     ZERO cartoon rectangles/huts and ZERO paid APIs!
     """
     W, H = get_aspect_dimensions(aspect_ratio)
@@ -1600,8 +1629,9 @@ def render_location_backdrop(
     }
     desc = loc_descriptions.get(location_key, loc_descriptions["city_street"])
     hint_clean = re.sub(r"[^a-zA-Z0-9 ,.-]", "", (prompt_hint or "")).strip()[:90]
-    cache_seed_str = f"{location_key}_{mood}_{W}x{H}_{hint_clean[:32]}"
-    cache_key = re.sub(r"[^a-zA-Z0-9_]", "_", cache_seed_str)[:70]
+    hero_tag = f"hero_{hero_role}" if include_hero else "bgonly"
+    cache_seed_str = f"{location_key}_{mood}_{W}x{H}_{hero_tag}_{hint_clean[:28]}"
+    cache_key = re.sub(r"[^a-zA-Z0-9_]", "_", cache_seed_str)[:76]
     cache_path = f"/tmp/cinepop_scene_{cache_key}.jpg"
     if os.path.exists(cache_path) and os.path.getsize(cache_path) > 8000:
         try:
@@ -1609,37 +1639,62 @@ def render_location_backdrop(
         except Exception:
             pass
 
-    try:
-        scene_detail = f"{hint_clean}, " if hint_clean else ""
-        full_prompt = (
-            f"{scene_detail}{desc}, {mood} dramatic lighting, Pocket FM graphic novel meets 4K realistic Bollywood cinema still, "
-            f"anamorphic bokeh, ultra detailed, no text, no watermark"
-        )
-        encoded = urllib.parse.quote(full_prompt, safe="")
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model=flux&nologo=true&seed={abs(hash(cache_key)) % 99999}"
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200 and len(resp.content) > 8000:
-            bg_img = open_upright_image(resp.content).resize((W, H), Image.Resampling.LANCZOS)
-            bg_img.save(cache_path, "JPEG", quality=91)
-            return bg_img
-    except Exception:
-        pass
+    role_subject_map = {
+        "villain": "intimidating Indian Bollywood mafia villain man in dark tailored coat looking intense, medium close-up portrait facing camera",
+        "saas": "dramatic Indian wealthy matriarch woman in royal silk saree with gold jewelry, intense expression, medium close-up facing camera",
+        "female": "expressive young Indian Bollywood actress in stylish ethnic cinematic attire, dramatic rim light, medium close-up facing camera",
+        "narrator": "charismatic Indian Bollywood action hero in dramatic lighting looking forward, medium close-up portrait facing camera",
+        "crowd": "dramatic Indian cinema character reacting intensely in cinematic crowd lighting, medium close-up facing camera",
+        "hero": "handsome Indian Bollywood action drama hero wearing stylish jacket, intense cinematic expression, medium close-up facing camera",
+    }
+    subject_prefix = (
+        f"{role_subject_map.get(hero_role, role_subject_map['hero'])}, "
+        if include_hero
+        else ""
+    )
+    scene_detail = f"{hint_clean}, " if hint_clean else ""
+    full_prompt = (
+        f"{subject_prefix}{scene_detail}{desc}, {mood} dramatic lighting, "
+        f"Pocket FM graphic novel meets 4K photorealistic Bollywood cinema still, "
+        f"shallow depth of field, anamorphic bokeh, ultra detailed, no text, no watermark"
+    )
+    encoded = urllib.parse.quote(full_prompt, safe="")
+    seed_val = abs(hash(cache_key)) % 99999
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    candidate_urls = [
+        (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model=flux&nologo=true&seed={seed_val}", 28),
+        (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model=turbo&nologo=true&seed={seed_val}", 20),
+        (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&nologo=true&seed={seed_val + 7}", 20),
+    ]
+    for url, t_sec in candidate_urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=t_sec)
+            ctype = str(resp.headers.get("content-type", "")).lower()
+            if resp.status_code == 200 and len(resp.content) > 8000 and ("image" in ctype or resp.content[:2] in (b"\xff\xd8", b"\x89P")):
+                bg_img = open_upright_image(resp.content).resize((W, H), Image.Resampling.LANCZOS)
+                bg_img.save(cache_path, "JPEG", quality=92)
+                return bg_img
+        except Exception:
+            continue
 
-    # Fallback: Deep atmospheric photographic film gradient + soft anamorphic bokeh light orbs (NO cartoon shapes!)
-    bg = Image.new("RGB", (W, H), (10, 12, 22))
+    # Last-resort photorealistic atmospheric lighting backdrop (ZERO cartoon buildings/boxes!)
+    bg = Image.new("RGB", (W, H), (14, 10, 18))
     palettes = {
-        "village_field": ((24, 34, 58), (120, 62, 28)),
-        "haunted_mansion": ((6, 10, 22), (22, 30, 54)),
-        "mumbai_rain": ((8, 16, 30), (18, 42, 68)),
-        "deep_jungle": ((6, 22, 16), (16, 52, 36)),
-        "police_station": ((10, 14, 28), (28, 22, 46)),
-        "outer_space": ((4, 5, 16), (22, 14, 52)),
-        "royal_palace": ((28, 10, 18), (92, 44, 16)),
-        "mountains": ((12, 20, 36), (52, 68, 92)),
-        "desert_fort": ((42, 16, 8), (128, 62, 16)),
-        "courtroom": ((22, 14, 10), (58, 36, 20)),
-        "cyber_lab": ((4, 14, 28), (10, 48, 72)),
-        "city_street": ((10, 14, 28), (32, 22, 58)),
+        "village_field": ((42, 28, 18), (138, 72, 26)),
+        "haunted_mansion": ((8, 14, 24), (24, 36, 52)),
+        "mumbai_rain": ((10, 20, 34), (22, 52, 76)),
+        "deep_jungle": ((8, 26, 18), (22, 62, 40)),
+        "police_station": ((14, 16, 30), (36, 22, 46)),
+        "outer_space": ((6, 8, 22), (24, 18, 56)),
+        "royal_palace": ((38, 14, 18), (118, 56, 20)),
+        "mountains": ((16, 26, 44), (62, 78, 102)),
+        "desert_fort": ((48, 20, 10), (142, 70, 20)),
+        "courtroom": ((28, 18, 12), (72, 44, 24)),
+        "cyber_lab": ((6, 18, 32), (14, 58, 84)),
+        "city_street": ((14, 16, 28), (44, 26, 48)),
     }
     top_c, bot_c = palettes.get(location_key, palettes["city_street"])
     _draw_vertical_gradient(bg, top_c, bot_c)
@@ -1648,13 +1703,13 @@ def render_location_backdrop(
     bdraw = ImageDraw.Draw(bokeh)
     rim = MOOD_RIM_COLORS.get(mood, (255, 88, 60))
     rng = random.Random(hash(cache_key) & 0xFFFFFFFF)
-    for _ in range(20):
-        bx = rng.randint(-80, W + 80)
-        by = rng.randint(40, H - 80)
-        br = rng.randint(45, 165)
-        col = (rim[0], rim[1], rim[2], rng.randint(24, 62)) if rng.random() > 0.45 else (40, 180, 240, rng.randint(20, 48))
+    for _ in range(18):
+        bx = rng.randint(-60, W + 60)
+        by = rng.randint(60, H - 60)
+        br = rng.randint(50, 175)
+        col = (rim[0], rim[1], rim[2], rng.randint(26, 68)) if rng.random() > 0.45 else (255, 190, 100, rng.randint(20, 50))
         bdraw.ellipse([bx - br, by - br, bx + br, by + br], fill=col)
-    bokeh = bokeh.filter(ImageFilter.GaussianBlur(radius=40))
+    bokeh = bokeh.filter(ImageFilter.GaussianBlur(radius=46))
     bg = Image.alpha_composite(bg.convert("RGBA"), bokeh).convert("RGB")
     return bg
 
@@ -1810,90 +1865,117 @@ def prepare_character_frame(
 ):
     """
     POCKET FM / MOJ FULL-SCREEN CINEMATIC DRAMA FRAME (720x1280 9:16 OR 1280x720 16:9):
-    - 100% DELETED square photo boxes, sticker frames, and cartoon buildings!
-    - Generates a full-screen 3D/Graphic-Novel/Realistic Bollywood scene via FREE Pollinations Flux.
-    - Seamlessly blends the user's EXIF-upright 5-angle scanned face edge-to-edge into the scene
-      (with optional free HF face-swap + soft cinematic radial lighting & atmospheric color match).
-    - Clean Hindi subtitles are overlaid separately as rock-steady PNG strips AFTER camera motion!
+    1. 100% DELETED square photo boxes, sticker borders, and cartoon buildings!
+    2. Generates a full-screen 3D/Graphic-Novel/Realistic Bollywood hero scene via FREE Pollinations Flux.
+    3. Straightens user's scanned face via EXIF transpose (`open_upright_image`) and seamlessly merges
+       it onto the AI Bollywood hero via FREE HuggingFace Face-Swap (`tonyassi/face-swap` / `ezioruan/inswapper`).
+    4. If HF Face-Swap is temporarily busy, blends the upright actor full-bleed edge-to-edge with
+       atmospheric lighting match (ZERO square box, ZERO floating borders!).
+    5. Clean Hindi subtitles are overlaid separately as rock-steady PIL PNG strips AFTER camera motion!
     """
     W, H = get_aspect_dimensions(aspect_ratio)
     is_vertical = H > W
+    role = detect_speaker_role(char_name)
 
-    if custom_bg_path and os.path.exists(custom_bg_path):
-        bg = open_upright_image(custom_bg_path).resize((W, H), Image.Resampling.LANCZOS)
-    else:
-        bg = render_location_backdrop(
-            location_key, mood, prompt_hint=visual_action_prompt, aspect_ratio=aspect_ratio
-        )
-
-    # Full-bleed edge-to-edge actor framing (NO pasted square box anywhere!)
+    # Always enforce EXIF-upright portrait orientation on user's scanned photo
     actor = open_upright_image(raw_img_path)
-    aw, ah = actor.size
+    upright_actor_tmp = f"{out_frame_path}_upright_actor.jpg"
+    scene_tmp = f"{out_frame_path}_ai_scene.jpg"
+    swapped_tmp = f"{out_frame_path}_swapped.jpg"
 
-    # Cover-scale actor generously so head & shoulders fill the full cinema shot naturally
-    if is_vertical:
-        scale = max((W * 1.04) / max(1, aw), (H * 0.72) / max(1, ah))
-    else:
-        scale = max((W * 0.68) / max(1, aw), (H * 1.06) / max(1, ah))
-    target_w = max(W if is_vertical else 720, int(aw * scale))
-    target_h = max(int(H * 0.68), int(ah * scale))
+    try:
+        actor.save(upright_actor_tmp, "JPEG", quality=92)
 
-    actor_resized = actor.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    actor_resized = ImageEnhance.Contrast(actor_resized).enhance(1.10)
-    actor_resized = ImageEnhance.Color(actor_resized).enhance(1.07)
+        if custom_bg_path and os.path.exists(custom_bg_path):
+            bg = open_upright_image(custom_bg_path).resize((W, H), Image.Resampling.LANCZOS)
+            use_hf_swap = False
+        else:
+            bg = render_location_backdrop(
+                location_key,
+                mood,
+                prompt_hint=visual_action_prompt,
+                aspect_ratio=aspect_ratio,
+                include_hero=True,
+                hero_role=role,
+            )
+            use_hf_swap = True
 
-    # Match ambient lighting tint of the cinematic backdrop onto the actor so they belong to the scene
-    bg_small = bg.resize((16, 16), Image.Resampling.BILINEAR)
-    bg_avg = tuple(int(sum(p[c] for p in bg_small.getdata()) / 256) for c in range(3))
-    tint_layer = Image.new("RGB", actor_resized.size, bg_avg)
-    actor_graded = Image.blend(actor_resized, tint_layer, 0.14)
+        # Step A: Try 100% FREE HuggingFace AI Face-Swap onto the Full-Screen Bollywood Hero Scene
+        if use_hf_swap:
+            bg.save(scene_tmp, "JPEG", quality=92)
+            swapped_path = _try_hf_scene_faceswap(scene_tmp, upright_actor_tmp, swapped_tmp)
+            if swapped_path and os.path.exists(swapped_path):
+                composed = open_upright_image(swapped_path).resize((W, H), Image.Resampling.LANCZOS)
+                composed = ImageEnhance.Contrast(composed).enhance(1.06)
+                composed = ImageEnhance.Color(composed).enhance(1.06)
+                if watermark_text:
+                    draw_channel_watermark(composed, watermark_text, watermark_position)
+                composed.save(out_frame_path, "JPEG", quality=93)
+                return
 
-    # Cinematic shallow depth-of-field background blur + moody contrast
-    bg_cin = bg.filter(ImageFilter.GaussianBlur(radius=3.5))
-    bg_cin = ImageEnhance.Brightness(bg_cin).enhance(0.76)
-    bg_cin = ImageEnhance.Contrast(bg_cin).enhance(1.12)
+        # Step B: Seamless Full-Bleed Edge-to-Edge Environmental Portrait Blend (ZERO square photo box!)
+        aw, ah = actor.size
+        # Cover-scale actor so subject spans full frame naturally with zero hard edges or floating square
+        scale = max((W * 1.08) / max(1, aw), (H * 0.92) / max(1, ah)) if is_vertical else max((W * 0.84) / max(1, aw), (H * 1.12) / max(1, ah))
+        target_w = max(W, int(aw * scale)) if is_vertical else max(int(W * 0.78), int(aw * scale))
+        target_h = max(int(H * 0.85), int(ah * scale))
 
-    canvas_actor = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    px = (W - target_w) // 2
-    py = int(H * 0.06) if is_vertical else max(-45, min(14, int((H - target_h) * 0.18)))
-    canvas_actor.paste(actor_graded.convert("RGBA"), (px, py))
+        actor_resized = actor.resize((target_w, target_h), Image.Resampling.LANCZOS)
+        actor_resized = ImageEnhance.Contrast(actor_resized).enhance(1.10)
+        actor_resized = ImageEnhance.Color(actor_resized).enhance(1.06)
 
-    # Ultra-soft organic full-bleed cinema feather mask (NO visible box or edges!)
-    mask = Image.new("L", (W, H), 0)
-    mdraw = ImageDraw.Draw(mask)
-    if is_vertical:
-        rx = int(W * 0.56)
-        ry = int(H * 0.44)
+        # Ambient scene lighting color match onto actor
+        bg_small = bg.resize((16, 16), Image.Resampling.BILINEAR)
+        bg_avg = tuple(int(sum(p[c] for p in bg_small.getdata()) / 256) for c in range(3))
+        tint_layer = Image.new("RGB", actor_resized.size, bg_avg)
+        actor_graded = Image.blend(actor_resized, tint_layer, 0.16)
+
+        bg_cin = bg.filter(ImageFilter.GaussianBlur(radius=4.5))
+        bg_cin = ImageEnhance.Brightness(bg_cin).enhance(0.78)
+        bg_cin = ImageEnhance.Contrast(bg_cin).enhance(1.10)
+
+        canvas_actor = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        px = (W - target_w) // 2
+        py = max(-40, min(0, (H - target_h) // 4))
+        canvas_actor.paste(actor_graded.convert("RGBA"), (px, py))
+
+        # Wide organic radial fade spanning the full frame (NO box edges anywhere!)
+        mask = Image.new("L", (W, H), 0)
+        mdraw = ImageDraw.Draw(mask)
+        rx = int(W * (0.62 if is_vertical else 0.48))
+        ry = int(H * (0.52 if is_vertical else 0.72))
         cx, cy = W // 2, int(H * 0.44)
-    else:
-        rx = min(int(target_w * 0.46), int(W * 0.39))
-        ry = int(H * 0.66)
-        cx, cy = W // 2, int(H * 0.48)
-    mdraw.ellipse([cx - rx, cy - ry, cx + rx, cy + ry], fill=255)
-    mask = mask.filter(ImageFilter.GaussianBlur(radius=68 if is_vertical else 72))
+        mdraw.ellipse([cx - rx, cy - ry, cx + rx, cy + ry], fill=255)
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=88))
 
-    # Dramatic rim glow matching scene mood
-    rim_rgb = MOOD_RIM_COLORS.get(mood, (255, 88, 60))
-    rim_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    rdraw = ImageDraw.Draw(rim_layer)
-    rdraw.ellipse([cx - rx - 45, cy - ry, cx + rx + 45, cy + ry], fill=(rim_rgb[0], rim_rgb[1], rim_rgb[2], 74))
-    rim_layer = rim_layer.filter(ImageFilter.GaussianBlur(radius=76))
+        rim_rgb = MOOD_RIM_COLORS.get(mood, (255, 88, 60))
+        rim_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        rdraw = ImageDraw.Draw(rim_layer)
+        rdraw.ellipse([cx - rx - 40, cy - ry, cx + rx + 40, cy + ry], fill=(rim_rgb[0], rim_rgb[1], rim_rgb[2], 66))
+        rim_layer = rim_layer.filter(ImageFilter.GaussianBlur(radius=84))
 
-    composed = Image.alpha_composite(bg_cin.convert("RGBA"), rim_layer)
-    composed = Image.composite(canvas_actor, composed, mask).convert("RGB")
+        composed = Image.alpha_composite(bg_cin.convert("RGBA"), rim_layer)
+        composed = Image.composite(canvas_actor, composed, mask).convert("RGB")
 
-    # Anamorphic Bollywood teal-orange cinematic vignette
-    vignette = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    vdraw = ImageDraw.Draw(vignette)
-    vdraw.rectangle([0, 0, W, H], fill=(8, 12, 24, 38))
-    vdraw.ellipse([int(W * 0.10), int(H * 0.04), int(W * 0.90), int(H * 0.96)], fill=(0, 0, 0, 0))
-    vignette = vignette.filter(ImageFilter.GaussianBlur(radius=68))
-    composed = Image.alpha_composite(composed.convert("RGBA"), vignette).convert("RGB")
+        # Subtle cinema vignette
+        vignette = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        vdraw = ImageDraw.Draw(vignette)
+        vdraw.rectangle([0, 0, W, H], fill=(8, 10, 20, 34))
+        vdraw.ellipse([int(W * 0.08), int(H * 0.04), int(W * 0.92), int(H * 0.96)], fill=(0, 0, 0, 0))
+        vignette = vignette.filter(ImageFilter.GaussianBlur(radius=72))
+        composed = Image.alpha_composite(composed.convert("RGBA"), vignette).convert("RGB")
 
-    if watermark_text:
-        draw_channel_watermark(composed, watermark_text, watermark_position)
+        if watermark_text:
+            draw_channel_watermark(composed, watermark_text, watermark_position)
 
-    composed.save(out_frame_path, "JPEG", quality=93)
+        composed.save(out_frame_path, "JPEG", quality=93)
+    finally:
+        for tmp_f in (upright_actor_tmp, scene_tmp, swapped_tmp):
+            if os.path.exists(tmp_f):
+                try:
+                    os.remove(tmp_f)
+                except Exception:
+                    pass
 
 
 def _probe_audio_duration(audio_path: str) -> float:
@@ -4365,17 +4447,9 @@ def _opencv_video_faceswap(
             swapped_count += 1
 
         if watermark_text:
-            cv2.rectangle(frame, (out_w - 230, 14), (out_w - 14, 48), (18, 12, 36), -1)
-            cv2.putText(
-                frame,
-                watermark_text[:20],
-                (out_w - 218, 37),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 214, 255),
-                2,
-                cv2.LINE_AA,
-            )
+            pil_fr = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            draw_channel_watermark(pil_fr, watermark_text[:24], "top-right")
+            frame = cv2.cvtColor(np.array(pil_fr), cv2.COLOR_RGB2BGR)
 
         writer.write(frame)
         frame_idx += 1
