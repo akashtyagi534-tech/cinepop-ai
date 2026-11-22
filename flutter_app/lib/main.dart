@@ -1793,14 +1793,25 @@ class _CinePopHomeState extends State<CinePopHome> {
         'POST',
         Uri.parse('$serverUrl/start-autonomous-movie/'),
       );
-      request.fields['user_email'] = userEmail!;
+      final String locText = locationController.text.trim();
+      final String wmText = watermarkController.text.trim();
+      final String totalDurationStr = selectedSeriesMode == "series"
+          ? (selectedPartDuration * selectedTotalParts).toString()
+          : selectedMinutes.toString();
+
+      request.fields['user_email'] = userEmail ?? 'guest@cinepop.ai';
       request.fields['idea'] = finalIdea;
+      request.fields['script'] = finalIdea;
+      request.fields['topic'] = finalIdea;
       request.fields['story_mode'] = storyMode;
       request.fields['genre'] = selectedGenre;
       request.fields['language'] = selectedLanguage;
       request.fields['default_mood'] = defaultMood;
-      request.fields['default_location'] = locationController.text.trim();
-      request.fields['watermark_text'] = watermarkController.text.trim();
+      request.fields['music_mood'] = defaultMood;
+      request.fields['default_location'] = locText;
+      request.fields['location'] = locText;
+      request.fields['watermark_text'] = wmText;
+      request.fields['watermark'] = wmText;
       request.fields['watermark_position'] = watermarkPosition;
       request.fields['aspect_ratio'] = selectedAspectRatio;
       request.fields['platform'] =
@@ -1808,9 +1819,8 @@ class _CinePopHomeState extends State<CinePopHome> {
       request.fields['series_mode'] = selectedSeriesMode;
       request.fields['part_duration_minutes'] = selectedPartDuration.toString();
       request.fields['total_parts'] = selectedTotalParts.toString();
-      request.fields['duration_minutes'] = selectedSeriesMode == "series"
-          ? (selectedPartDuration * selectedTotalParts).toString()
-          : selectedMinutes.toString();
+      request.fields['parts_count'] = selectedTotalParts.toString();
+      request.fields['duration_minutes'] = totalDurationStr;
       request.fields['auto_cast'] = useAutoCast ? 'ai' : 'face';
       request.fields['char_names'] = useAutoCast
           ? 'आर्यन,काव्या'
@@ -1833,15 +1843,18 @@ class _CinePopHomeState extends State<CinePopHome> {
         final List<Map<String, dynamic>> angleMetaList = [];
         for (int i = 0; i < characters.length; i++) {
           final c = characters[i];
-          request.files.add(
-            await http.MultipartFile.fromPath('images', (c['file'] as File).path),
-          );
+          final dynamic mainFile = c['file'];
+          if (mainFile is File && await mainFile.exists() && await mainFile.length() > 0) {
+            request.files.add(
+              await http.MultipartFile.fromPath('images', mainFile.path),
+            );
+          }
           final dynamic rawAngles = c['angles'];
           if (rawAngles is Map) {
             for (final entry in rawAngles.entries) {
               final angKey = entry.key.toString();
               final angFile = entry.value;
-              if (angFile is File) {
+              if (angFile is File && await angFile.exists() && await angFile.length() > 0) {
                 request.files.add(
                   await http.MultipartFile.fromPath('angle_images', angFile.path),
                 );
@@ -1859,7 +1872,9 @@ class _CinePopHomeState extends State<CinePopHome> {
         }
       }
 
-      if (customBgFile != null) {
+      if (customBgFile != null &&
+          await customBgFile!.exists() &&
+          await customBgFile!.length() > 0) {
         request.files.add(
           await http.MultipartFile.fromPath('custom_bg', customBgFile!.path),
         );
@@ -1892,16 +1907,76 @@ class _CinePopHomeState extends State<CinePopHome> {
       } else if (res.statusCode == 402) {
         _showBuyCreditDialog();
       } else {
-        setState(
-          () => statusMessage =
-              "सर्वर एरर (${res.statusCode}): कृपया पुनः प्रयास करें।",
-        );
+        String exactReason = "";
+        try {
+          final parsed = jsonDecode(res.body);
+          if (parsed is Map) {
+            final List<String> parts = [];
+            if (parsed['missing_fields'] is List &&
+                (parsed['missing_fields'] as List).isNotEmpty) {
+              parts.add("Missing/Invalid: ${(parsed['missing_fields'] as List).join(', ')}");
+            }
+            final dynamic detail = parsed['detail'];
+            if (detail is String && detail.trim().isNotEmpty) {
+              parts.add(detail.trim());
+            } else if (detail is List) {
+              final List<String> errItems = [];
+              for (final item in detail) {
+                if (item is Map) {
+                  final loc = item['loc'] is List
+                      ? (item['loc'] as List)
+                          .where((e) => e.toString() != 'body')
+                          .join('.')
+                      : '';
+                  final msg = (item['msg'] ?? '').toString();
+                  errItems.add(loc.isNotEmpty ? "$loc ($msg)" : msg);
+                } else {
+                  errItems.add(item.toString());
+                }
+              }
+              if (errItems.isNotEmpty) {
+                parts.add(errItems.join(', '));
+              }
+            } else if (parsed['error'] != null) {
+              parts.add(parsed['error'].toString());
+            }
+            exactReason = parts.join(" — ");
+          }
+        } catch (_) {
+          if (res.body.trim().isNotEmpty) {
+            exactReason = res.body.trim().substring(
+                  0,
+                  res.body.trim().length > 160 ? 160 : res.body.trim().length,
+                );
+          }
+        }
+
+        String displayErr = exactReason.isNotEmpty
+            ? "सर्वर एरर (${res.statusCode}): $exactReason"
+            : "सर्वर एरर (${res.statusCode}): कृपया पुनः प्रयास करें।";
+
+        if (res.statusCode == 422 &&
+            useAutoCast &&
+            exactReason.toLowerCase().contains('images')) {
+          displayErr +=
+              "\n💡 Railway बैकएंड अभी पुराने वर्ज़न पर है जो फोटो माँगता है। कृपया Railway Dashboard में नया Commit Redeploy करें, या अभी '📸 अपना Face लगाएँ' चुनें।";
+        }
+
+        setState(() => statusMessage = displayErr);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              backgroundColor: Colors.redAccent.shade700,
+              duration: const Duration(seconds: 6),
+              content: Text(displayErr),
+            ),
+          );
+        }
       }
     } catch (e) {
-      setState(
-        () => statusMessage =
-            "कनेक्शन फेल: कृपया ऊपर ⚙️ से सही Server URL चेक करें।",
-      );
+      final errMsg =
+          "कनेक्शन फेल: कृपया ऊपर ⚙️ से सही Server URL चेक करें। (${e.toString()})";
+      setState(() => statusMessage = errMsg);
     } finally {
       setState(() => isSubmitting = false);
     }

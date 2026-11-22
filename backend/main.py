@@ -15,12 +15,13 @@ import datetime
 import subprocess
 import urllib.parse
 import concurrent.futures
-from typing import Optional
+from typing import Optional, Union
 import requests
 import edge_tts
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps, ImageEnhance
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Request, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
@@ -44,6 +45,36 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Return exact missing/invalid field names in JSON so clients never see a vague 422 error."""
+    missing_fields: list[str] = []
+    formatted_errors: list[dict] = []
+    for err in exc.errors():
+        loc_parts = [str(p) for p in err.get("loc", []) if str(p) not in ("body", "query", "path")]
+        field_name = ".".join(loc_parts) if loc_parts else "request"
+        msg = str(err.get("msg", "Invalid value"))
+        err_type = str(err.get("type", "validation_error"))
+        if field_name not in missing_fields:
+            missing_fields.append(field_name)
+        formatted_errors.append({
+            "field": field_name,
+            "message": msg,
+            "type": err_type,
+        })
+    summary = "; ".join(f"{e['field']}: {e['message']}" for e in formatted_errors) or "Invalid request payload"
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "VALIDATION_ERROR",
+            "detail": f"Validation error — {summary}",
+            "missing_fields": missing_fields,
+            "errors": formatted_errors,
+            "path": str(request.url.path),
+        },
+    )
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "akashtyagi534@gmail.com").lower().strip()
@@ -691,7 +722,7 @@ def home():
     return {
         "app": "CinePop AI — Pocket Bollywood & Face-Swap Studio",
         "status": "100% Live",
-        "engine_version": "v6-multi-engine-free-ai-video-autocast",
+        "engine_version": "v7-zero-422-multi-engine-free-ai-video-autocast",
         "devanagari_font": find_devanagari_font_path(bold=True) or "not-found",
         "gemini_configured": bool(GEMINI_API_KEY),
         "opencv_faceswap": OPENCV_AVAILABLE,
@@ -3462,35 +3493,165 @@ async def autonomous_movie_worker(project_id: str):
             save_state(proj_dir, state)
 
 
+def _is_upload_file_obj(val) -> bool:
+    """Safely detect Starlette/FastAPI UploadFile objects without crashing on empty strings or None."""
+    return val is not None and not isinstance(val, (str, bytes, dict, list, int, float, bool)) and callable(getattr(val, "read", None))
+
+
+def _safe_payload_str(payload: dict, *keys: str, default: str = "") -> str:
+    """Read the first non-empty string value across multiple alias keys."""
+    for key in keys:
+        if key not in payload:
+            continue
+        val = payload.get(key)
+        if val is None or _is_upload_file_obj(val):
+            continue
+        if isinstance(val, (dict, list)):
+            try:
+                s = json.dumps(val, ensure_ascii=False).strip()
+            except Exception:
+                s = ""
+        else:
+            s = str(val).strip()
+        if s and s.lower() not in ("null", "none", "undefined"):
+            return s
+    return default
+
+
+def _safe_payload_int(
+    payload: dict,
+    *keys: str,
+    default: int = 1,
+    min_val: Optional[int] = None,
+    max_val: Optional[int] = None,
+) -> int:
+    """Read an integer across alias keys safely; never raises 422 on bad strings or None."""
+    parsed = default
+    for key in keys:
+        if key not in payload:
+            continue
+        val = payload.get(key)
+        if val is None or _is_upload_file_obj(val):
+            continue
+        s = str(val).strip()
+        if not s or s.lower() in ("null", "none", "undefined"):
+            continue
+        try:
+            parsed = int(float(s))
+            break
+        except Exception:
+            continue
+    if min_val is not None:
+        parsed = max(min_val, parsed)
+    if max_val is not None:
+        parsed = min(max_val, parsed)
+    return parsed
+
+
+def _extract_form_uploads(form_data, *keys: str) -> list:
+    """Extract only genuine UploadFile objects across alias keys (ignoring empty strings/nulls)."""
+    uploads: list = []
+    if form_data is None:
+        return uploads
+    seen_ids: set[int] = set()
+    for key in keys:
+        try:
+            items = form_data.getlist(key)
+        except Exception:
+            item = form_data.get(key)
+            items = [item] if item is not None else []
+        for item in items:
+            if _is_upload_file_obj(item) and id(item) not in seen_ids:
+                seen_ids.add(id(item))
+                uploads.append(item)
+    return uploads
+
+
 @app.post("/start-autonomous-movie/")
+@app.post("/start-autonomous-movie")
+@app.post("/generate")
+@app.post("/generate-movie")
+@app.post("/generate-series")
 async def start_movie(
+    request: Request,
     background_tasks: BackgroundTasks,
-    user_email: str = Form(...),
-    idea: str = Form(...),
-    duration_minutes: int = Form(3),
-    char_names: str = Form(""),
-    voices: str = Form(""),
-    images: Optional[list[UploadFile]] = File(default=None),
-    angle_images: Optional[list[UploadFile]] = File(default=None),
-    angle_meta: str = Form("[]"),
-    auto_cast: str = Form("auto"),
-    story_mode: str = Form("ai"),
-    genre: str = Form("Action"),
-    language: str = Form("Hindi"),
-    char_pitches: str = Form("{}"),
-    default_mood: str = Form("Action"),
-    default_location: str = Form(""),
-    watermark_text: str = Form(""),
-    watermark_position: str = Form("top-right"),
-    aspect_ratio: str = Form("9:16"),
-    platform: str = Form("instagram"),
-    series_mode: str = Form("series"),
-    part_duration_minutes: int = Form(1),
-    total_parts: int = Form(3),
-    admin_pin: str = Form(""),
-    custom_bg: Optional[UploadFile] = File(None),
 ):
+    """
+    100% Flexible Movie & Series Generation Endpoint (Zero FastAPI 422 Errors).
+    Accepts multipart/form-data, application/x-www-form-urlencoded, or application/json.
+    All fields are optional with safe defaults and support every client alias.
+    """
+    content_type = (request.headers.get("content-type") or "").lower()
+    form_data = None
+    payload: dict = {}
+
+    if "application/json" in content_type:
+        try:
+            raw_json = await request.json()
+            if isinstance(raw_json, dict):
+                payload = raw_json
+        except Exception:
+            payload = {}
+    else:
+        try:
+            form_data = await request.form()
+            for k in form_data.keys():
+                v = form_data.get(k)
+                if not _is_upload_file_obj(v):
+                    payload[k] = v
+        except Exception:
+            try:
+                raw_json = await request.json()
+                if isinstance(raw_json, dict):
+                    payload = raw_json
+            except Exception:
+                payload = {}
+
+    # Merge query params as fallback if any field was sent via query string
+    for qk, qv in request.query_params.items():
+        if qk not in payload and qv:
+            payload[qk] = qv
+
+    user_email = _safe_payload_str(payload, "user_email", "email", default="guest@cinepop.ai")
+    idea = _safe_payload_str(
+        payload,
+        "idea",
+        "script",
+        "topic",
+        "story",
+        "prompt",
+        default="Ek emotional aur action-packed Bollywood kahani",
+    )
+    duration_minutes = _safe_payload_int(payload, "duration_minutes", "duration", default=3, min_val=1, max_val=30)
+    char_names = _safe_payload_str(payload, "char_names", "character_names", "characters", default="")
+    voices = _safe_payload_str(payload, "voices", "character_voices", default="")
+    angle_meta = _safe_payload_str(payload, "angle_meta", default="[]")
+    auto_cast = _safe_payload_str(payload, "auto_cast", default="auto")
+    story_mode = _safe_payload_str(payload, "story_mode", default="ai")
+    genre = _safe_payload_str(payload, "genre", default="Action")
+    language = _safe_payload_str(payload, "language", default="Hindi")
+    char_pitches = _safe_payload_str(payload, "char_pitches", default="{}")
+    default_mood = _safe_payload_str(payload, "default_mood", "music_mood", "mood", default="Action")
+    default_location = _safe_payload_str(payload, "default_location", "location", default="")
+    watermark_text = _safe_payload_str(payload, "watermark_text", "watermark", default="")
+    watermark_position = _safe_payload_str(payload, "watermark_position", default="top-right")
+    aspect_ratio = _safe_payload_str(payload, "aspect_ratio", default="9:16")
+    platform = _safe_payload_str(payload, "platform", default="instagram")
+    default_series_mode = "series" if request.url.path.rstrip("/").endswith("generate-series") else "series"
+    series_mode = _safe_payload_str(payload, "series_mode", default=default_series_mode)
+    part_duration_minutes = _safe_payload_int(payload, "part_duration_minutes", default=1, min_val=1, max_val=5)
+    total_parts = _safe_payload_int(payload, "total_parts", "parts_count", "parts", default=3, min_val=1, max_val=15)
+    admin_pin = _safe_payload_str(payload, "admin_pin", default="")
+
+    images = _extract_form_uploads(form_data, "images", "character_photos", "face_image", "face_images")
+    angle_images = _extract_form_uploads(form_data, "angle_images")
+    custom_bg_uploads = _extract_form_uploads(form_data, "custom_bg", "custom_bg_photo", "bg_photo")
+    custom_bg = custom_bg_uploads[0] if custom_bg_uploads else None
+
     email = user_email.lower().strip()
+    if "@" not in email:
+        email = "guest@cinepop.ai"
+
     db = load_db()
     if email not in db["users"]:
         db["users"][email] = {
@@ -3555,7 +3716,10 @@ async def start_movie(
     valid_uploaded_images: list[tuple[int, bytes]] = []
     if images and str(auto_cast).strip().lower() != "ai":
         for idx, img in enumerate(images):
-            raw_img_bytes = await img.read()
+            try:
+                raw_img_bytes = await img.read()
+            except Exception:
+                raw_img_bytes = b""
             if raw_img_bytes and len(raw_img_bytes) > 256:
                 valid_uploaded_images.append((idx, raw_img_bytes))
 
@@ -3604,13 +3768,16 @@ async def start_movie(
                 parsed_angle_meta = []
 
             for a_idx, a_file in enumerate(angle_images):
-                raw_a = await a_file.read()
-                if not raw_a:
+                try:
+                    raw_a = await a_file.read()
+                except Exception:
+                    raw_a = b""
+                if not raw_a or len(raw_a) <= 256:
                     continue
                 meta_item = parsed_angle_meta[a_idx] if a_idx < len(parsed_angle_meta) and isinstance(parsed_angle_meta[a_idx], dict) else {}
                 angle_key = str(meta_item.get("angle", "")).lower().strip()
                 if angle_key not in ALLOWED_FACE_ANGLES:
-                    fname_low = (a_file.filename or "").lower()
+                    fname_low = (getattr(a_file, "filename", "") or "").lower()
                     angle_key = next((ang for ang in ALLOWED_FACE_ANGLES if ang in fname_low), "front")
                 target_char = None
                 meta_name = str(meta_item.get("char_name", "")).strip()
@@ -3634,16 +3801,19 @@ async def start_movie(
 
     custom_bg_path = None
     if custom_bg is not None:
-        raw_bytes = await custom_bg.read()
-        if raw_bytes:
+        try:
+            raw_bytes = await custom_bg.read()
+        except Exception:
+            raw_bytes = b""
+        if raw_bytes and len(raw_bytes) > 256:
             custom_bg_path = safe_project_file(proj_dir, "custom_bg.jpg")
             save_upright_image_bytes(raw_bytes, custom_bg_path, max_side=1600)
 
     clean_lang = normalize_language(language)
     wm_pos = watermark_position if watermark_position in ("top-right", "bottom-right", "top-left") else "top-right"
     clean_ratio = "9:16" if str(aspect_ratio).strip() in ("9:16", "vertical", "instagram", "moj") else "16:9"
-    clean_platform = "instagram" if clean_ratio == "9:16" else "youtube"
-    clean_series_mode = "series" if str(series_mode).strip().lower() == "series" else "single"
+    clean_platform = "instagram" if clean_ratio == "9:16" else ("youtube" if platform != "instagram" else "youtube")
+    clean_series_mode = "series" if str(series_mode).strip().lower() in ("series", "true", "1", "parts", "part-wise") else "single"
     clean_part_dur = 2 if int(part_duration_minutes or 1) >= 2 else 1
     clean_total_parts = max(1, min(15, int(total_parts or 3))) if clean_series_mode == "series" else 1
 
@@ -5024,23 +5194,41 @@ async def face_swap_worker(job_id: str):
 
 
 @app.post("/face-swap/start/")
+@app.post("/face-swap/start")
 async def start_face_swap(
     background_tasks: BackgroundTasks,
-    user_email: str = Form(...),
-    title: str = Form("Custom Face-Swap Clip"),
-    dub_text: str = Form(""),
-    dub_language: str = Form("Hindi"),
-    dub_voice: str = Form("hi-IN-MadhurNeural"),
-    dub_pitch: str = Form("normal"),
-    watermark_text: str = Form(""),
-    video: UploadFile = File(...),
-    face_image: UploadFile = File(...),
-    angle_images: Optional[list[UploadFile]] = File(default=None),
-    angle_meta: str = Form("[]"),
+    user_email: Optional[str] = Form(default="guest@cinepop.ai"),
+    title: Optional[str] = Form(default="Custom Face-Swap Clip"),
+    dub_text: Optional[str] = Form(default=""),
+    dub_language: Optional[str] = Form(default="Hindi"),
+    dub_voice: Optional[str] = Form(default="hi-IN-MadhurNeural"),
+    dub_pitch: Optional[str] = Form(default="normal"),
+    watermark_text: Optional[str] = Form(default=""),
+    video: Optional[Union[UploadFile, str]] = File(default=None),
+    face_image: Optional[Union[UploadFile, str]] = File(default=None),
+    angle_images: Optional[list[Union[UploadFile, str]]] = File(default=None),
+    angle_meta: Optional[str] = Form(default="[]"),
 ):
-    email = user_email.lower().strip()
+    email = (user_email or "guest@cinepop.ai").lower().strip()
+    title = title or "Custom Face-Swap Clip"
+    dub_text = dub_text or ""
+    dub_language = dub_language or "Hindi"
+    dub_voice = dub_voice or "hi-IN-MadhurNeural"
+    dub_pitch = dub_pitch or "normal"
+    watermark_text = watermark_text or ""
+    angle_meta = angle_meta or "[]"
+
+    if not _is_upload_file_obj(video):
+        raise HTTPException(status_code=400, detail="Video file is required for Face-Swap.")
+    if not _is_upload_file_obj(face_image):
+        raise HTTPException(status_code=400, detail="Face photo (face_image) is required for Face-Swap.")
+
     video_bytes = await video.read()
     face_bytes = await face_image.read()
+    if not video_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded video file is empty.")
+    if not face_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded face photo is empty.")
     if len(video_bytes) > 65 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Video max size is 65MB")
     if len(face_bytes) > 12 * 1024 * 1024:
@@ -5050,7 +5238,7 @@ async def start_face_swap(
     job_dir = f"{FACE_SWAPS_DIR}/{job_id}"
     os.makedirs(job_dir, exist_ok=True)
 
-    vid_path = safe_project_file(job_dir, f"input_{video.filename or 'clip.mp4'}")
+    vid_path = safe_project_file(job_dir, f"input_{getattr(video, 'filename', None) or 'clip.mp4'}")
     face_path = safe_project_file(job_dir, "face_front.jpg")
     with open(vid_path, "wb") as f:
         f.write(video_bytes)
@@ -5065,13 +5253,15 @@ async def start_face_swap(
         except Exception:
             parsed_meta = []
         for idx_a, a_up in enumerate(angle_images):
+            if not _is_upload_file_obj(a_up):
+                continue
             a_bytes = await a_up.read()
             if not a_bytes:
                 continue
             m = parsed_meta[idx_a] if idx_a < len(parsed_meta) and isinstance(parsed_meta[idx_a], dict) else {}
             ang = str(m.get("angle", "")).lower().strip()
             if ang not in ALLOWED_FACE_ANGLES:
-                fname_low = (a_up.filename or "").lower()
+                fname_low = (getattr(a_up, "filename", "") or "").lower()
                 ang = next((k for k in ALLOWED_FACE_ANGLES if k in fname_low), "front")
             a_path = safe_project_file(job_dir, f"face_{ang}.jpg")
             save_upright_image_bytes(a_bytes, a_path)
