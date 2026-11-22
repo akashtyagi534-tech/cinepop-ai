@@ -109,7 +109,32 @@ jobs:
       - name: Build Compact Release APK (arm64-v8a + 32-bit Split)
         working-directory: ./flutter_app
         run: |
-          flutter build apk --release --split-per-abi --no-tree-shake-icons
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/maven-repos.gradle" <<'GRADLE'
+          beforeSettings { settings ->
+              settings.pluginManagement {
+                  repositories {
+                      google()
+                      mavenCentral()
+                      gradlePluginPortal()
+                  }
+              }
+          }
+          allprojects {
+              buildscript {
+                  repositories {
+                      google()
+                      mavenCentral()
+                      gradlePluginPortal()
+                  }
+              }
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          GRADLE
+          flutter build apk --release --split-per-abi --no-tree-shake-icons || (sleep 10 && flutter build apk --release --split-per-abi --no-tree-shake-icons)
           ls -lh build/app/outputs/flutter-apk/
           cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "build/app/outputs/flutter-apk/CinePop-AI-v${{ github.run_number }}.apk"
           cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "build/app/outputs/flutter-apk/CinePop-AI-Latest.apk"
