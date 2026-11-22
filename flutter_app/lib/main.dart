@@ -134,6 +134,7 @@ class _CinePopHomeState extends State<CinePopHome> {
   String selectedSeriesMode = "series"; // "series" (Moj/Pocket FM default) | "single"
   int selectedPartDuration = 1; // 1 or 2 Min / Part
   int selectedTotalParts = 3; // 3, 5, 10, 15 Parts
+  bool aiAutoCastMode = true; // True = No face photo needed (AI creates characters from story!)
   List<Map<String, dynamic>> characters = [];
   String dataEstimateText =
       "📱 3 Parts × 1 Min (9:16 Moj/Reels) · Part 1 ~35 सेकंड में Play के लिए तैयार";
@@ -145,6 +146,8 @@ class _CinePopHomeState extends State<CinePopHome> {
   String activeAspectRatio = "9:16";
   String activeSeriesMode = "series";
   int activeTotalParts = 3;
+  String activeAiEngine = "Pollinations Flux + LivePortrait Motion";
+  bool activeAiAutoCast = true;
   int progress = 0;
   String statusMessage = "";
   List<dynamic> readyParts = [];
@@ -1767,18 +1770,22 @@ class _CinePopHomeState extends State<CinePopHome> {
         ? ideaController.text.trim()
         : aiTopicController.text.trim();
 
-    if (finalIdea.isEmpty || characters.isEmpty) {
+    if (finalIdea.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text("कहानी और कम से कम 1 कैरेक्टर की फोटो ज़रूरी है!"),
+          content: Text("कृपया कम से कम 1 लाइन की कहानी या आइडिया लिखें!"),
         ),
       );
       return;
     }
 
+    final bool useAutoCast = aiAutoCastMode || characters.isEmpty;
+
     setState(() {
       isSubmitting = true;
-      statusMessage = "फोटोज़, लोकेशन और कहानी क्लाउड पर भेजी जा रही है...";
+      statusMessage = useAutoCast
+          ? "🎭 AI Auto-Cast कहानी क्लाउड Free AI Video Engine पर भेजी जा रही है..."
+          : "फोटोज़, लोकेशन और कहानी क्लाउड पर भेजी जा रही है...";
     });
 
     try {
@@ -1804,44 +1811,52 @@ class _CinePopHomeState extends State<CinePopHome> {
       request.fields['duration_minutes'] = selectedSeriesMode == "series"
           ? (selectedPartDuration * selectedTotalParts).toString()
           : selectedMinutes.toString();
-      request.fields['char_names'] =
-          characters.map((c) => c['name']).join(',');
-      request.fields['voices'] = characters.map((c) => c['voice']).join(',');
+      request.fields['auto_cast'] = useAutoCast ? 'ai' : 'face';
+      request.fields['char_names'] = useAutoCast
+          ? 'आर्यन,काव्या'
+          : characters.map((c) => c['name']).join(',');
+      request.fields['voices'] = useAutoCast
+          ? 'hi-IN-MadhurNeural,hi-IN-SwaraNeural'
+          : characters.map((c) => c['voice']).join(',');
       final Map<String, String> pitchMap = {};
-      for (var c in characters) {
-        pitchMap[c['name'].toString()] = (c['pitch'] ?? 'normal').toString();
+      if (!useAutoCast) {
+        for (var c in characters) {
+          pitchMap[c['name'].toString()] = (c['pitch'] ?? 'normal').toString();
+        }
       }
       request.fields['char_pitches'] = jsonEncode(pitchMap);
       if (_verifiedAdminPin.isNotEmpty) {
         request.fields['admin_pin'] = _verifiedAdminPin;
       }
 
-      final List<Map<String, dynamic>> angleMetaList = [];
-      for (int i = 0; i < characters.length; i++) {
-        final c = characters[i];
-        request.files.add(
-          await http.MultipartFile.fromPath('images', (c['file'] as File).path),
-        );
-        final dynamic rawAngles = c['angles'];
-        if (rawAngles is Map) {
-          for (final entry in rawAngles.entries) {
-            final angKey = entry.key.toString();
-            final angFile = entry.value;
-            if (angFile is File) {
-              request.files.add(
-                await http.MultipartFile.fromPath('angle_images', angFile.path),
-              );
-              angleMetaList.add({
-                "char_index": i,
-                "char_name": c['name'].toString(),
-                "angle": angKey,
-              });
+      if (!useAutoCast) {
+        final List<Map<String, dynamic>> angleMetaList = [];
+        for (int i = 0; i < characters.length; i++) {
+          final c = characters[i];
+          request.files.add(
+            await http.MultipartFile.fromPath('images', (c['file'] as File).path),
+          );
+          final dynamic rawAngles = c['angles'];
+          if (rawAngles is Map) {
+            for (final entry in rawAngles.entries) {
+              final angKey = entry.key.toString();
+              final angFile = entry.value;
+              if (angFile is File) {
+                request.files.add(
+                  await http.MultipartFile.fromPath('angle_images', angFile.path),
+                );
+                angleMetaList.add({
+                  "char_index": i,
+                  "char_name": c['name'].toString(),
+                  "angle": angKey,
+                });
+              }
             }
           }
         }
-      }
-      if (angleMetaList.isNotEmpty) {
-        request.fields['angle_meta'] = jsonEncode(angleMetaList);
+        if (angleMetaList.isNotEmpty) {
+          request.fields['angle_meta'] = jsonEncode(angleMetaList);
+        }
       }
 
       if (customBgFile != null) {
@@ -1867,6 +1882,10 @@ class _CinePopHomeState extends State<CinePopHome> {
             walletBalance = data['remaining_wallet_balance'] as int;
           }
           activeProjectId = data['project_id'];
+          activeAiAutoCast = (data['ai_auto_cast'] ?? useAutoCast) == true;
+          if (data['active_engine'] != null) {
+            activeAiEngine = data['active_engine'].toString();
+          }
           statusMessage = data['status_text'] ?? "";
         });
         _startAutoSync();
@@ -1914,6 +1933,13 @@ class _CinePopHomeState extends State<CinePopHome> {
             }
             if (data['total_parts'] is int) {
               activeTotalParts = data['total_parts'] as int;
+            }
+            if (data['active_engine'] != null &&
+                data['active_engine'].toString().isNotEmpty) {
+              activeAiEngine = data['active_engine'].toString();
+            }
+            if (data['ai_auto_cast'] != null) {
+              activeAiAutoCast = data['ai_auto_cast'] == true;
             }
           });
           if (isCompleted) syncTimer?.cancel();
@@ -3672,18 +3698,109 @@ class _CinePopHomeState extends State<CinePopHome> {
         ),
         const SizedBox(height: 16),
 
-        // 2. Character Photos + Guided 5-Angle 3D Face Scan
+        // 2. Character Cast Mode: AI Auto-Cast (No Photo Needed) OR Optional 5-Angle Face Scan
+        const Text(
+          "2. कैरेक्टर और फेस चुनें (Face Optional):",
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+            color: Color(0xFF00E5FF),
+          ),
+        ),
+        const SizedBox(height: 8),
         Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            const Text(
-              "2. कैरेक्टर 3D फेस स्कैन:",
-              style: TextStyle(
-                fontWeight: FontWeight.bold,
-                color: Color(0xFF00E5FF),
+            Expanded(
+              child: GestureDetector(
+                onTap: () => setState(() => aiAutoCastMode = true),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(vertical: 11, horizontal: 8),
+                  decoration: BoxDecoration(
+                    color: aiAutoCastMode
+                        ? Colors.greenAccent.withOpacity(0.22)
+                        : const Color(0xFF1B1236),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: aiAutoCastMode ? Colors.greenAccent : Colors.white12,
+                      width: aiAutoCastMode ? 1.8 : 1,
+                    ),
+                  ),
+                  child: const Text(
+                    "🎭 AI Auto-Cast\n(बिना फोटो के)",
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
               ),
             ),
-            ElevatedButton.icon(
+            const SizedBox(width: 8),
+            Expanded(
+              child: GestureDetector(
+                onTap: () => setState(() => aiAutoCastMode = false),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(vertical: 11, horizontal: 8),
+                  decoration: BoxDecoration(
+                    color: !aiAutoCastMode
+                        ? const Color(0xFFFF007F).withOpacity(0.25)
+                        : const Color(0xFF1B1236),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: !aiAutoCastMode
+                          ? const Color(0xFFFF007F)
+                          : Colors.white12,
+                      width: !aiAutoCastMode ? 1.8 : 1,
+                    ),
+                  ),
+                  child: const Text(
+                    "📸 अपना Face लगाएँ\n(5-Angle Scan)",
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        if (aiAutoCastMode)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.greenAccent.withOpacity(0.10),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.greenAccent.withOpacity(0.45)),
+            ),
+            child: const Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  "✅ AI Auto-Cast चालू — कोई फोटो लगाना ज़रूरी नहीं!",
+                  style: TextStyle(
+                    color: Colors.greenAccent,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
+                  ),
+                ),
+                SizedBox(height: 4),
+                Text(
+                  "कहानी के हिसाब से 100% Free Multi-Engine AI (Wan 2.1 · LTX-Video · CogVideoX-5B · HunyuanVideo · Pollinations Flux) खुद हीरो, हीरोइन और फुल-स्क्रीन मोशन वीडियो बना देगा!",
+                  style: TextStyle(color: Colors.white70, fontSize: 11),
+                ),
+              ],
+            ),
+          )
+        else ...[
+          Align(
+            alignment: Alignment.centerRight,
+            child: ElevatedButton.icon(
               style: ElevatedButton.styleFrom(
                 backgroundColor: const Color(0xFFFF007F),
               ),
@@ -3694,26 +3811,25 @@ class _CinePopHomeState extends State<CinePopHome> {
                 style: TextStyle(color: Colors.white, fontSize: 12),
               ),
             ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        if (characters.isEmpty)
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: const Color(0xFF1B1236),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.white12),
-            ),
-            child: const Text(
-              "🎭 ऊपर '3D Face Scan / जोड़ें' दबाकर 5 एंगल (Front, Left, Right, Up, Down) स्कैन करें या गैलरी से फोटो चुनें।",
-              style: TextStyle(color: Colors.white60, fontSize: 11),
-            ),
-          )
-        else
-          Column(
-            children: characters.map((c) {
+          ),
+          const SizedBox(height: 8),
+          if (characters.isEmpty)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1B1236),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.white12),
+              ),
+              child: const Text(
+                "🎭 ऊपर '3D Face Scan / जोड़ें' दबाकर 5 एंगल स्कैन करें — या ऊपर 'AI Auto-Cast' चुनकर बिना फोटो के सीधे वीडियो बनाएँ।",
+                style: TextStyle(color: Colors.white60, fontSize: 11),
+              ),
+            )
+          else
+            Column(
+              children: characters.map((c) {
               final Map<String, File> angMap = c['angles'] is Map
                   ? Map<String, File>.from(c['angles'] as Map)
                   : {};
@@ -3795,6 +3911,7 @@ class _CinePopHomeState extends State<CinePopHome> {
               );
             }).toList(),
           ),
+        ],
         const SizedBox(height: 16),
 
         // 3. 2-Tab Story Writer Mode (AI vs Manual Custom Script)
@@ -4127,6 +4244,49 @@ class _CinePopHomeState extends State<CinePopHome> {
                       ? Colors.greenAccent
                       : const Color(0xFFFF007F),
                   backgroundColor: const Color(0xFF281854),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Container(
+                width: double.infinity,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0E091E),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: const Color(0xFF00E5FF).withOpacity(0.45),
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.bolt,
+                      color: Color(0xFF00E5FF),
+                      size: 16,
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        "Free AI Engine: $activeAiEngine",
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Color(0xFF00E5FF),
+                          fontWeight: FontWeight.bold,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      activeAiAutoCast ? "🎭 Auto-Cast" : "📸 Face ID",
+                      style: const TextStyle(
+                        color: Colors.greenAccent,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 10,
+                      ),
+                    ),
+                  ],
                 ),
               ),
               const SizedBox(height: 8),
