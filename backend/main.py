@@ -25,7 +25,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
-from gradio_client import Client, handle_file
+try:
+    from gradio_client import Client, handle_file
+    GRADIO_AVAILABLE = True
+except Exception:
+    Client = None
+    handle_file = None
+    GRADIO_AVAILABLE = False
 
 try:
     import cv2
