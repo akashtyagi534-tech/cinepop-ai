@@ -1,15 +1,15 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     git \
     curl \
+    ca-certificates \
     fontconfig \
     libraqm0 \
     libfribidi0 \
     libharfbuzz0b \
-    fonts-noto-core \
-    fonts-noto \
+    libglib2.0-0 \
     fonts-lohit-deva \
     && mkdir -p /app/fonts \
     && (curl -fsSL --retry 2 "https://github.com/notofonts/devanagari/raw/main/fonts/NotoSansDevanagari/full/ttf/NotoSansDevanagari-Bold.ttf" -o /app/fonts/NotoSansDevanagari-Bold.ttf || true) \
