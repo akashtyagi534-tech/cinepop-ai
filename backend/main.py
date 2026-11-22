@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import time
 import hmac
 import math
 import wave
@@ -13,6 +14,7 @@ import asyncio
 import datetime
 import subprocess
 import urllib.parse
+import concurrent.futures
 from typing import Optional
 import requests
 import edge_tts
@@ -1562,40 +1564,75 @@ def get_aspect_dimensions(aspect_ratio: str = "16:9") -> tuple[int, int]:
     return (1280, 720)
 
 
+_HF_SPACE_COOLDOWN: dict[str, float] = {}
+_HF_COOLDOWN_SECONDS = 600.0  # Skip sleeping/dead HF spaces for 10 min so renders NEVER hang!
+
+
+def _is_hf_space_cooling(space_id: str) -> bool:
+    until = _HF_SPACE_COOLDOWN.get(space_id, 0.0)
+    return time.time() < until
+
+
+def _mark_hf_space_failed(space_id: str):
+    _HF_SPACE_COOLDOWN[space_id] = time.time() + _HF_COOLDOWN_SECONDS
+
+
+def _run_with_timeout(fn, timeout_sec: float = 10.0):
+    """Run a blocking third-party call (e.g. Gradio HF Client) with a strict non-blocking hard timeout."""
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = pool.submit(fn)
+    try:
+        return fut.result(timeout=timeout_sec)
+    except Exception:
+        return None
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 def _try_hf_scene_faceswap(scene_img_path: str, actor_face_path: str, out_path: str) -> Optional[str]:
     """
     Seamlessly merge the user's scanned face onto the full-screen AI drama scene's hero using
-    100% FREE HuggingFace Face-Swap spaces (`tonyassi/face-swap`, `ezioruan/inswapper`).
-    Returns out_path on success, or None to fall back to seamless skin-tone feathered compositing.
+    100% FREE HuggingFace Face-Swap spaces (`tonyassi/face-swap`, `ezioruan/inswapper`) with
+    a strict 10s timeout + circuit breaker so movie rendering NEVER hangs at 5%-10%!
     """
     if not scene_img_path or not actor_face_path or not os.path.exists(scene_img_path) or not os.path.exists(actor_face_path):
         return None
     for space_id in ("tonyassi/face-swap", "ezioruan/inswapper"):
-        try:
-            hf_client = Client(space_id)
-            res = hf_client.predict(
+        if _is_hf_space_cooling(space_id):
+            continue
+
+        def _call(sid=space_id):
+            hf_client = Client(sid)
+            return hf_client.predict(
                 handle_file(actor_face_path),
                 handle_file(scene_img_path),
                 api_name="/predict",
             )
-            swapped = None
-            if isinstance(res, str) and os.path.exists(res):
-                swapped = res
-            elif isinstance(res, dict):
-                swapped = res.get("path") or res.get("url")
-            elif isinstance(res, (list, tuple)):
-                for item in res:
-                    if isinstance(item, str) and os.path.exists(item):
-                        swapped = item
-                        break
-                    if isinstance(item, dict) and item.get("path") and os.path.exists(item["path"]):
-                        swapped = item["path"]
-                        break
-            if swapped and os.path.exists(swapped) and os.path.getsize(swapped) > 4000:
+
+        res = _run_with_timeout(_call, timeout_sec=10.0)
+        if res is None:
+            _mark_hf_space_failed(space_id)
+            continue
+        swapped = None
+        if isinstance(res, str) and os.path.exists(res):
+            swapped = res
+        elif isinstance(res, dict):
+            swapped = res.get("path") or res.get("url")
+        elif isinstance(res, (list, tuple)):
+            for item in res:
+                if isinstance(item, str) and os.path.exists(item):
+                    swapped = item
+                    break
+                if isinstance(item, dict) and item.get("path") and os.path.exists(item["path"]):
+                    swapped = item["path"]
+                    break
+        if swapped and os.path.exists(swapped) and os.path.getsize(swapped) > 4000:
+            try:
                 open_upright_image(swapped).save(out_path, "JPEG", quality=93)
                 return out_path
-        except Exception:
-            continue
+            except Exception:
+                pass
+        _mark_hf_space_failed(space_id)
     return None
 
 
@@ -1628,9 +1665,10 @@ def render_location_backdrop(
         "city_street": "dramatic Indian metropolitan city highway at night with glowing neon bokeh lights and wet road, Bollywood action thriller scene",
     }
     desc = loc_descriptions.get(location_key, loc_descriptions["city_street"])
-    hint_clean = re.sub(r"[^a-zA-Z0-9 ,.-]", "", (prompt_hint or "")).strip()[:90]
+    hint_clean = re.sub(r"[^a-zA-Z0-9 ,.-]", "", (prompt_hint or "")).strip()[:72]
     hero_tag = f"hero_{hero_role}" if include_hero else "bgonly"
-    cache_seed_str = f"{location_key}_{mood}_{W}x{H}_{hero_tag}_{hint_clean[:28]}"
+    # Reuse cached high-res scene per (location, mood, aspect, role) so 14 fast-cut scenes render super fast!
+    cache_seed_str = f"{location_key}_{mood}_{W}x{H}_{hero_tag}"
     cache_key = re.sub(r"[^a-zA-Z0-9_]", "_", cache_seed_str)[:76]
     cache_path = f"/tmp/cinepop_scene_{cache_key}.jpg"
     if os.path.exists(cache_path) and os.path.getsize(cache_path) > 8000:
@@ -1665,9 +1703,8 @@ def render_location_backdrop(
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     }
     candidate_urls = [
-        (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model=flux&nologo=true&seed={seed_val}", 28),
-        (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model=turbo&nologo=true&seed={seed_val}", 20),
-        (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&nologo=true&seed={seed_val + 7}", 20),
+        (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model=flux&nologo=true&seed={seed_val}", 12),
+        (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model=turbo&nologo=true&seed={seed_val}", 8),
     ]
     for url, t_sec in candidate_urls:
         try:
@@ -2038,37 +2075,44 @@ def _try_ai_action_i2v_spaces(
         ("KwaiVGI/LivePortrait", "liveportrait"),
     ]
     for space_id, kind in i2v_spaces:
-        try:
-            hf_client = Client(space_id)
-            if kind == "wan":
-                res = hf_client.predict(
+        if _is_hf_space_cooling(space_id):
+            continue
+
+        def _call(sid=space_id, k=kind):
+            hf_client = Client(sid)
+            if k == "wan":
+                return hf_client.predict(
                     image=handle_file(raw_img_path),
                     prompt=prompt_txt,
                     api_name="/predict",
                 )
-            elif kind == "ltx":
-                res = hf_client.predict(
+            elif k == "ltx":
+                return hf_client.predict(
                     prompt=prompt_txt,
                     negative_prompt="static image, blurry, distorted face, low quality",
                     input_image_filepath=handle_file(raw_img_path),
                     api_name="/image_to_video",
                 )
-            elif kind == "cogvideo":
-                res = hf_client.predict(
+            elif k == "cogvideo":
+                return hf_client.predict(
                     prompt=prompt_txt,
                     image_input=handle_file(raw_img_path),
                     api_name="/generate",
                 )
             else:
-                res = hf_client.predict(
+                return hf_client.predict(
                     handle_file(raw_img_path),
                     api_name="/gpu_wrapped_execute_video",
                 )
-            vid_path = _extract_gradio_video_path(res)
-            if vid_path and os.path.getsize(vid_path) > 2000:
-                return vid_path
-        except Exception:
+
+        res = _run_with_timeout(_call, timeout_sec=10.0)
+        if res is None:
+            _mark_hf_space_failed(space_id)
             continue
+        vid_path = _extract_gradio_video_path(res)
+        if vid_path and os.path.getsize(vid_path) > 2000:
+            return vid_path
+        _mark_hf_space_failed(space_id)
     return None
 
 
@@ -2200,10 +2244,13 @@ def _try_talking_lipsync_spaces(
         ("KwaiVGI/LivePortrait", "liveportrait"),
     ]
     for space_id, kind in mirrors:
-        try:
-            hf_client = Client(space_id)
-            if kind == "sadtalker":
-                res = hf_client.predict(
+        if _is_hf_space_cooling(space_id):
+            continue
+
+        def _call(sid=space_id, k=kind):
+            hf_client = Client(sid)
+            if k == "sadtalker":
+                return hf_client.predict(
                     source_image=handle_file(face_img_path),
                     driven_audio=handle_file(dialogue_audio_path),
                     preprocess="crop",
@@ -2214,23 +2261,27 @@ def _try_talking_lipsync_spaces(
                     pose_style=0,
                     api_name="/test",
                 )
-            elif kind == "wav2lip":
-                res = hf_client.predict(
+            elif k == "wav2lip":
+                return hf_client.predict(
                     face=handle_file(face_img_path),
                     audio=handle_file(dialogue_audio_path),
                     api_name="/predict",
                 )
             else:
-                res = hf_client.predict(
+                return hf_client.predict(
                     source_image=handle_file(face_img_path),
                     driving_audio=handle_file(dialogue_audio_path),
                     api_name="/predict",
                 )
-            vid_path = _extract_gradio_video_path(res)
-            if vid_path and os.path.exists(vid_path) and os.path.getsize(vid_path) > 2000:
-                return vid_path
-        except Exception:
+
+        res = _run_with_timeout(_call, timeout_sec=10.0)
+        if res is None:
+            _mark_hf_space_failed(space_id)
             continue
+        vid_path = _extract_gradio_video_path(res)
+        if vid_path and os.path.exists(vid_path) and os.path.getsize(vid_path) > 2000:
+            return vid_path
+        _mark_hf_space_failed(space_id)
     return None
 
 
@@ -2821,8 +2872,13 @@ async def autonomous_movie_worker(project_id: str):
                         सिर्फ शुद्ध JSON दो:
                         {{"title": "सीरीज़/फिल्म का दमदार नाम", "chapters": [{{"no": 1, "title": "Part 1: धमाकेदार शुरुआत", "plot": "विस्तार से कहानी, ट्विस्ट और अंत का सस्पेंस"}}]}}
                         """
-                        res = client.models.generate_content(
-                            model="gemini-2.5-flash", contents=prompt
+                        res = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                lambda: client.models.generate_content(
+                                    model="gemini-2.5-flash", contents=prompt
+                                )
+                            ),
+                            timeout=18.0,
                         )
                         parsed_out = safe_extract_json(res.text, fallback_outline)
                         if not isinstance(parsed_out, dict) or not parsed_out.get("chapters"):
@@ -2920,8 +2976,13 @@ async def autonomous_movie_worker(project_id: str):
                         हर सीन के साथ location, mood (Action, Emotional, Suspense, Comedy, Romantic), sfx (none, rain, thunder, punch, explosion, sword, footsteps), camera_angle (front, left, right, up, down), और dramatic English visual_action_prompt दो।
                         सिर्फ JSON लिस्ट दो: [{{"character": "{char_names[0]}", "dialogue": "डायलॉग...", "location": "Mumbai ki Barish", "mood": "{default_mood}", "sfx": "rain", "camera_angle": "front", "visual_action_prompt": "dramatic close-up in rain, neon reflections, intense thriller lighting"}}]
                         """
-                        s_res = client.models.generate_content(
-                            model="gemini-2.5-flash", contents=script_prompt
+                        s_res = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                lambda: client.models.generate_content(
+                                    model="gemini-2.5-flash", contents=script_prompt
+                                )
+                            ),
+                            timeout=18.0,
                         )
                         raw_list = safe_extract_json(s_res.text, fallback_dialogues)
                         raw_list = raw_list[: max(6, scenes_per_chapter + 2)]
@@ -3006,6 +3067,8 @@ async def autonomous_movie_worker(project_id: str):
                 target_scene_sec = 0.0
 
             for i, d in enumerate(dialogues):
+                if not os.path.isdir(proj_dir):
+                    return
                 raw_spk = str(d.get("character", "")).strip()
                 c_name = (
                     raw_spk
@@ -3098,12 +3161,13 @@ async def autonomous_movie_worker(project_id: str):
                     if os.path.exists(f_img):
                         os.remove(f_img)
                 clips.append(v_file)
-
+                if not os.path.isdir(proj_dir):
+                    return
                 scene_pct = min(
                     94,
                     ch_base_pct + 5 + int(((i + 1) / total_scenes) * max(1, ch_span_pct - 5)),
                 )
-                state["progress"] = max(state.get("progress", 15), scene_pct)
+                state["progress"] = max(state.get("progress", 12), scene_pct)
                 ready_hint = (
                     " (Part 1 तैयार — अभी Play करें!)"
                     if (series_mode == "series" and 1 in state.get("ready_parts", []) and ch_no > 1)
@@ -3114,6 +3178,8 @@ async def autonomous_movie_worker(project_id: str):
                 )
                 save_state(proj_dir, state)
 
+            if not os.path.isdir(proj_dir):
+                return
             ffmpeg_concat(clips, ch_mp4)
             state["done_chapters"].append(ch_no)
             prev_plot = ch["plot"]
@@ -3121,8 +3187,9 @@ async def autonomous_movie_worker(project_id: str):
             save_state(proj_dir, state)
 
     except Exception as e:
-        state["status_text"] = f"रुकावट आई (रीस्टार्ट पर यहीं से चलेगा): {str(e)}"
-        save_state(proj_dir, state)
+        if os.path.isdir(proj_dir):
+            state["status_text"] = f"रुकावट आई (रीस्टार्ट पर यहीं से चलेगा): {str(e)}"
+            save_state(proj_dir, state)
 
 
 @app.post("/start-autonomous-movie/")
@@ -4114,7 +4181,7 @@ def download_trailer_endpoint(project_id: str, format: str = "16x9"):
 # ==================== CUSTOM VIDEO AI FACE-SWAP ENGINE (ZERO CascadeClassifier) ====================
 
 def _try_hf_faceswap_image(source_face_path: str, target_frame_path: str) -> Optional[str]:
-    """Try free HuggingFace Face-Swap spaces (tonyassi/face-swap, ezioruan/inswapper, roop)."""
+    """Try free HuggingFace Face-Swap spaces with strict 10s timeout + circuit breaker."""
     hf_spaces = [
         ("tonyassi/face-swap", "/predict"),
         ("ezioruan/inswapper", "/predict"),
@@ -4122,23 +4189,30 @@ def _try_hf_faceswap_image(source_face_path: str, target_frame_path: str) -> Opt
         ("felixrosberg/face-swap", "/predict"),
     ]
     for space, api_ep in hf_spaces:
-        try:
-            hf = Client(space)
-            res = hf.predict(
+        if _is_hf_space_cooling(space):
+            continue
+
+        def _call(sp=space, ep=api_ep):
+            hf = Client(sp)
+            return hf.predict(
                 handle_file(source_face_path),
                 handle_file(target_frame_path),
-                api_name=api_ep,
+                api_name=ep,
             )
-            if isinstance(res, str) and os.path.exists(res):
-                return res
-            if isinstance(res, (list, tuple)) and res:
-                first = res[0]
-                if isinstance(first, str) and os.path.exists(first):
-                    return first
-                if isinstance(first, dict) and first.get("path") and os.path.exists(first["path"]):
-                    return first["path"]
-        except Exception:
+
+        res = _run_with_timeout(_call, timeout_sec=10.0)
+        if res is None:
+            _mark_hf_space_failed(space)
             continue
+        if isinstance(res, str) and os.path.exists(res):
+            return res
+        if isinstance(res, (list, tuple)) and res:
+            first = res[0]
+            if isinstance(first, str) and os.path.exists(first):
+                return first
+            if isinstance(first, dict) and first.get("path") and os.path.exists(first["path"]):
+                return first["path"]
+        _mark_hf_space_failed(space)
     return None
 
 
@@ -4273,11 +4347,12 @@ def _estimate_frame_head_pose(frame_bgr, box: tuple[int, int, int, int]) -> str:
 
 
 def _load_face_crop_from_path(img_path: str):
-    """Safely load and extract portrait face crop from any image file (OpenCV + PIL fallback)."""
-    src_img = cv2.imread(img_path)
-    if src_img is None:
-        pil_src = Image.open(img_path).convert("RGB")
+    """Safely load upright (EXIF-corrected) portrait face crop from any image file."""
+    try:
+        pil_src = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
         src_img = cv2.cvtColor(np.array(pil_src), cv2.COLOR_RGB2BGR)
+    except Exception:
+        src_img = cv2.imread(img_path)
     return _extract_source_face_crop(src_img)
 
 
@@ -4337,7 +4412,42 @@ def _opencv_video_faceswap(
 
     src_face_crop = angle_crops.get(preferred_angle, primary_crop)
 
-    cap = cv2.VideoCapture(video_path)
+    # Normalize mobile videos (HEVC/H.265/MOV/vertical rotation metadata) to clean H.264 MP4 for reliable OpenCV decode
+    norm_video_path = f"{out_video_noaudio}_norm.mp4"
+    decode_path = video_path
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-t",
+                "25",
+                "-vf",
+                "scale='min(720,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-r",
+                "24",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-an",
+                norm_video_path,
+            ],
+            check=True,
+            timeout=45,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if os.path.exists(norm_video_path) and os.path.getsize(norm_video_path) > 1024:
+            decode_path = norm_video_path
+    except Exception:
+        decode_path = video_path
+
+    cap = cv2.VideoCapture(decode_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
     fps = max(12.0, min(30.0, fps))
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
@@ -4456,6 +4566,40 @@ def _opencv_video_faceswap(
 
     cap.release()
     writer.release()
+    if os.path.exists(norm_video_path):
+        try:
+            os.remove(norm_video_path)
+        except Exception:
+            pass
+    if frame_idx == 0 or not os.path.exists(out_video_noaudio) or os.path.getsize(out_video_noaudio) < 1024:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-i",
+                face_img_path,
+                "-t",
+                "25",
+                "-filter_complex",
+                "[0:v]scale=720:-2,scale=trunc(iw/2)*2:trunc(ih/2)*2[base];[1:v]scale=180:210:force_original_aspect_ratio=increase,crop=180:210[fc];[base][fc]overlay=(W-w)/2:H*0.16[v]",
+                "-map",
+                "[v]",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-pix_fmt",
+                "yuv420p",
+                out_video_noaudio,
+            ],
+            check=True,
+            timeout=60,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return "ffmpeg-safe-blend"
     angle_tag = f"{len(angle_crops)}D-angles" if len(angle_crops) > 1 else "front-lock"
     tag = f"hf-ai-faceswap+{angle_tag}" if hf_engine_used else f"numpy-smooth-blend+{angle_tag}"
     return f"{tag} ({swapped_count}/{frame_idx} frames)"
@@ -4693,14 +4837,38 @@ def face_swap_download(job_id: str):
     )
 
 
+@app.delete("/project/{project_id}")
+def delete_movie_project(project_id: str, user_email: str = ""):
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "", project_id)
+    if not safe_id:
+        raise HTTPException(status_code=400, detail="Invalid project_id")
+    proj_dir = f"{PROJECTS_DIR}/{safe_id}"
+    if os.path.isdir(proj_dir):
+        st = load_state(proj_dir)
+        if user_email and st:
+            owner = str(st.get("user_email", "")).lower().strip()
+            requester = user_email.lower().strip()
+            if owner and requester != owner and requester != ADMIN_EMAIL:
+                raise HTTPException(status_code=403, detail="Unauthorized delete")
+        shutil.rmtree(proj_dir, ignore_errors=True)
+    return {"message": "Deleted", "project_id": safe_id}
+
+
 @app.delete("/face-swap/{job_id}")
-def face_swap_delete(job_id: str):
+def face_swap_delete(job_id: str, user_email: str = ""):
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "", job_id)
     db = load_db()
-    if job_id in db.get("face_swaps", {}):
-        del db["face_swaps"][job_id]
+    if safe_id in db.get("face_swaps", {}):
+        job = db["face_swaps"][safe_id]
+        if user_email:
+            owner = str(job.get("user_email", "")).lower().strip()
+            requester = user_email.lower().strip()
+            if owner and requester != owner and requester != ADMIN_EMAIL:
+                raise HTTPException(status_code=403, detail="Unauthorized delete")
+        del db["face_swaps"][safe_id]
         save_db(db)
-    shutil.rmtree(f"{FACE_SWAPS_DIR}/{job_id}", ignore_errors=True)
-    return {"message": "Deleted"}
+    shutil.rmtree(f"{FACE_SWAPS_DIR}/{safe_id}", ignore_errors=True)
+    return {"message": "Deleted", "job_id": safe_id}
 
 
 @app.get("/my-library/")

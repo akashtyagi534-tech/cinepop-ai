@@ -106,7 +106,7 @@ jobs:
           flutter pub get
           dart run flutter_launcher_icons
 
-      - name: Build Compact Release APK (arm64-v8a + 32-bit Split)
+      - name: Build Compact arm64-v8a Release APK Only
         working-directory: ./flutter_app
         run: |
           mkdir -p "$HOME/.gradle/init.d"
@@ -130,31 +130,29 @@ jobs:
               }
           }
           GRADLE
-          flutter build apk --release --split-per-abi --no-tree-shake-icons || (sleep 10 && flutter build apk --release --split-per-abi --no-tree-shake-icons)
+          flutter build apk --release --target-platform android-arm64 --no-tree-shake-icons || (sleep 10 && flutter build apk --release --target-platform android-arm64 --no-tree-shake-icons)
           ls -lh build/app/outputs/flutter-apk/
-          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "build/app/outputs/flutter-apk/CinePop-AI-v${{ github.run_number }}.apk"
-          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "build/app/outputs/flutter-apk/CinePop-AI-Latest.apk"
-          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk "build/app/outputs/flutter-apk/CinePop-AI-32bit-v${{ github.run_number }}.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "build/app/outputs/flutter-apk/CinePop-AI-v${{ github.run_number }}-arm64.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "build/app/outputs/flutter-apk/CinePop-AI-Latest.apk"
 
-      - name: Publish Direct Download APK to GitHub Releases (No ZIP Needed!)
+      - name: Publish Direct Download arm64-v8a APK to GitHub Releases (No ZIP Needed!)
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          APK_VER="flutter_app/build/app/outputs/flutter-apk/CinePop-AI-v${{ github.run_number }}.apk"
+          APK_VER="flutter_app/build/app/outputs/flutter-apk/CinePop-AI-v${{ github.run_number }}-arm64.apk"
           APK_LATEST="flutter_app/build/app/outputs/flutter-apk/CinePop-AI-Latest.apk"
-          APK_32="flutter_app/build/app/outputs/flutter-apk/CinePop-AI-32bit-v${{ github.run_number }}.apk"
           if gh release view latest >/dev/null 2>&1; then
-            gh release upload latest "$APK_LATEST" "$APK_VER" "$APK_32" --clobber
+            gh release upload latest "$APK_LATEST" "$APK_VER" --clobber
           else
-            gh release create latest "$APK_LATEST" "$APK_VER" "$APK_32" \
-              --title "CinePop AI Android APK (Latest)" \
-              --notes "Direct 1-tap Android APK download (compact ~38MB arm64-v8a, no ZIP extraction required!) Build #${{ github.run_number }}"
+            gh release create latest "$APK_LATEST" "$APK_VER" \
+              --title "CinePop AI Android APK (Latest arm64-v8a)" \
+              --notes "Direct 1-tap arm64-v8a Android APK download (~38MB, no ZIP extraction required!) Build #${{ github.run_number }}"
           fi
 
-      - name: Upload Release APK (Standard ZIP Artifact Backup)
+      - name: Upload arm64-v8a Release APK (Standard ZIP Artifact Backup)
         uses: actions/upload-artifact@v4
         with:
-          name: CinePop-AI-v${{ github.run_number }}-APK
-          path: flutter_app/build/app/outputs/flutter-apk/CinePop-AI-v${{ github.run_number }}.apk
+          name: CinePop-AI-v${{ github.run_number }}-arm64-APK
+          path: flutter_app/build/app/outputs/flutter-apk/CinePop-AI-v${{ github.run_number }}-arm64.apk
           compression-level: 6

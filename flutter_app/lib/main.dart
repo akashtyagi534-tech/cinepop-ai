@@ -4528,22 +4528,40 @@ class _CinePopHomeState extends State<CinePopHome> {
           ],
         ),
         const SizedBox(height: 24),
-        TextButton(
-          onPressed: () async {
-            final prefs = await SharedPreferences.getInstance();
-            await prefs.remove('active_project_id');
-            setState(() {
-              activeProjectId = null;
-              readyParts = [];
-              progress = 0;
-              isCompleted = false;
-              currentlyPlayingType = null;
-            });
-          },
-          child: const Text(
-            "नया प्रोजेक्ट शुरू करें",
-            style: TextStyle(color: Color(0xFF00E5FF)),
-          ),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          children: [
+            TextButton.icon(
+              onPressed: () async {
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.remove('active_project_id');
+                setState(() {
+                  activeProjectId = null;
+                  readyParts = [];
+                  progress = 0;
+                  isCompleted = false;
+                  currentlyPlayingType = null;
+                });
+              },
+              icon: const Icon(Icons.add_circle_outline, color: Color(0xFF00E5FF)),
+              label: const Text(
+                "नया प्रोजेक्ट शुरू करें",
+                style: TextStyle(color: Color(0xFF00E5FF)),
+              ),
+            ),
+            if (activeProjectId != null)
+              TextButton.icon(
+                onPressed: () => _deleteLibraryMovie(
+                  activeProjectId!,
+                  "यह वीडियो ($activeProjectId)",
+                ),
+                icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
+                label: const Text(
+                  "डिलीट करें",
+                  style: TextStyle(color: Colors.redAccent),
+                ),
+              ),
+          ],
         )
       ],
     );
@@ -4768,6 +4786,142 @@ class _CinePopHomeState extends State<CinePopHome> {
 
   // ==================== TAB 2: MY MOVIES CLOUD LIBRARY ====================
 
+  Future<void> _deleteLibraryMovie(String projectId, String title) async {
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1B1236),
+        title: const Text(
+          "🗑️ वीडियो डिलीट करें?",
+          style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold),
+        ),
+        content: Text(
+          "क्या आप \"$title\" को हमेशा के लिए डिलीट करना चाहते हैं?",
+          style: const TextStyle(color: Colors.white70, fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text("नहीं", style: TextStyle(color: Colors.white70)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text(
+              "हाँ, डिलीट करें",
+              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    try {
+      final emailParam = Uri.encodeComponent(userEmail ?? "");
+      await http
+          .delete(
+            Uri.parse('$serverUrl/project/$projectId?user_email=$emailParam'),
+          )
+          .timeout(const Duration(seconds: 12));
+      if (activeProjectId == projectId) {
+        syncTimer?.cancel();
+        _videoController?.dispose();
+        _chewieController?.dispose();
+        _videoController = null;
+        _chewieController = null;
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.remove('active_project_id');
+      }
+      if (mounted) {
+        setState(() {
+          libraryMovies.removeWhere(
+            (m) => m['project_id'].toString() == projectId,
+          );
+          if (activeProjectId == projectId) {
+            activeProjectId = null;
+            readyParts = [];
+            progress = 0;
+            isCompleted = false;
+            currentlyPlayingType = null;
+          }
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            backgroundColor: Colors.redAccent,
+            content: Text("🗑️ मूवी सफलतापूर्वक डिलीट हो गई!"),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("डिलीट करने में समस्या: $e")),
+        );
+      }
+    }
+  }
+
+  Future<void> _deleteLibraryFaceSwap(String jobId, String title) async {
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1B1236),
+        title: const Text(
+          "🗑️ Face-Swap वीडियो डिलीट करें?",
+          style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold),
+        ),
+        content: Text(
+          "क्या आप \"$title\" को हमेशा के लिए डिलीट करना चाहते हैं?",
+          style: const TextStyle(color: Colors.white70, fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text("नहीं", style: TextStyle(color: Colors.white70)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text(
+              "हाँ, डिलीट करें",
+              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    try {
+      final emailParam = Uri.encodeComponent(userEmail ?? "");
+      await http
+          .delete(
+            Uri.parse('$serverUrl/face-swap/$jobId?user_email=$emailParam'),
+          )
+          .timeout(const Duration(seconds: 12));
+      if (mounted) {
+        setState(() {
+          libraryFaceSwaps.removeWhere(
+            (j) => j['job_id'].toString() == jobId,
+          );
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            backgroundColor: Colors.redAccent,
+            content: Text("🗑️ Face-Swap वीडियो डिलीट हो गया!"),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("डिलीट करने में समस्या: $e")),
+        );
+      }
+    }
+  }
+
   Widget _buildLibraryScreen() {
     return RefreshIndicator(
       onRefresh: _fetchCloudLibrary,
@@ -4824,16 +4978,18 @@ class _CinePopHomeState extends State<CinePopHome> {
                   "${m['genre'] ?? 'Action'} • ${m['language'] ?? 'Hindi'} • ${m['progress'] ?? 0}%",
                   style: const TextStyle(fontSize: 12, color: Colors.white70),
                 ),
-                trailing: Wrap(
-                  spacing: 4,
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
                     IconButton(
+                      visualDensity: VisualDensity.compact,
                       icon: const Icon(Icons.photo_album, color: Color(0xFFFFD600)),
                       tooltip: "Movie Poster",
                       onPressed: () =>
                           _generateAndShowPoster(m['project_id'].toString()),
                     ),
                     IconButton(
+                      visualDensity: VisualDensity.compact,
                       icon: const Icon(Icons.play_arrow, color: Color(0xFF00E5FF)),
                       tooltip: "Open in Studio",
                       onPressed: () {
@@ -4843,6 +4999,18 @@ class _CinePopHomeState extends State<CinePopHome> {
                         });
                         _startAutoSync();
                       },
+                    ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      icon: const Icon(
+                        Icons.delete_outline,
+                        color: Colors.redAccent,
+                      ),
+                      tooltip: "Delete Video",
+                      onPressed: () => _deleteLibraryMovie(
+                        m['project_id'].toString(),
+                        (m['title'] ?? 'Movie').toString(),
+                      ),
                     ),
                   ],
                 ),
@@ -4873,35 +5041,63 @@ class _CinePopHomeState extends State<CinePopHome> {
                 title: Text((j['title'] ?? 'Face-Swap').toString()),
                 subtitle: Text(
                   "Status: ${j['status']} • ${j['created_at'] ?? ''}",
-                  style: const TextStyle(fontSize: 12, color: Colors.white70),
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: j['status'] == 'failed'
+                        ? Colors.redAccent
+                        : Colors.white70,
+                  ),
                 ),
-                trailing: j['status'] == 'ready'
-                    ? Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          IconButton(
-                            icon: const Icon(
-                              Icons.play_circle_fill,
-                              color: Color(0xFF00E5FF),
-                            ),
-                            onPressed: () {
-                              setState(() => currentTab = 1);
-                              _playFaceSwapPreview(j['job_id'].toString());
-                            },
-                          ),
-                          IconButton(
-                            icon: const Icon(
-                              Icons.download,
-                              color: Colors.greenAccent,
-                            ),
-                            onPressed: () => _downloadDirectUrl(
-                              '$serverUrl/face-swap/download/${j['job_id']}',
-                              'CinePop_FaceSwap_${j['job_id']}.mp4',
-                            ),
-                          ),
-                        ],
-                      )
-                    : const Icon(Icons.hourglass_top, color: Colors.amber),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (j['status'] == 'ready') ...[
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        icon: const Icon(
+                          Icons.play_circle_fill,
+                          color: Color(0xFF00E5FF),
+                        ),
+                        onPressed: () {
+                          setState(() => currentTab = 1);
+                          _playFaceSwapPreview(j['job_id'].toString());
+                        },
+                      ),
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        icon: const Icon(
+                          Icons.download,
+                          color: Colors.greenAccent,
+                        ),
+                        onPressed: () => _downloadDirectUrl(
+                          '$serverUrl/face-swap/download/${j['job_id']}',
+                          'CinePop_FaceSwap_${j['job_id']}.mp4',
+                        ),
+                      ),
+                    ] else
+                      Icon(
+                        j['status'] == 'failed'
+                            ? Icons.error_outline
+                            : Icons.hourglass_top,
+                        color: j['status'] == 'failed'
+                            ? Colors.redAccent
+                            : Colors.amber,
+                        size: 20,
+                      ),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      icon: const Icon(
+                        Icons.delete_outline,
+                        color: Colors.redAccent,
+                      ),
+                      tooltip: "Delete Face-Swap",
+                      onPressed: () => _deleteLibraryFaceSwap(
+                        j['job_id'].toString(),
+                        (j['title'] ?? 'Face-Swap').toString(),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
