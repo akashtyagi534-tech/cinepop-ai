@@ -57,6 +57,87 @@ os.makedirs(FACE_SWAPS_DIR, exist_ok=True)
 ALLOWED_MOODS = ["Action", "Emotional", "Suspense", "Comedy", "Romantic"]
 ALLOWED_LANGUAGES = ["Hindi", "Bhojpuri", "Haryanvi", "Punjabi", "English"]
 ALLOWED_SFX = ["none", "rain", "thunder", "punch", "explosion", "sword", "footsteps"]
+ALLOWED_FACE_ANGLES = ("front", "left", "right", "up", "down")
+
+
+def detect_scene_angle(
+    visual_action_prompt: str = "",
+    dialogue: str = "",
+    mood: str = "Action",
+    sfx: str = "none",
+    scene_idx: int = 0,
+) -> str:
+    """Detect best-matching character head/camera angle (front/left/right/up/down) for a scene."""
+    blob = f"{visual_action_prompt} {dialogue}".lower()
+    if any(k in blob for k in ("look up", "looking up", "sky", "ऊपर", "आसमान", "flying", "helicopter", "rooftop", "lightning", "thunder", "tower", "ऊंचाई")):
+        return "up"
+    if any(k in blob for k in ("look down", "looking down", "नीचे", "ज़मीन", "ground", "fallen", "bowed", "sad", "tears", "रो", "दुख", "floor")):
+        return "down"
+    if any(k in blob for k in ("turn left", "left profile", "left side", "बाएं", "running left", "dodge left", "glancing left")):
+        return "left"
+    if any(k in blob for k in ("turn right", "right profile", "right side", "दाएं", "running right", "dodge right", "glancing right")):
+        return "right"
+    if any(k in blob for k in ("running", "chase", "sprint", "fight", "punch", "sword", "combat", "side shot", "tracking", "दौड़", "लड़ाई", "हमला", "तलवार")) or sfx in ("punch", "sword", "explosion"):
+        # Alternate left/right side action profile on dynamic action shots, front on dialogue beats
+        cycle = ("front", "left", "right")
+        return cycle[scene_idx % len(cycle)]
+    if mood == "Emotional" and scene_idx % 3 == 2:
+        return "down"
+    if mood == "Suspense" and scene_idx % 3 == 1:
+        return "left" if scene_idx % 2 == 0 else "right"
+    return "front"
+
+
+def select_character_angle_photo(char_entry: dict, target_angle: str = "front") -> str:
+    """
+    STRICT CHARACTER PHOTO LOCK:
+    Always returns the user's exact uploaded/scanned photo matching target_angle
+    ('front', 'left', 'right', 'up', 'down'), falling back ONLY to the character's
+    uploaded 'front' / primary photo. NEVER returns any random or external image.
+    """
+    angles = char_entry.get("angles") or {}
+    clean_angle = target_angle if target_angle in ALLOWED_FACE_ANGLES else "front"
+    candidates = [
+        angles.get(clean_angle),
+        angles.get("front"),
+        char_entry.get("image"),
+    ]
+    for a in ALLOWED_FACE_ANGLES:
+        candidates.append(angles.get(a))
+    for path in candidates:
+        if isinstance(path, str) and path and os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+    return str(char_entry.get("image") or "")
+
+
+def resolve_character_name(raw_name: object, char_map: dict, fallback_idx: int = 0) -> str:
+    """Strictly resolve dialogue speaker to one of the user's uploaded characters (case-insensitive & multi-char aware)."""
+    char_names = list(char_map.keys())
+    if not char_names:
+        return "Actor"
+    raw = str(raw_name or "").strip()
+    if raw in char_map:
+        return raw
+    raw_low = raw.lower()
+    if raw_low:
+        # Case-insensitive exact match
+        for cn in char_names:
+            if cn.lower() == raw_low:
+                return cn
+        # Substring / first-name match (e.g. "Akash Tyagi" <-> "Akash")
+        for cn in char_names:
+            cn_low = cn.lower()
+            if cn_low in raw_low or raw_low in cn_low:
+                return cn
+            cn_first = cn_low.split()[0]
+            raw_first = raw_low.split()[0]
+            if len(cn_first) >= 2 and cn_first == raw_first:
+                return cn
+        # Role hint mapping if user named characters Hero / Villain or 2+ characters exist
+        if len(char_names) >= 2 and any(k in raw_low for k in ("villain", "don", "boss", "enemy", "विलेन", "डॉन", "दुश्मन")):
+            return char_names[1]
+    # Round-robin across user's uploaded characters so all uploaded cast appear naturally
+    return char_names[fallback_idx % len(char_names)]
 
 PITCH_PRESETS = {
     "normal": {"pitch": "+0Hz", "rate": "+0%", "label": "Normal"},
@@ -1749,139 +1830,177 @@ def render_exact_face_clip(
     mood: str = "Action",
     sfx_type: str = "none",
     visual_action_prompt: str = "",
+    char_angles: Optional[dict] = None,
+    scene_angle: str = "front",
 ):
+    """
+    STRICT CHARACTER PHOTO LOCK + MULTI-ANGLE FACE-SWAP PIPELINE (ZERO RANDOM FACES):
+    1. Any AI-generated motion video (LTX-Video / CogVideoX-5B / SVD) MUST pass through
+       mandatory user Face-Swap & Multi-Angle Face Lock so the user's exact uploaded face
+       is preserved in every single frame (random AI faces are strictly blocked!).
+    2. Talking-Face spaces (Wav2Lip / SadTalker) directly animate the exact angle-matched
+       uploaded user photo.
+    3. Guaranteed fallback renders High-Octane Pro Motion & VFX directly from the user's
+       angle-matched character portrait composited onto the cinematic location set.
+    """
     mixed_tmp = f"{out_mp4}_mix.mp3"
+    locked_tmp = f"{out_mp4}_facelocked.mp4"
     final_audio = mix_cinematic_audio(audio_path, mood, sfx_type, mixed_tmp)
 
+    # Ensure primary face path is ALWAYS a valid uploaded user photo
+    effective_angles = dict(char_angles or {})
+    if raw_img_path and os.path.exists(raw_img_path):
+        effective_angles.setdefault("front", raw_img_path)
+    angle_face_path = (
+        effective_angles.get(scene_angle)
+        if effective_angles.get(scene_angle) and os.path.exists(effective_angles[scene_angle])
+        else raw_img_path
+    )
+
     try:
-        # 1. Try Real AI Action Image-to-Video (LTX-Video / CogVideoX-5B / SVD)
-        ai_video_path = _try_ai_action_i2v_spaces(
-            raw_img_path, visual_action_prompt, mood
-        )
-        if ai_video_path:
-            try:
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-stream_loop",
-                        "-1",
-                        "-i",
+        # 1. Try Real AI Action Image-to-Video (LTX-Video / CogVideoX-5B / SVD) WITH MANDATORY USER FACE LOCK
+        if angle_face_path and os.path.exists(angle_face_path):
+            ai_video_path = _try_ai_action_i2v_spaces(
+                angle_face_path, visual_action_prompt, mood
+            )
+            if ai_video_path and os.path.exists(ai_video_path):
+                try:
+                    # CRITICAL LOCK: Never output raw I2V video directly — immediately swap/lock the user's
+                    # exact multi-angle face onto every frame so ZERO random/hallucinated AI faces appear!
+                    _opencv_video_faceswap(
                         ai_video_path,
-                        "-i",
-                        final_audio,
-                        "-map",
-                        "0:v:0",
-                        "-map",
-                        "1:a:0",
-                        "-vf",
-                        "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,eq=contrast=1.06:saturation=1.12,vignette=PI/5",
-                        "-r",
-                        "24",
-                        "-shortest",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "veryfast",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-crf",
-                        "25",
-                        "-c:a",
-                        "aac",
-                        "-ar",
-                        "44100",
-                        "-b:a",
-                        "96k",
-                        out_mp4,
-                    ],
-                    check=True,
-                    timeout=45,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000:
-                    return
-            except Exception:
-                pass
+                        angle_face_path,
+                        locked_tmp,
+                        watermark_text="",
+                        char_angles=effective_angles,
+                        preferred_angle=scene_angle,
+                    )
+                    if os.path.exists(locked_tmp) and os.path.getsize(locked_tmp) > 2000:
+                        subprocess.run(
+                            [
+                                "ffmpeg",
+                                "-y",
+                                "-stream_loop",
+                                "-1",
+                                "-i",
+                                locked_tmp,
+                                "-i",
+                                final_audio,
+                                "-map",
+                                "0:v:0",
+                                "-map",
+                                "1:a:0",
+                                "-vf",
+                                "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,eq=contrast=1.06:saturation=1.12,vignette=PI/5",
+                                "-r",
+                                "24",
+                                "-shortest",
+                                "-c:v",
+                                "libx264",
+                                "-preset",
+                                "veryfast",
+                                "-pix_fmt",
+                                "yuv420p",
+                                "-crf",
+                                "25",
+                                "-c:a",
+                                "aac",
+                                "-ar",
+                                "44100",
+                                "-b:a",
+                                "96k",
+                                out_mp4,
+                            ],
+                            check=True,
+                            timeout=45,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000:
+                            return
+                except Exception:
+                    # Reject unlocked AI video rather than allowing any random face!
+                    pass
 
-        # 2. Try Talking-Face AI Lip-Sync Spaces (Wav2Lip / SadTalker) for close-up dialogues
-        hf_mirrors = ["camenduru/Wav2Lip", "vinthony/SadTalker"]
-        for mirror in hf_mirrors:
-            try:
-                hf_client = Client(mirror)
-                if "Wav2Lip" in mirror:
-                    res = hf_client.predict(
-                        face=handle_file(raw_img_path),
-                        audio=handle_file(audio_path),
-                        api_name="/predict",
+        # 2. Try Talking-Face AI Lip-Sync Spaces (Wav2Lip / SadTalker) directly on exact uploaded user photo
+        if scene_angle == "front" and angle_face_path and os.path.exists(angle_face_path):
+            hf_mirrors = ["camenduru/Wav2Lip", "vinthony/SadTalker"]
+            for mirror in hf_mirrors:
+                try:
+                    hf_client = Client(mirror)
+                    if "Wav2Lip" in mirror:
+                        res = hf_client.predict(
+                            face=handle_file(angle_face_path),
+                            audio=handle_file(audio_path),
+                            api_name="/predict",
+                        )
+                    else:
+                        res = hf_client.predict(
+                            source_image=handle_file(angle_face_path),
+                            driven_audio=handle_file(audio_path),
+                            preprocess="crop",
+                            still_mode=False,
+                            use_enhancer=False,
+                            batch_size=1,
+                            size_of_image=256,
+                            pose_style=0,
+                            api_name="/test",
+                        )
+                    talk_vid = _extract_gradio_video_path(res)
+                    if not talk_vid:
+                        continue
+                    subprocess.run(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-i",
+                            talk_vid,
+                            "-i",
+                            final_audio,
+                            "-map",
+                            "0:v:0",
+                            "-map",
+                            "1:a:0",
+                            "-vf",
+                            "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+                            "-r",
+                            "24",
+                            "-shortest",
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "veryfast",
+                            "-crf",
+                            "25",
+                            "-c:a",
+                            "aac",
+                            "-ar",
+                            "44100",
+                            "-b:a",
+                            "96k",
+                            out_mp4,
+                        ],
+                        check=True,
+                        timeout=35,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
                     )
-                else:
-                    res = hf_client.predict(
-                        source_image=handle_file(raw_img_path),
-                        driven_audio=handle_file(audio_path),
-                        preprocess="crop",
-                        still_mode=False,
-                        use_enhancer=False,
-                        batch_size=1,
-                        size_of_image=256,
-                        pose_style=0,
-                        api_name="/test",
-                    )
-                talk_vid = _extract_gradio_video_path(res)
-                if not talk_vid:
+                    if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000:
+                        return
+                except Exception:
                     continue
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-i",
-                        talk_vid,
-                        "-i",
-                        final_audio,
-                        "-map",
-                        "0:v:0",
-                        "-map",
-                        "1:a:0",
-                        "-vf",
-                        "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
-                        "-r",
-                        "24",
-                        "-shortest",
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "veryfast",
-                        "-crf",
-                        "25",
-                        "-c:a",
-                        "aac",
-                        "-ar",
-                        "44100",
-                        "-b:a",
-                        "96k",
-                        out_mp4,
-                    ],
-                    check=True,
-                    timeout=35,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000:
-                    return
-            except Exception:
-                continue
 
-        # 3. High-Octane FFmpeg + OpenCV Pro Motion & VFX Engine (Camera tracking + shake + speed lines + particles + dynamic lighting — ZERO static stills!)
+        # 3. 100% Exact-Face Pro Motion & VFX Engine (Built directly from user's angle-matched photo — ZERO random faces!)
         _render_pro_motion_vfx_clip(
             framed_img_path, final_audio, out_mp4, mood=mood, sfx_type=sfx_type
         )
     finally:
-        if os.path.exists(mixed_tmp):
-            try:
-                os.remove(mixed_tmp)
-            except Exception:
-                pass
+        for tmp_p in (mixed_tmp, locked_tmp):
+            if os.path.exists(tmp_p):
+                try:
+                    os.remove(tmp_p)
+                except Exception:
+                    pass
 
 
 def ffmpeg_concat(file_list: list, out_path: str):
@@ -2145,11 +2264,11 @@ async def autonomous_movie_worker(project_id: str):
                         script_prompt = f"""
                         फिल्म: {state['outline']['title']} | पिछला सीन: {prev_plot}
                         वर्तमान चैप्टर {ch_no}: {ch['plot']}
-                        कैरेक्टर्स: {char_names}
+                        सख्त नियम — सिर्फ यही अपलोड किए गए कैरेक्टर नाम इस्तेमाल करो (कोई नया नाम मत जोड़ो): {char_names}
                         भाषा / Dialect: {language} (सभी डायलॉग्स असली {language} अंदाज़ और बोलचाल में लिखो!)
                         इस चैप्टर के लिए ठीक {scenes_per_chapter} दमदार, तेज़-रफ़्तार {language} डायलॉग्स लिखो ताकि {duration} मिनट का शानदार वीडियो बने।
-                        हर डायलॉग के साथ उसकी रियल लोकेशन (location: जैसे Gaon ka Khet, Purani Haveli, Mumbai ki Barish, Deep Jungle, Police Station, Outer Space, Royal Palace), mood (Action, Emotional, Suspense, Comedy, Romantic), sfx (none, rain, thunder, punch, explosion, sword, footsteps), और हाई-ऑक्टेन English visual_action_prompt (जैसे: "character running through stormy street, camera tracking, sparks flying") भी दो।
-                        सिर्फ JSON लिस्ट दो: [{{"character": "{char_names[0]}", "dialogue": "डायलॉग...", "location": "Mumbai ki Barish", "mood": "{default_mood}", "sfx": "rain", "visual_action_prompt": "hero running through stormy Mumbai street, fast tracking camera, sparks and rain"}}]
+                        हर डायलॉग के साथ उसकी रियल लोकेशन (location), mood (Action, Emotional, Suspense, Comedy, Romantic), sfx (none, rain, thunder, punch, explosion, sword, footsteps), camera_angle (front, left, right, up, down — क्लोज़अप के लिए front, साइड एक्शन/दौड़ने के लिए left या right, ऊपर देखने के लिए up, नीचे देखने के लिए down), और हाई-ऑक्टेन English visual_action_prompt दो।
+                        सिर्फ JSON लिस्ट दो: [{{"character": "{char_names[0]}", "dialogue": "डायलॉग...", "location": "Mumbai ki Barish", "mood": "{default_mood}", "sfx": "rain", "camera_angle": "front", "visual_action_prompt": "hero running through stormy Mumbai street, fast tracking camera, sparks and rain"}}]
                         """
                         s_res = client.models.generate_content(
                             model="gemini-2.5-flash", contents=script_prompt
@@ -2158,11 +2277,9 @@ async def autonomous_movie_worker(project_id: str):
                         # Cap to scenes_per_chapter + 2 so short durations stay ultra-fast
                         raw_list = raw_list[: max(4, scenes_per_chapter + 2)]
                         dialogues = []
-                        for item in raw_list:
-                            c_name = (
-                                item.get("character")
-                                if item.get("character") in char_map
-                                else char_names[0]
+                        for idx_d, item in enumerate(raw_list):
+                            c_name = resolve_character_name(
+                                item.get("character"), char_map, idx_d
                             )
                             diag_text = str(item.get("dialogue", "कहानी आगे बढ़ती है..."))
                             lk, ll = detect_location_meta(
@@ -2175,6 +2292,12 @@ async def autonomous_movie_worker(project_id: str):
                             vap = str(item.get("visual_action_prompt", "")).strip() or build_visual_action_prompt(
                                 c_name, diag_text, ll, mood_val, sfx_val
                             )
+                            raw_ang = str(item.get("camera_angle", "")).lower().strip()
+                            cam_angle = (
+                                raw_ang
+                                if raw_ang in ALLOWED_FACE_ANGLES
+                                else detect_scene_angle(vap, diag_text, mood_val, sfx_val, idx_d)
+                            )
                             dialogues.append(
                                 {
                                     "character": c_name,
@@ -2183,6 +2306,7 @@ async def autonomous_movie_worker(project_id: str):
                                     "location_key": lk,
                                     "mood": mood_val,
                                     "sfx": sfx_val,
+                                    "camera_angle": cam_angle,
                                     "visual_action_prompt": vap,
                                 }
                             )
@@ -2194,18 +2318,15 @@ async def autonomous_movie_worker(project_id: str):
             state["scripts"][str(ch_no)] = dialogues
             state["progress"] = min(94, ch_base_pct + 6)
             state["status_text"] = (
-                f"स्क्रिप्ट तैयार ({len(dialogues)} सीन्स)! अब वॉइसओवर + Pro Motion वीडियो रेंडर हो रहा है ({state['progress']}%)..."
+                f"स्क्रिप्ट तैयार ({len(dialogues)} सीन्स)! अब 3D Face Lock + Pro Motion वीडियो रेंडर हो रहा है ({state['progress']}%)..."
             )
             save_state(proj_dir, state)
 
             clips = []
             total_scenes = max(1, len(dialogues))
             for i, d in enumerate(dialogues):
-                c_name = (
-                    d.get("character")
-                    if d.get("character") in char_map
-                    else char_names[0]
-                )
+                c_name = resolve_character_name(d.get("character"), char_map, i)
+                char_entry = char_map[c_name]
                 diag_text = d.get("dialogue", "कहानी आगे बढ़ती है...")
                 loc_key = d.get("location_key") or "city_street"
                 loc_label = d.get("location") or default_location or "Mumbai City Street"
@@ -2214,8 +2335,15 @@ async def autonomous_movie_worker(project_id: str):
                 action_prompt = d.get("visual_action_prompt") or build_visual_action_prompt(
                     c_name, diag_text, loc_label, scene_mood, scene_sfx
                 )
+                scene_angle = (
+                    d.get("camera_angle")
+                    if d.get("camera_angle") in ALLOWED_FACE_ANGLES
+                    else detect_scene_angle(action_prompt, diag_text, scene_mood, scene_sfx, i)
+                )
+                # STRICT MULTI-ANGLE CHARACTER PHOTO LOCK (ZERO random faces!)
+                exact_char_photo = select_character_angle_photo(char_entry, scene_angle)
                 bg_override = d.get("bg_path") or project_custom_bg
-                char_pitch = char_map[c_name].get("pitch", "normal")
+                char_pitch = char_entry.get("pitch", "normal")
 
                 a_file = f"{ch_temp}/a_{i}.mp3"
                 f_img = f"{ch_temp}/f_{i}.jpg"
@@ -2224,14 +2352,14 @@ async def autonomous_movie_worker(project_id: str):
                 if not os.path.exists(v_file):
                     await generate_bulletproof_audio(
                         diag_text,
-                        char_map[c_name]["voice"],
+                        char_entry["voice"],
                         a_file,
                         pitch=char_pitch,
                         language=language,
                     )
                     await asyncio.to_thread(
                         prepare_character_frame,
-                        char_map[c_name]["image"],
+                        exact_char_photo,
                         c_name,
                         diag_text,
                         f_img,
@@ -2244,13 +2372,15 @@ async def autonomous_movie_worker(project_id: str):
                     )
                     await asyncio.to_thread(
                         render_exact_face_clip,
-                        char_map[c_name]["image"],
+                        exact_char_photo,
                         f_img,
                         a_file,
                         v_file,
                         scene_mood,
                         scene_sfx,
                         action_prompt,
+                        char_entry.get("angles"),
+                        scene_angle,
                     )
                     if os.path.exists(a_file):
                         os.remove(a_file)
@@ -2293,6 +2423,8 @@ async def start_movie(
     char_names: str = Form(...),
     voices: str = Form(...),
     images: list[UploadFile] = File(...),
+    angle_images: Optional[list[UploadFile]] = File(default=None),
+    angle_meta: str = Form("[]"),
     story_mode: str = Form("ai"),
     genre: str = Form("Action"),
     language: str = Form("Hindi"),
@@ -2305,6 +2437,11 @@ async def start_movie(
     custom_bg: Optional[UploadFile] = File(None),
 ):
     email = user_email.lower().strip()
+    if not images:
+        raise HTTPException(
+            status_code=400,
+            detail="कम से कम 1 कैरेक्टर की फोटो (या 5-Angle 3D Face Scan) ज़रूरी है!",
+        )
     db = load_db()
     if email not in db["users"]:
         db["users"][email] = {
@@ -2355,7 +2492,7 @@ async def start_movie(
     proj_dir = f"{PROJECTS_DIR}/{project_id}"
     os.makedirs(proj_dir, exist_ok=True)
 
-    names = [x.strip() for x in char_names.split(",")]
+    names = [x.strip() for x in char_names.split(",") if x.strip()]
     v_list = [x.strip() for x in voices.split(",")]
     try:
         pitches_map = json.loads(char_pitches) if char_pitches.strip() else {}
@@ -2365,14 +2502,65 @@ async def start_movie(
         pitches_map = {}
 
     char_map = {}
+    ordered_names: list[str] = []
     for idx, img in enumerate(images):
         c_name = names[idx] if idx < len(names) else f"Actor_{idx+1}"
         c_voice = v_list[idx] if idx < len(v_list) else "hi-IN-MadhurNeural"
         c_pitch = normalize_pitch(str(pitches_map.get(c_name, pitches_map.get(str(idx), "normal"))))
-        img_path = safe_project_file(proj_dir, f"char_{idx}_{c_name}.jpg")
+        raw_img_bytes = await img.read()
+        if not raw_img_bytes:
+            raise HTTPException(status_code=400, detail=f"Character '{c_name}' की फोटो खाली है।")
+        img_path = safe_project_file(proj_dir, f"char_{idx}_front.jpg")
         with open(img_path, "wb") as f:
-            f.write(await img.read())
-        char_map[c_name] = {"image": img_path, "voice": c_voice, "pitch": c_pitch}
+            f.write(raw_img_bytes)
+        char_map[c_name] = {
+            "image": img_path,
+            "voice": c_voice,
+            "pitch": c_pitch,
+            "angles": {"front": img_path},
+            "face_profile_3d": False,
+        }
+        ordered_names.append(c_name)
+
+    # Save optional 3D Multi-Angle Face Scan photos (front, left, right, up, down) per character
+    if angle_images:
+        try:
+            parsed_angle_meta = json.loads(angle_meta) if angle_meta.strip() else []
+            if not isinstance(parsed_angle_meta, list):
+                parsed_angle_meta = []
+        except Exception:
+            parsed_angle_meta = []
+
+        for a_idx, a_file in enumerate(angle_images):
+            raw_a = await a_file.read()
+            if not raw_a:
+                continue
+            meta_item = parsed_angle_meta[a_idx] if a_idx < len(parsed_angle_meta) and isinstance(parsed_angle_meta[a_idx], dict) else {}
+            angle_key = str(meta_item.get("angle", "")).lower().strip()
+            if angle_key not in ALLOWED_FACE_ANGLES:
+                # Try parsing from filename e.g. char0_left.jpg
+                fname_low = (a_file.filename or "").lower()
+                angle_key = next((ang for ang in ALLOWED_FACE_ANGLES if ang in fname_low), "front")
+            target_char = None
+            meta_name = str(meta_item.get("char_name", "")).strip()
+            if meta_name and meta_name in char_map:
+                target_char = meta_name
+            else:
+                try:
+                    c_i = int(meta_item.get("char_index", 0))
+                except Exception:
+                    c_i = 0
+                if 0 <= c_i < len(ordered_names):
+                    target_char = ordered_names[c_i]
+            if target_char and target_char in char_map:
+                c_slot = ordered_names.index(target_char)
+                a_path = safe_project_file(proj_dir, f"char_{c_slot}_{angle_key}.jpg")
+                with open(a_path, "wb") as f:
+                    f.write(raw_a)
+                char_map[target_char]["angles"][angle_key] = a_path
+                if angle_key == "front":
+                    char_map[target_char]["image"] = a_path
+                char_map[target_char]["face_profile_3d"] = len(char_map[target_char]["angles"]) >= 3
 
     custom_bg_path = None
     if custom_bg is not None:
@@ -3306,11 +3494,55 @@ def _extract_source_face_crop(src_img):
     return src_img[y_start : y_start + side, x_start : x_start + side]
 
 
+def _estimate_frame_head_pose(frame_bgr, box: tuple[int, int, int, int]) -> str:
+    """
+    Estimate actor head pose (front / left / right / up / down) inside detected face ROI
+    using pure NumPy skin-mass centroid asymmetry (zero CascadeClassifier!).
+    Used to select the best-matching photo from a character's 5-Angle 3D Face Scan.
+    """
+    try:
+        tx, ty, tw, th = box
+        roi = frame_bgr[ty : ty + th, tx : tx + tw]
+        if roi.size == 0 or tw < 24 or th < 24:
+            return "front"
+        ycrcb = cv2.cvtColor(roi, cv2.COLOR_BGR2YCrCb)
+        cr, cb, y_ch = ycrcb[:, :, 1], ycrcb[:, :, 2], ycrcb[:, :, 0]
+        skin = ((cr >= 133) & (cr <= 178) & (cb >= 77) & (cb <= 130) & (y_ch >= 45)).astype(np.float32)
+        total = float(skin.sum())
+        if total < 20.0:
+            return "front"
+        ys, xs = np.indices((th, tw), dtype=np.float32)
+        cx_norm = float((xs * skin).sum() / total) / max(1.0, float(tw))
+        cy_norm = float((ys * skin).sum() / total) / max(1.0, float(th))
+        if cx_norm < 0.43:
+            return "left"
+        if cx_norm > 0.57:
+            return "right"
+        if cy_norm < 0.42:
+            return "up"
+        if cy_norm > 0.59:
+            return "down"
+        return "front"
+    except Exception:
+        return "front"
+
+
+def _load_face_crop_from_path(img_path: str):
+    """Safely load and extract portrait face crop from any image file (OpenCV + PIL fallback)."""
+    src_img = cv2.imread(img_path)
+    if src_img is None:
+        pil_src = Image.open(img_path).convert("RGB")
+        src_img = cv2.cvtColor(np.array(pil_src), cv2.COLOR_RGB2BGR)
+    return _extract_source_face_crop(src_img)
+
+
 def _opencv_video_faceswap(
     video_path: str,
     face_img_path: str,
     out_video_noaudio: str,
     watermark_text: str = "",
+    char_angles: Optional[dict] = None,
+    preferred_angle: str = "front",
 ):
     if not OPENCV_AVAILABLE or cv2 is None or np is None:
         # Fallback FFmpeg smooth portrait face overlay if OpenCV is unavailable
@@ -3342,16 +3574,23 @@ def _opencv_video_faceswap(
         )
         return "ffmpeg-portrait-blend"
 
-    # Decode uploaded face image safely (OpenCV with PIL fallback for HEIC/WebP/PNG)
-    src_img = cv2.imread(face_img_path)
-    if src_img is None:
-        try:
-            pil_src = Image.open(face_img_path).convert("RGB")
-            src_img = cv2.cvtColor(np.array(pil_src), cv2.COLOR_RGB2BGR)
-        except Exception:
-            raise ValueError("Uploaded face image could not be decoded")
+    # Pre-load primary + all 5-Angle 3D Face Scan crops (front, left, right, up, down)
+    angle_crops: dict[str, any] = {}
+    angle_paths: dict[str, str] = {}
+    primary_crop = _load_face_crop_from_path(face_img_path)
+    angle_crops["front"] = primary_crop
+    angle_paths["front"] = face_img_path
 
-    src_face_crop = _extract_source_face_crop(src_img)
+    if char_angles:
+        for ang, pth in char_angles.items():
+            if ang in ALLOWED_FACE_ANGLES and isinstance(pth, str) and os.path.exists(pth):
+                try:
+                    angle_crops[ang] = _load_face_crop_from_path(pth)
+                    angle_paths[ang] = pth
+                except Exception:
+                    continue
+
+    src_face_crop = angle_crops.get(preferred_angle, primary_crop)
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
@@ -3369,8 +3608,9 @@ def _opencv_video_faceswap(
     frame_idx = 0
     last_box = None
     swapped_count = 0
-    hf_tried = False
+    hf_tried_angles: set[str] = set()
     hf_engine_used = False
+    active_pose = preferred_angle if preferred_angle in ALLOWED_FACE_ANGLES else "front"
 
     while frame_idx < max_frames:
         ok, frame = cap.read()
@@ -3379,7 +3619,7 @@ def _opencv_video_faceswap(
         if scale < 0.99:
             frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
 
-        # Estimate target face box every 3rd frame with pure NumPy YCrCb detector (zero CascadeClassifier!)
+        # Estimate target face box & 3D head pose every 3rd frame (zero CascadeClassifier!)
         if frame_idx % 3 == 0 or last_box is None:
             bx, by, bw, bh = _detect_face_box_numpy_ycrcb(frame)
             if last_box is not None:
@@ -3392,6 +3632,10 @@ def _opencv_video_faceswap(
                 )
             else:
                 last_box = (int(bx), int(by), int(bw), int(bh))
+            if len(angle_crops) > 1:
+                detected_pose = _estimate_frame_head_pose(frame, last_box)
+                if detected_pose in angle_crops:
+                    active_pose = detected_pose
 
         tx, ty, tw, th = last_box
         tx = max(0, min(out_w - 24, tx))
@@ -3399,19 +3643,23 @@ def _opencv_video_faceswap(
         tw = max(24, min(out_w - tx, tw))
         th = max(24, min(out_h - ty, th))
 
-        # Step 1: Try free HuggingFace AI Face-Swap Space on first frame to extract lighting/expression-matched AI face
-        if not hf_tried and frame_idx == 0:
-            hf_tried = True
+        active_face_path = angle_paths.get(active_pose, face_img_path)
+        src_face_crop = angle_crops.get(active_pose, primary_crop)
+
+        # Step 1: Try free HuggingFace AI Face-Swap Space once per detected pose angle
+        if active_pose not in hf_tried_angles and len(hf_tried_angles) < 2:
+            hf_tried_angles.add(active_pose)
             try:
-                tmp_frame = f"{out_video_noaudio}_f0.jpg"
+                tmp_frame = f"{out_video_noaudio}_f_{active_pose}.jpg"
                 cv2.imwrite(tmp_frame, frame)
-                hf_res = _try_hf_faceswap_image(face_img_path, tmp_frame)
+                hf_res = _try_hf_faceswap_image(active_face_path, tmp_frame)
                 if hf_res and os.path.exists(hf_res):
                     hf_img = cv2.imread(hf_res)
                     if hf_img is not None:
                         hf_resized = cv2.resize(hf_img, (out_w, out_h))
                         hf_crop = hf_resized[ty : ty + th, tx : tx + tw]
                         if hf_crop.size > 0:
+                            angle_crops[active_pose] = hf_crop
                             src_face_crop = hf_crop
                             hf_engine_used = True
                 if os.path.exists(tmp_frame):
@@ -3471,7 +3719,8 @@ def _opencv_video_faceswap(
 
     cap.release()
     writer.release()
-    tag = "hf-ai-faceswap+smooth-blend" if hf_engine_used else "numpy-smooth-blend"
+    angle_tag = f"{len(angle_crops)}D-angles" if len(angle_crops) > 1 else "front-lock"
+    tag = f"hf-ai-faceswap+{angle_tag}" if hf_engine_used else f"numpy-smooth-blend+{angle_tag}"
     return f"{tag} ({swapped_count}/{frame_idx} frames)"
 
 
@@ -3493,6 +3742,7 @@ async def face_swap_worker(job_id: str):
             face_path,
             raw_swapped,
             job.get("watermark_text", ""),
+            job.get("face_angles"),
         )
 
         dub_text = (job.get("dub_text") or "").strip()
@@ -3610,6 +3860,8 @@ async def start_face_swap(
     watermark_text: str = Form(""),
     video: UploadFile = File(...),
     face_image: UploadFile = File(...),
+    angle_images: Optional[list[UploadFile]] = File(default=None),
+    angle_meta: str = Form("[]"),
 ):
     email = user_email.lower().strip()
     video_bytes = await video.read()
@@ -3624,11 +3876,33 @@ async def start_face_swap(
     os.makedirs(job_dir, exist_ok=True)
 
     vid_path = safe_project_file(job_dir, f"input_{video.filename or 'clip.mp4'}")
-    face_path = safe_project_file(job_dir, f"face_{face_image.filename or 'face.jpg'}")
+    face_path = safe_project_file(job_dir, f"face_front_{face_image.filename or 'face.jpg'}")
     with open(vid_path, "wb") as f:
         f.write(video_bytes)
     with open(face_path, "wb") as f:
         f.write(face_bytes)
+
+    face_angles: dict[str, str] = {"front": face_path}
+    if angle_images:
+        try:
+            parsed_meta = json.loads(angle_meta) if angle_meta.strip() else []
+            if not isinstance(parsed_meta, list):
+                parsed_meta = []
+        except Exception:
+            parsed_meta = []
+        for idx_a, a_up in enumerate(angle_images):
+            a_bytes = await a_up.read()
+            if not a_bytes:
+                continue
+            m = parsed_meta[idx_a] if idx_a < len(parsed_meta) and isinstance(parsed_meta[idx_a], dict) else {}
+            ang = str(m.get("angle", "")).lower().strip()
+            if ang not in ALLOWED_FACE_ANGLES:
+                fname_low = (a_up.filename or "").lower()
+                ang = next((k for k in ALLOWED_FACE_ANGLES if k in fname_low), "front")
+            a_path = safe_project_file(job_dir, f"face_{ang}.jpg")
+            with open(a_path, "wb") as f:
+                f.write(a_bytes)
+            face_angles[ang] = a_path
 
     job_meta = {
         "job_id": job_id,
@@ -3636,13 +3910,14 @@ async def start_face_swap(
         "title": title.strip()[:50] or "Custom Face-Swap Clip",
         "video_path": vid_path,
         "face_path": face_path,
+        "face_angles": face_angles,
         "dub_text": dub_text.strip(),
         "dub_language": normalize_language(dub_language),
         "dub_voice": dub_voice.strip() or "hi-IN-MadhurNeural",
         "dub_pitch": normalize_pitch(dub_pitch),
         "watermark_text": watermark_text.strip()[:30],
         "status": "processing",
-        "status_text": "🎭 AI Face-Swap (HuggingFace + OpenCV Seamless Blend) चल रहा है...",
+        "status_text": f"🎭 3D Multi-Angle Face-Swap ({len(face_angles)} Angles Locked) चल रहा है...",
         "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 

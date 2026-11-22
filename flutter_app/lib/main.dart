@@ -1220,15 +1220,650 @@ class _CinePopHomeState extends State<CinePopHome> {
     }
   }
 
-  Future<void> _addCharacter() async {
-    final picker = ImagePicker();
-    final XFile? photo =
-        await picker.pickImage(source: ImageSource.gallery, imageQuality: 85);
-    if (photo == null) return;
+  static const List<Map<String, String>> _faceAngleSteps = [
+    {
+      "key": "front",
+      "label": "Front",
+      "hi": "सामने देखें (Look Straight)",
+      "hint": "चेहरा सर्कल के ठीक बीच में सीधा रखें",
+    },
+    {
+      "key": "left",
+      "label": "Left",
+      "hi": "थोड़ा बाएं मुड़ें (Turn Left)",
+      "hint": "चेहरे को हल्का सा बाईं ओर घुमाएँ",
+    },
+    {
+      "key": "right",
+      "label": "Right",
+      "hi": "थोड़ा दाएं मुड़ें (Turn Right)",
+      "hint": "चेहरे को हल्का सा दाईं ओर घुमाएँ",
+    },
+    {
+      "key": "up",
+      "label": "Up",
+      "hi": "थोड़ा ऊपर देखें (Look Up)",
+      "hint": "ठोड़ी को थोड़ा ऊपर उठाएँ",
+    },
+    {
+      "key": "down",
+      "label": "Down",
+      "hi": "थोड़ा नीचे देखें (Look Down)",
+      "hint": "चेहरे को हल्का सा नीचे झुकाएँ",
+    },
+  ];
 
-    TextEditingController nameCtrl = TextEditingController();
+  IconData _angleIcon(String key) {
+    switch (key) {
+      case "left":
+        return Icons.arrow_back_rounded;
+      case "right":
+        return Icons.arrow_forward_rounded;
+      case "up":
+        return Icons.arrow_upward_rounded;
+      case "down":
+        return Icons.arrow_downward_rounded;
+      default:
+        return Icons.face_retouching_natural;
+    }
+  }
+
+  Future<void> _addCharacter() async {
+    if (!mounted) return;
+    final String? chosenMode = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: const Color(0xFF160E2B),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+      ),
+      builder: (sheetCtx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 18, 20, 22),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Row(
+                children: [
+                  Icon(Icons.face_retouching_natural, color: Color(0xFFFF007F)),
+                  SizedBox(width: 8),
+                  Text(
+                    "🎭 3D Face Scan — कैरेक्टर जोड़ें",
+                    style: TextStyle(
+                      color: Color(0xFFFFD600),
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                "हर एंगल (Front, Left, Right, Up, Down) से असली चेहरा लॉक करें ताकि साइड और एक्शन शॉट में भी चेहरा न बिगड़े:",
+                style: TextStyle(color: Colors.white70, fontSize: 12),
+              ),
+              const SizedBox(height: 16),
+              InkWell(
+                borderRadius: BorderRadius.circular(14),
+                onTap: () => Navigator.pop(sheetCtx, "live"),
+                child: Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    gradient: const LinearGradient(
+                      colors: [Color(0xFFFF007F), Color(0xFF7000FF)],
+                    ),
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.camera_front, color: Colors.white, size: 28),
+                      SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              "📸 Live 5-Angle Face Scan (Recommended)",
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                              ),
+                            ),
+                            SizedBox(height: 2),
+                            Text(
+                              "Face ID / KYC जैसा गाइडेड स्कैन — Front, Left, Right, Up, Down",
+                              style: TextStyle(
+                                color: Colors.white70,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Icon(Icons.chevron_right, color: Colors.white),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+              InkWell(
+                borderRadius: BorderRadius.circular(14),
+                onTap: () => Navigator.pop(sheetCtx, "gallery"),
+                child: Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF231747),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: const Color(0xFF00E5FF)),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(
+                        Icons.photo_library,
+                        color: Color(0xFF00E5FF),
+                        size: 26,
+                      ),
+                      SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              "🖼️ Gallery से Multiple Angles Upload करें",
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                              ),
+                            ),
+                            SizedBox(height: 2),
+                            Text(
+                              "Front, Left, Right, Up, Down की अलग-अलग फोटो चुनें",
+                              style: TextStyle(
+                                color: Colors.white70,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Icon(Icons.chevron_right, color: Color(0xFF00E5FF)),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    if (chosenMode == null || !mounted) return;
+    if (chosenMode == "live") {
+      await _openLive5AngleFaceScan();
+    } else {
+      await _openGalleryMultiAngleDialog();
+    }
+  }
+
+  Future<void> _openLive5AngleFaceScan() async {
+    final picker = ImagePicker();
+    final Map<String, File> capturedAngles = {};
+    int stepIdx = 0;
+
+    if (!mounted) return;
+    final bool? completed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dlgCtx) => StatefulBuilder(
+        builder: (ctx, setDlgState) {
+          final current = _faceAngleSteps[stepIdx];
+          final String currentKey = current["key"]!;
+          final File? currentFile = capturedAngles[currentKey];
+          final int doneCount = capturedAngles.length;
+          final bool allDone = doneCount >= 5;
+
+          return AlertDialog(
+            backgroundColor: const Color(0xFF140D29),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(20),
+              side: BorderSide(
+                color: allDone
+                    ? Colors.greenAccent
+                    : const Color(0xFFFF007F),
+                width: 1.5,
+              ),
+            ),
+            title: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Expanded(
+                  child: Text(
+                    "🎭 3D Face Scan (5 Angles)",
+                    style: TextStyle(
+                      color: Color(0xFFFFD600),
+                      fontSize: 15,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                Text(
+                  "$doneCount/5",
+                  style: TextStyle(
+                    color: allDone
+                        ? Colors.greenAccent
+                        : const Color(0xFF00E5FF),
+                    fontWeight: FontWeight.bold,
+                    fontSize: 14,
+                  ),
+                ),
+              ],
+            ),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  LinearProgressIndicator(
+                    value: doneCount / 5.0,
+                    backgroundColor: Colors.white12,
+                    color: allDone
+                        ? Colors.greenAccent
+                        : const Color(0xFFFF007F),
+                    minHeight: 6,
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  const SizedBox(height: 16),
+                  // Circular Face-ID KYC Frame
+                  Container(
+                    width: 170,
+                    height: 170,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: const Color(0xFF0B0718),
+                      border: Border.all(
+                        color: allDone
+                            ? Colors.greenAccent
+                            : (currentFile != null
+                                ? Colors.greenAccent
+                                : const Color(0xFF00E5FF)),
+                        width: 4,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: (allDone
+                                  ? Colors.greenAccent
+                                  : const Color(0xFFFF007F))
+                              .withOpacity(0.35),
+                          blurRadius: 18,
+                          spreadRadius: 2,
+                        ),
+                      ],
+                    ),
+                    child: ClipOval(
+                      child: currentFile != null
+                          ? Image.file(currentFile, fit: BoxFit.cover)
+                          : Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(
+                                  _angleIcon(currentKey),
+                                  size: 46,
+                                  color: const Color(0xFF00E5FF),
+                                ),
+                                const SizedBox(height: 6),
+                                Text(
+                                  "Step ${stepIdx + 1}/5",
+                                  style: const TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ],
+                            ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  if (allDone)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.green.withOpacity(0.18),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: Colors.greenAccent),
+                      ),
+                      child: const Row(
+                        children: [
+                          Icon(
+                            Icons.verified,
+                            color: Colors.greenAccent,
+                            size: 20,
+                          ),
+                          SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              "✅ 5-Angle 3D Face Profile Ready!",
+                              style: TextStyle(
+                                color: Colors.greenAccent,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    )
+                  else
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1F1440),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Column(
+                        children: [
+                          Text(
+                            "${stepIdx + 1}. ${current['hi']}",
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 14,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            current['hint']!,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 11,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  const SizedBox(height: 12),
+                  // 5-angle mini pill selector
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    alignment: WrapAlignment.center,
+                    children: List.generate(_faceAngleSteps.length, (i) {
+                      final st = _faceAngleSteps[i];
+                      final k = st['key']!;
+                      final hasImg = capturedAngles.containsKey(k);
+                      final isSel = i == stepIdx;
+                      return GestureDetector(
+                        onTap: () => setDlgState(() => stepIdx = i),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 5,
+                          ),
+                          decoration: BoxDecoration(
+                            color: hasImg
+                                ? Colors.green.withOpacity(0.25)
+                                : (isSel
+                                    ? const Color(0xFFFF007F).withOpacity(0.25)
+                                    : const Color(0xFF1E143B)),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color: hasImg
+                                  ? Colors.greenAccent
+                                  : (isSel
+                                      ? const Color(0xFFFF007F)
+                                      : Colors.white24),
+                            ),
+                          ),
+                          child: Text(
+                            "${hasImg ? '✓ ' : ''}${st['label']}",
+                            style: TextStyle(
+                              color: hasImg ? Colors.greenAccent : Colors.white,
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      );
+                    }),
+                  ),
+                  const SizedBox(height: 14),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFFFF007F),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                      onPressed: () async {
+                        final XFile? pic = await picker.pickImage(
+                          source: ImageSource.camera,
+                          preferredCameraDevice: CameraDevice.front,
+                          imageQuality: 85,
+                        );
+                        if (pic != null) {
+                          setDlgState(() {
+                            capturedAngles[currentKey] = File(pic.path);
+                            // Auto-advance to next uncaptured angle
+                            for (int next = 0;
+                                next < _faceAngleSteps.length;
+                                next++) {
+                              final nk = _faceAngleSteps[next]['key']!;
+                              if (!capturedAngles.containsKey(nk)) {
+                                stepIdx = next;
+                                break;
+                              }
+                            }
+                          });
+                        }
+                      },
+                      icon: const Icon(Icons.camera_alt, color: Colors.white),
+                      label: Text(
+                        currentFile != null
+                            ? "Retake ${current['label']} Pose"
+                            : "📸 Capture: ${current['label']}",
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dlgCtx, false),
+                child: const Text(
+                  "रद्द करें",
+                  style: TextStyle(color: Colors.white60),
+                ),
+              ),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: allDone
+                      ? Colors.green
+                      : const Color(0xFF00E5FF),
+                ),
+                onPressed: capturedAngles.isEmpty
+                    ? null
+                    : () => Navigator.pop(dlgCtx, true),
+                child: Text(
+                  allDone
+                      ? "आगे बढ़ें (5/5 Ready)"
+                      : "Save (${capturedAngles.length}/5)",
+                  style: TextStyle(
+                    color: allDone ? Colors.white : Colors.black,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+
+    if (completed == true && capturedAngles.isNotEmpty && mounted) {
+      await _showCharacterDetailsDialog(capturedAngles);
+    }
+  }
+
+  Future<void> _openGalleryMultiAngleDialog() async {
+    final picker = ImagePicker();
+    final Map<String, File> selectedAngles = {};
+
+    if (!mounted) return;
+    final bool? proceed = await showDialog<bool>(
+      context: context,
+      builder: (dlgCtx) => StatefulBuilder(
+        builder: (ctx, setDlgState) {
+          final int count = selectedAngles.length;
+          return AlertDialog(
+            backgroundColor: const Color(0xFF140D29),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(18),
+              side: const BorderSide(color: Color(0xFF00E5FF)),
+            ),
+            title: Text(
+              "🖼️ Multiple Angles चुनें ($count/5)",
+              style: const TextStyle(
+                color: Color(0xFFFFD600),
+                fontSize: 15,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    "कम से कम Front फोटो चुनें। 5 एंगल (Front, Left, Right, Up, Down) चुनने से 3D Face Profile लॉक होता है।",
+                    style: TextStyle(color: Colors.white70, fontSize: 11),
+                  ),
+                  const SizedBox(height: 12),
+                  ..._faceAngleSteps.map((step) {
+                    final k = step['key']!;
+                    final File? file = selectedAngles[k];
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      decoration: BoxDecoration(
+                        color: file != null
+                            ? Colors.green.withOpacity(0.14)
+                            : const Color(0xFF1F1440),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: file != null
+                              ? Colors.greenAccent
+                              : Colors.white24,
+                        ),
+                      ),
+                      child: ListTile(
+                        dense: true,
+                        leading: file != null
+                            ? ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: Image.file(
+                                  file,
+                                  width: 42,
+                                  height: 42,
+                                  fit: BoxFit.cover,
+                                ),
+                              )
+                            : CircleAvatar(
+                                backgroundColor: const Color(0xFF0B0718),
+                                child: Icon(
+                                  _angleIcon(k),
+                                  color: const Color(0xFF00E5FF),
+                                  size: 20,
+                                ),
+                              ),
+                        title: Text(
+                          "${step['label']}${k == 'front' ? ' *' : ''}",
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 13,
+                          ),
+                        ),
+                        subtitle: Text(
+                          step['hi']!,
+                          style: const TextStyle(
+                            color: Colors.white60,
+                            fontSize: 11,
+                          ),
+                        ),
+                        trailing: Icon(
+                          file != null ? Icons.check_circle : Icons.add_a_photo,
+                          color: file != null
+                              ? Colors.greenAccent
+                              : const Color(0xFFFFD600),
+                        ),
+                        onTap: () async {
+                          final XFile? pic = await picker.pickImage(
+                            source: ImageSource.gallery,
+                            imageQuality: 85,
+                          );
+                          if (pic != null) {
+                            setDlgState(() {
+                              selectedAngles[k] = File(pic.path);
+                            });
+                          }
+                        },
+                      ),
+                    );
+                  }),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dlgCtx, false),
+                child: const Text(
+                  "Cancel",
+                  style: TextStyle(color: Colors.white60),
+                ),
+              ),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFFFF007F),
+                ),
+                onPressed: selectedAngles.isEmpty
+                    ? null
+                    : () => Navigator.pop(dlgCtx, true),
+                child: Text(
+                  count >= 5
+                      ? "✅ 5-Angle Ready — आगे बढ़ें"
+                      : "आगे बढ़ें ($count Angles)",
+                  style: const TextStyle(color: Colors.white),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+
+    if (proceed == true && selectedAngles.isNotEmpty && mounted) {
+      await _showCharacterDetailsDialog(selectedAngles);
+    }
+  }
+
+  Future<void> _showCharacterDetailsDialog(
+    Map<String, File> angleFiles,
+  ) async {
+    final File primaryPhoto =
+        angleFiles['front'] ?? angleFiles.values.first;
+    final TextEditingController nameCtrl = TextEditingController();
     String selectedVoice = "hi-IN-MadhurNeural";
     String selectedPitch = "normal";
+    final int angleCount = angleFiles.length;
 
     if (!mounted) return;
     await showDialog(
@@ -1236,17 +1871,40 @@ class _CinePopHomeState extends State<CinePopHome> {
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF1B1236),
         title: const Text(
-          "🎭 कैरेक्टर जोड़ें",
-          style: TextStyle(color: Color(0xFFFFD600)),
+          "🎭 कैरेक्टर का नाम और आवाज़ चुनें",
+          style: TextStyle(color: Color(0xFFFFD600), fontSize: 15),
         ),
         content: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
+              if (angleCount >= 5)
+                Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.only(bottom: 10),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.green.withOpacity(0.18),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: Colors.greenAccent),
+                  ),
+                  child: const Text(
+                    "✅ 5-Angle 3D Face Profile Ready!",
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.greenAccent,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
               TextField(
                 controller: nameCtrl,
                 decoration: const InputDecoration(
-                  labelText: "नाम (जैसे: Hero, Villain)",
+                  labelText: "नाम (जैसे: Vikram, Hero, Villain)",
                 ),
               ),
               const SizedBox(height: 10),
@@ -1293,17 +1951,30 @@ class _CinePopHomeState extends State<CinePopHome> {
               backgroundColor: const Color(0xFFFF007F),
             ),
             onPressed: () {
-              if (nameCtrl.text.isNotEmpty) {
-                setState(() {
-                  characters.add({
-                    "name": nameCtrl.text.trim(),
-                    "voice": selectedVoice,
-                    "pitch": selectedPitch,
-                    "file": File(photo.path),
-                  });
+              final cleanName = nameCtrl.text.trim().isEmpty
+                  ? "Actor ${characters.length + 1}"
+                  : nameCtrl.text.trim();
+              setState(() {
+                characters.add({
+                  "name": cleanName,
+                  "voice": selectedVoice,
+                  "pitch": selectedPitch,
+                  "file": primaryPhoto,
+                  "angles": Map<String, File>.from(angleFiles),
+                  "is5AngleReady": angleCount >= 5,
                 });
-                _updateDataEstimate();
-                Navigator.pop(ctx);
+              });
+              _updateDataEstimate();
+              Navigator.pop(ctx);
+              if (angleCount >= 5 && mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(
+                      "✅ $cleanName: 5-Angle 3D Face Profile Ready!",
+                    ),
+                    backgroundColor: Colors.green.shade700,
+                  ),
+                );
               }
             },
             child: const Text(
@@ -1370,10 +2041,32 @@ class _CinePopHomeState extends State<CinePopHome> {
         request.fields['admin_pin'] = _verifiedAdminPin;
       }
 
-      for (var c in characters) {
+      final List<Map<String, dynamic>> angleMetaList = [];
+      for (int i = 0; i < characters.length; i++) {
+        final c = characters[i];
         request.files.add(
           await http.MultipartFile.fromPath('images', (c['file'] as File).path),
         );
+        final dynamic rawAngles = c['angles'];
+        if (rawAngles is Map) {
+          for (final entry in rawAngles.entries) {
+            final angKey = entry.key.toString();
+            final angFile = entry.value;
+            if (angFile is File) {
+              request.files.add(
+                await http.MultipartFile.fromPath('angle_images', angFile.path),
+              );
+              angleMetaList.add({
+                "char_index": i,
+                "char_name": c['name'].toString(),
+                "angle": angKey,
+              });
+            }
+          }
+        }
+      }
+      if (angleMetaList.isNotEmpty) {
+        request.fields['angle_meta'] = jsonEncode(angleMetaList);
       }
 
       if (customBgFile != null) {
@@ -2788,12 +3481,12 @@ class _CinePopHomeState extends State<CinePopHome> {
         ),
         const SizedBox(height: 16),
 
-        // 2. Character Photos
+        // 2. Character Photos + Guided 5-Angle 3D Face Scan
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             const Text(
-              "2. कैरेक्टर फोटोज़:",
+              "2. कैरेक्टर 3D फेस स्कैन:",
               style: TextStyle(
                 fontWeight: FontWeight.bold,
                 color: Color(0xFF00E5FF),
@@ -2801,37 +3494,109 @@ class _CinePopHomeState extends State<CinePopHome> {
             ),
             ElevatedButton.icon(
               style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF7000FF),
+                backgroundColor: const Color(0xFFFF007F),
               ),
               onPressed: _addCharacter,
-              icon: const Icon(Icons.add_a_photo, color: Colors.white),
+              icon: const Icon(Icons.face_retouching_natural, color: Colors.white),
               label: const Text(
-                "कैरेक्टर जोड़ें",
-                style: TextStyle(color: Colors.white),
+                "🎭 3D Face Scan / जोड़ें",
+                style: TextStyle(color: Colors.white, fontSize: 12),
               ),
             ),
           ],
         ),
-        Wrap(
-          spacing: 8,
-          children: characters
-              .map(
-                (c) => Chip(
-                  backgroundColor: const Color(0xFF281854),
-                  avatar: CircleAvatar(
-                    backgroundImage: FileImage(c['file'] as File),
+        const SizedBox(height: 8),
+        if (characters.isEmpty)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1B1236),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.white12),
+            ),
+            child: const Text(
+              "🎭 ऊपर '3D Face Scan / जोड़ें' दबाकर 5 एंगल (Front, Left, Right, Up, Down) स्कैन करें या गैलरी से फोटो चुनें।",
+              style: TextStyle(color: Colors.white60, fontSize: 11),
+            ),
+          )
+        else
+          Column(
+            children: characters.map((c) {
+              final Map<String, File> angMap = c['angles'] is Map
+                  ? Map<String, File>.from(c['angles'] as Map)
+                  : {};
+              final int angCount = angMap.length;
+              final bool is5Ready =
+                  (c['is5AngleReady'] == true) || angCount >= 5;
+              return Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF211447),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: is5Ready
+                        ? Colors.greenAccent.withOpacity(0.6)
+                        : Colors.white12,
                   ),
-                  label: Text(
-                    "${c['name']} (${c['pitch'] ?? 'normal'})",
-                  ),
-                  onDeleted: () {
-                    setState(() => characters.remove(c));
-                    _updateDataEstimate();
-                  },
                 ),
-              )
-              .toList(),
-        ),
+                child: Row(
+                  children: [
+                    CircleAvatar(
+                      radius: 22,
+                      backgroundImage: FileImage(c['file'] as File),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            "${c['name']} (${c['pitch'] ?? 'normal'})",
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          if (is5Ready)
+                            const Text(
+                              "✅ 5-Angle 3D Face Profile Ready!",
+                              style: TextStyle(
+                                color: Colors.greenAccent,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 11,
+                              ),
+                            )
+                          else
+                            Text(
+                              "${angCount > 0 ? angCount : 1}/5 Angles Locked",
+                              style: const TextStyle(
+                                color: Color(0xFF00E5FF),
+                                fontSize: 11,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(
+                        Icons.delete_outline,
+                        color: Colors.redAccent,
+                        size: 20,
+                      ),
+                      onPressed: () {
+                        setState(() => characters.remove(c));
+                        _updateDataEstimate();
+                      },
+                    ),
+                  ],
+                ),
+              );
+            }).toList(),
+          ),
         const SizedBox(height: 16),
 
         // 3. 2-Tab Story Writer Mode (AI vs Manual Custom Script)
