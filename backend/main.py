@@ -13,8 +13,10 @@ import shutil
 import asyncio
 import datetime
 import subprocess
+import base64
 import urllib.parse
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Union
 import requests
 import edge_tts
@@ -27,9 +29,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 try:
     from gradio_client import Client, handle_file
+    GradioClient = Client
     GRADIO_AVAILABLE = True
 except Exception:
     Client = None
+    GradioClient = None
     handle_file = None
     GRADIO_AVAILABLE = False
 
@@ -433,11 +437,11 @@ def _get_or_create_role_portrait(role_kind: str, proj_dir: str) -> Optional[str]
     }
     encoded = urllib.parse.quote(prompt, safe="")
     for url in (
-        f"https://pollinations.ai/p/{encoded}?width=768&height=768&model=flux&nologo=true&seed={seed_num}",
+        f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=768&model=flux&nologo=true&seed={seed_num}",
         f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=768&model=turbo&nologo=true&seed={seed_num}",
     ):
         try:
-            resp = requests.get(url, headers=headers, timeout=8)
+            resp = requests.get(url, headers=headers, timeout=15)
             ctype = str(resp.headers.get("content-type", "")).lower()
             if resp.status_code == 200 and len(resp.content) > 5000 and ("image" in ctype or resp.content[:2] in (b"\xff\xd8", b"\x89P")):
                 save_upright_image_bytes(resp.content, out_path, max_side=960)
@@ -846,7 +850,7 @@ def home():
     return {
         "app": "CinePop AI — Pocket Bollywood & Face-Swap Studio",
         "status": "100% Live",
-        "engine_version": "v9-multi-character-pocketfm-drama-engine",
+        "engine_version": "v10-photorealistic-indian-tv-serial-drama-engine",
         "devanagari_font": find_devanagari_font_path(bold=True) or "not-found",
         "gemini_configured": bool(GEMINI_API_KEY),
         "opencv_faceswap": OPENCV_AVAILABLE,
@@ -2159,124 +2163,69 @@ def _try_hf_scene_faceswap(scene_img_path: str, actor_face_path: str, out_path: 
     return None
 
 
-def render_location_backdrop(
-    location_key: str,
-    mood: str,
-    prompt_hint: str = "",
-    aspect_ratio: str = "16:9",
-    include_hero: bool = False,
-    hero_role: str = "hero",
-    shot_variant: str = "main",
-) -> Image.Image:
-    """
-    Generate a FULL-SCREEN Pocket FM / Moj 3D Graphic-Novel / Realistic Bollywood drama scene
-    at exact 9:16 (720x1280) or 16:9 (1280x720) via 100% FREE UNLIMITED `image.pollinations.ai` Flux model.
-    Supports distinct multi-shot camera variants (`establishing`, `action_mid`, `closeup_drama`) so every
-    scene has TRUE multi-angle moving cinema action — ZERO cartoon buildings and ZERO paid APIs!
-    """
-    W, H = get_aspect_dimensions(aspect_ratio)
-    loc_descriptions = {
-        "village_field": "golden sunset Indian mustard wheat field rural cinematic landscape, dramatic clouds, warm lens flare, 3D graphic novel Bollywood drama scene",
-        "haunted_mansion": "ancient spooky Indian royal haveli mansion at night in blue fog and moonlight, dramatic horror thriller cinema atmosphere, photorealistic",
-        "mumbai_rain": "Mumbai city street in heavy monsoon rain at night, wet asphalt neon reflections, dramatic Bollywood action cinema scene, bokeh",
-        "deep_jungle": "dense misty Indian forest jungle with dramatic volumetric sunbeams through trees, cinematic adventure drama scene",
-        "police_station": "dramatic dark Indian police headquarters interior at night with red and blue siren bokeh reflections, crime thriller cinema scene",
-        "outer_space": "deep cosmic nebula and glowing planet in outer space, realistic IMAX sci-fi drama backdrop",
-        "royal_palace": "grand Rajasthani Indian royal palace hall lit with golden chandeliers and torches, epic Pocket FM Bollywood drama set",
-        "mountains": "dramatic snow-capped Himalayan mountain peaks in twilight mist, epic Bollywood cinema landscape",
-        "desert_fort": "majestic Rajasthan desert sandstone fort at fiery sunset, golden dust atmosphere, cinema background",
-        "courtroom": "dramatic wood-paneled Indian courtroom hall with warm directional sunlight beams, high-stakes Bollywood drama set",
-        "cyber_lab": "dark futuristic high-tech holographic command center lab with cyan rim lighting, sci-fi thriller set",
-        "city_street": "dramatic Indian metropolitan city highway at night with glowing neon bokeh lights and wet road, Bollywood action thriller scene",
-    }
-    desc = loc_descriptions.get(location_key, loc_descriptions["city_street"])
-    hint_clean = re.sub(r"[^a-zA-Z0-9 ,.-]", "", (prompt_hint or "")).strip()[:76]
-    hero_tag = f"hero_{hero_role}" if include_hero else "bgonly"
-    shot_clean = re.sub(r"[^a-zA-Z0-9_]", "", shot_variant or "main")[:18] or "main"
-
-    # Cache by (location, mood, dimensions, role, shot_variant, action_hash) so multi-shot motion stays fast & varied
-    hint_sig = str(abs(hash(hint_clean[:36])) % 17) if hint_clean else "0"
-    cache_seed_str = f"{location_key}_{mood}_{W}x{H}_{hero_tag}_{shot_clean}_{hint_sig}"
-    cache_key = re.sub(r"[^a-zA-Z0-9_]", "_", cache_seed_str)[:84]
-    cache_path = f"/tmp/cinepop_scene_{cache_key}.jpg"
-    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 8000:
-        try:
-            return open_upright_image(cache_path).resize((W, H), Image.Resampling.LANCZOS)
-        except Exception:
-            pass
-
-    shot_framing_map = {
-        "establishing": "wide cinematic establishing action shot, dynamic full-body movement in motion, sweeping camera perspective",
-        "action_mid": "dynamic mid-action tracking shot, dramatic body movement and intense gesture, cinematic motion energy",
-        "closeup_drama": "dramatic Bollywood close-up portrait facing camera, intense expressive eyes, shallow depth of field",
-        "main": "medium cinematic Bollywood drama shot facing camera, intense expression, dynamic lighting",
-    }
-    shot_desc = shot_framing_map.get(shot_clean, shot_framing_map["main"])
-
-    role_subject_map = {
-        "villain": "dramatic close-up of intimidating Indian Bollywood villain man with dark beard and fierce scowl in black blazer, intense eyes facing camera",
-        "saas": "dramatic close-up of wealthy Indian matriarch saas woman in royal silk saree with heavy gold jewelry, sharp angry expression facing camera",
-        "female": "dramatic close-up of expressive young Indian Bollywood heroine actress in elegant ethnic attire, emotional eyes facing camera",
-        "narrator": "dramatic wide establishing Bollywood cinema atmosphere shot with moody silhouette and rich cinematic lighting",
-        "crowd": "dramatic Indian cinema crowd characters reacting intensely in atmospheric lighting",
-        "hero": "dramatic close-up of handsome Indian Bollywood action drama hero wearing stylish jacket, intense confident expression facing camera",
-    }
-    subject_prefix = (
-        f"{role_subject_map.get(hero_role, role_subject_map['hero'])}, {shot_desc}, "
-        if include_hero
-        else f"{shot_desc}, "
-    )
-    scene_detail = f"{hint_clean}, " if hint_clean else ""
-    full_prompt = (
-        f"{subject_prefix}{scene_detail}{desc}, {mood} dramatic lighting, "
-        f"4K photorealistic Bollywood cinema film frame, anamorphic bokeh, ultra detailed, no text, no watermark"
-    )
-    encoded = urllib.parse.quote(full_prompt, safe="")
-    seed_val = abs(hash(cache_key)) % 99999
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "Referer": "https://pollinations.ai/",
-    }
-    cfg = get_runtime_ai_config()
-    if cfg.get("enable_pollinations", True):
-        pref_model = cfg.get("pollinations_model", "flux")
-        alt_model = "turbo" if pref_model != "turbo" else "flux"
-        # Primary mirror uses pollinations.ai/p/ (avoids image.pollinations.ai rate limits), then fallback mirrors
-        candidate_urls = [
-            (f"https://pollinations.ai/p/{encoded}?width={W}&height={H}&model={pref_model}&nologo=true&seed={seed_val}", 9),
-            (f"https://pollinations.ai/p/{encoded}?width={W}&height={H}&model={alt_model}&nologo=true&seed={(seed_val + 73) % 99999}", 8),
-            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model={alt_model}&nologo=true&seed={(seed_val + 137) % 99999}", 7),
-        ]
-        for url, t_sec in candidate_urls:
-            try:
-                resp = requests.get(url, headers=headers, timeout=t_sec, allow_redirects=True)
-                ctype = str(resp.headers.get("content-type", "")).lower()
-                if (
-                    resp.status_code == 200
-                    and len(resp.content) > 8000
-                    and ("image" in ctype or resp.content[:2] in (b"\xff\xd8", b"\x89P") or resp.content[:4] == b"RIFF")
-                ):
-                    bg_img = open_upright_image(resp.content).resize((W, H), Image.Resampling.LANCZOS)
-                    bg_img.save(cache_path, "JPEG", quality=92)
-                    return bg_img
-            except Exception:
-                continue
-
-    # Mirror 2: Free HuggingFace Fast Image Spaces via gradio_client (FLUX.1-schnell, SDXL-Lightning, SDXL-Turbo, Playground v2.5)
-    hf_img = _try_hf_fast_image_spaces(full_prompt, W, H, seed_val, cfg)
-    if hf_img is not None:
-        try:
-            hf_img.save(cache_path, "JPEG", quality=92)
-        except Exception:
-            pass
-        return hf_img
-
-    # Mirror 3: Rich Illustrated Bollywood Character & Set Fallback (NEVER a blank blurred gradient!)
-    return _render_illustrated_bollywood_fallback(W, H, location_key, mood, hero_role, include_hero, cache_key)
-
-
+_GEMINI_IMG_MODEL_COOLDOWN: dict[str, float] = {}
 _HF_IMG_SPACE_COOLDOWN: dict[str, float] = {}
+
+
+def _try_gemini_photorealistic_image(prompt: str, W: int, H: int) -> Optional[Image.Image]:
+    """
+    Priority 1: Generate a 100% photorealistic live-action Indian TV serial photograph
+    via Google GenAI SDK (`imagen-3.0-generate-002` -> `gemini-2.5-flash-image`) when GEMINI_API_KEY is active.
+    """
+    if not client:
+        return None
+    aspect = "9:16" if H > W else "16:9"
+    now_t = time.time()
+
+    # 1A: Try Imagen 3 (`imagen-3.0-generate-002`)
+    if now_t - _GEMINI_IMG_MODEL_COOLDOWN.get("imagen-3.0-generate-002", 0.0) > 600:
+        def _call_imagen():
+            return client.models.generate_images(
+                model="imagen-3.0-generate-002",
+                prompt=prompt,
+                config={
+                    "number_of_images": 1,
+                    "aspect_ratio": aspect,
+                    "output_mime_type": "image/jpeg",
+                },
+            )
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                res = pool.submit(_call_imagen).result(timeout=18.0)
+            gen_imgs = getattr(res, "generated_images", None) or []
+            if gen_imgs:
+                img_obj = getattr(gen_imgs[0], "image", None)
+                raw_bytes = getattr(img_obj, "image_bytes", None)
+                if raw_bytes and len(raw_bytes) > 5000:
+                    return open_upright_image(raw_bytes).resize((W, H), Image.Resampling.LANCZOS)
+        except Exception:
+            _GEMINI_IMG_MODEL_COOLDOWN["imagen-3.0-generate-002"] = time.time()
+
+    # 1B: Try Gemini Flash Image (`gemini-2.5-flash-image`)
+    if now_t - _GEMINI_IMG_MODEL_COOLDOWN.get("gemini-2.5-flash-image", 0.0) > 600:
+        def _call_flash_img():
+            return client.models.generate_content(
+                model="gemini-2.5-flash-image",
+                contents=prompt,
+                config={"response_modalities": ["IMAGE"]},
+            )
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                res = pool.submit(_call_flash_img).result(timeout=18.0)
+            candidates = getattr(res, "candidates", None) or []
+            for cand in candidates:
+                parts = getattr(getattr(cand, "content", None), "parts", None) or []
+                for part in parts:
+                    inline = getattr(part, "inline_data", None)
+                    data = getattr(inline, "data", None) if inline else None
+                    if data:
+                        raw_bytes = base64.b64decode(data) if isinstance(data, str) else bytes(data)
+                        if len(raw_bytes) > 5000:
+                            return open_upright_image(raw_bytes).resize((W, H), Image.Resampling.LANCZOS)
+        except Exception:
+            _GEMINI_IMG_MODEL_COOLDOWN["gemini-2.5-flash-image"] = time.time()
+
+    return None
 
 
 def _extract_gradio_image_path(res) -> Optional[str]:
@@ -2296,17 +2245,17 @@ def _extract_gradio_image_path(res) -> Optional[str]:
 
 
 def _try_hf_fast_image_spaces(prompt: str, W: int, H: int, seed_val: int, cfg: dict) -> Optional[Image.Image]:
-    """Try fast free HuggingFace text-to-image Spaces with strict timeout & circuit breaker."""
+    """Try fast free HuggingFace photorealistic text-to-image Spaces with strict timeout & circuit breaker."""
     if not GRADIO_AVAILABLE or not cfg.get("enable_public_hf_spaces", True):
         return None
     hf_tok = (cfg.get("hf_token") or os.getenv("HF_TOKEN") or "").strip() or None
-    timeout_s = max(6, min(12, int(cfg.get("space_timeout_sec", 8)) + 2))
+    timeout_s = max(8, min(14, int(cfg.get("space_timeout_sec", 8)) + 4))
     now_t = time.time()
     space_specs = [
         ("black-forest-labs/FLUX.1-schnell", lambda c: c.predict(prompt=prompt, seed=seed_val, randomize_seed=False, width=min(1024, W), height=min(1024, H), num_inference_steps=4, api_name="/infer")),
         ("ByteDance/SDXL-Lightning", lambda c: c.predict(prompt, "4-Step", api_name="/generate_image")),
         ("stabilityai/sdxl-turbo", lambda c: c.predict(prompt, api_name="/predict")),
-        ("playgroundai/playground-v2.5-1024px-aesthetic", lambda c: c.predict(prompt=prompt, negative_prompt="blurry, text, watermark, cartoon", use_negative_prompt=True, seed=seed_val, width=min(1024, W), height=min(1024, H), guidance_scale=3.0, randomize_seed=False, api_name="/run")),
+        ("playgroundai/playground-v2.5-1024px-aesthetic", lambda c: c.predict(prompt=prompt, negative_prompt="cartoon, anime, illustration, 2d drawing, painting, blurry, text, watermark", use_negative_prompt=True, seed=seed_val, width=min(1024, W), height=min(1024, H), guidance_scale=3.0, randomize_seed=False, api_name="/run")),
     ]
     for space_id, invoke_fn in space_specs:
         if now_t - _HF_IMG_SPACE_COOLDOWN.get(space_id, 0.0) < 300:
@@ -2327,188 +2276,169 @@ def _try_hf_fast_image_spaces(prompt: str, W: int, H: int, seed_val: int, cfg: d
     return None
 
 
-def _render_illustrated_bollywood_fallback(
-    W: int,
-    H: int,
+def _reuse_cached_photorealistic_scene(W: int, H: int, hero_role: str, seed_val: int) -> Optional[Image.Image]:
+    """If an online image fetch transiently fails, reuse a real cached photorealistic frame with subtle framing variation (ZERO 2D cartoons!)."""
+    try:
+        candidates = [
+            f for f in os.listdir("/tmp")
+            if f.startswith("cinepop_tv_") and f.endswith(".jpg") and f"_{W}x{H}_" in f
+        ]
+        if not candidates:
+            return None
+        role_matches = [f for f in candidates if f"_hero_{hero_role}_" in f]
+        pool = role_matches if role_matches else candidates
+        chosen = os.path.join("/tmp", pool[seed_val % len(pool)])
+        if os.path.exists(chosen) and os.path.getsize(chosen) > 8000:
+            img = open_upright_image(chosen).resize((W, H), Image.Resampling.LANCZOS)
+            # Subtle cinematic crop variation so consecutive shots stay dynamic
+            if seed_val % 2 == 1:
+                margin_x = max(8, int(W * 0.04))
+                margin_y = max(8, int(H * 0.04))
+                img = img.crop((margin_x, margin_y, W - margin_x, H - margin_y)).resize((W, H), Image.Resampling.LANCZOS)
+            return img
+    except Exception:
+        pass
+    return None
+
+
+def render_location_backdrop(
     location_key: str,
     mood: str,
-    hero_role: str,
-    include_hero: bool,
-    cache_key: str,
+    prompt_hint: str = "",
+    aspect_ratio: str = "16:9",
+    include_hero: bool = False,
+    hero_role: str = "hero",
+    shot_variant: str = "main",
 ) -> Image.Image:
     """
-    Rich graphic-novel Bollywood cinema frame with architectural pillars/set, volumetric spotlights,
-    dramatic illustrated character portrait (Hero/Heroine/Villain/Saas/Narrator), and rain/sparks VFX
-    so the screen NEVER looks like an empty blurred gradient even when offline!
+    Generate a 100% PHOTOREALISTIC Indian TV Serial (Dangal TV / StarPlus Live-Action Drama) frame
+    at exact 9:16 (720x1280) or 16:9 (1280x720) — ZERO 2D cartoon drawings!
+      Priority 1: Google GenAI SDK (`imagen-3.0-generate-002` / `gemini-2.5-flash-image`) when GEMINI_API_KEY is set.
+      Priority 2: Working Pollinations Real Photo API (`https://image.pollinations.ai/prompt/...`, `flux` & `turbo`, timeout=15s).
+      Priority 3: Free HuggingFace Photorealistic Spaces (`FLUX.1-schnell`, `SDXL-Lightning`, `SDXL-Turbo`, `Playground v2.5`).
+      Priority 4: Cached photorealistic still / clean dark film plate (NEVER 2D drawn faces!).
     """
-    bg = Image.new("RGB", (W, H), (14, 10, 22))
-    palettes = {
-        "village_field": ((38, 22, 16), (134, 68, 24)),
-        "haunted_mansion": ((8, 14, 28), (24, 40, 62)),
-        "mumbai_rain": ((10, 20, 38), (22, 54, 82)),
-        "deep_jungle": ((8, 26, 18), (22, 64, 42)),
-        "police_station": ((14, 16, 34), (42, 22, 50)),
-        "outer_space": ((6, 8, 26), (26, 18, 62)),
-        "royal_palace": ((42, 14, 18), (124, 58, 22)),
-        "mountains": ((14, 24, 46), (62, 78, 108)),
-        "desert_fort": ((52, 22, 12), (146, 72, 22)),
-        "courtroom": ((30, 18, 12), (78, 46, 24)),
-        "cyber_lab": ((6, 18, 36), (14, 62, 92)),
-        "city_street": ((14, 16, 32), (48, 26, 54)),
+    W, H = get_aspect_dimensions(aspect_ratio)
+    loc_descriptions = {
+        "royal_palace": "luxurious Indian royal haveli living room hall with crystal golden chandelier, carved marble pillars, velvet sofas, warm Dangal TV StarPlus serial lighting",
+        "city_street": "luxurious Indian family mansion living hall with grand chandelier, teak staircase and warm golden sconces, Indian Hindi TV serial set",
+        "haunted_mansion": "grand heritage Indian haveli mansion hall at night with moody chandelier glow and carved wooden arches, Indian Hindi TV thriller drama set",
+        "mumbai_rain": "upscale Mumbai bungalow living room with rain-streaked French windows and warm interior drama lighting, Indian Hindi TV serial set",
+        "village_field": "traditional wealthy Indian rural haveli courtyard at golden sunset with warm cinematic sunlight, Indian Hindi TV drama serial set",
+        "deep_jungle": "misty Indian estate forest road at twilight with dramatic cinematic headlights, Indian live-action thriller TV drama",
+        "police_station": "realistic Indian police station interior with wooden desk and dramatic overhead lights, Indian Hindi crime TV serial set",
+        "outer_space": "luxurious modern Indian billionaire penthouse hall overlooking night city skyline, Indian Hindi TV drama set",
+        "mountains": "luxury Himalayan resort villa living room with fireplace and mountain view window, Indian Hindi TV drama set",
+        "desert_fort": "grand Rajasthani heritage haveli palace courtyard at golden hour with sandstone arches, Indian Hindi TV serial set",
+        "courtroom": "realistic Indian wood-paneled courtroom interior with dramatic sunlight shafts, Indian Hindi TV drama serial set",
+        "cyber_lab": "modern Indian corporate billionaire boardroom office with glass walls and city skyline, Indian Hindi TV drama set",
     }
-    top_c, bot_c = palettes.get(location_key, palettes["royal_palace"])
-    _draw_vertical_gradient(bg, top_c, bot_c)
+    desc = loc_descriptions.get(location_key, loc_descriptions["royal_palace"])
+    hint_clean = re.sub(r"[^a-zA-Z0-9 ,.-]", "", (prompt_hint or "")).strip()[:64]
+    hero_tag = f"hero_{hero_role}" if include_hero else "bgonly"
+    shot_clean = re.sub(r"[^a-zA-Z0-9_]", "", shot_variant or "main")[:18] or "main"
 
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(layer)
-    rim = MOOD_RIM_COLORS.get(mood, (255, 165, 60))
-    rng = random.Random(hash(cache_key) & 0xFFFFFFFF)
+    hint_sig = str(abs(hash(hint_clean[:32])) % 11) if hint_clean else "0"
+    cache_seed_str = f"tv_{location_key}_{mood}_{W}x{H}_{hero_tag}_{shot_clean}_{hint_sig}"
+    cache_key = re.sub(r"[^a-zA-Z0-9_]", "_", cache_seed_str)[:84]
+    cache_path = f"/tmp/cinepop_{cache_key}.jpg"
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 8000:
+        try:
+            return open_upright_image(cache_path).resize((W, H), Image.Resampling.LANCZOS)
+        except Exception:
+            pass
 
-    # 1. Architectural Bollywood Set (Palace / Haveli Pillars, Arches & Chandelier Glow)
-    pillar_w = max(36, int(W * 0.09))
-    for px in (int(W * 0.04), W - int(W * 0.04) - pillar_w):
-        draw.rectangle([px, 0, px + pillar_w, H], fill=(10, 8, 18, 195))
-        draw.rectangle([px + 4, 0, px + 8, H], fill=(rim[0], rim[1], rim[2], 90))
-        draw.rectangle([px + pillar_w - 8, 0, px + pillar_w - 4, H], fill=(rim[0], rim[1], rim[2], 65))
-    # Grand royal arch across top
-    draw.arc([int(W * 0.08), -int(H * 0.10), int(W * 0.92), int(H * 0.28)], start=0, end=180, fill=(255, 210, 110, 130), width=5)
-    # Glowing chandelier / moon orb at upper center
-    orb_r = int(min(W, H) * 0.14)
-    draw.ellipse([W // 2 - orb_r, int(H * 0.06), W // 2 + orb_r, int(H * 0.06) + orb_r * 2], fill=(255, 225, 150, 58))
+    shot_framing_map = {
+        "wide_group": "wide live-action TV serial group confrontation shot showing Indian family members standing inside the grand haveli hall, 35mm cinema lens",
+        "establishing": "wide live-action Indian TV serial establishing shot inside the luxurious haveli living room with real actors standing in dramatic tension, 35mm DSLR lens",
+        "closeup_drama": "dramatic Indian TV serial tight close-up portrait from chest up facing camera, expressive eyes and natural lip pose, 85mm cinema portrait lens, shallow depth of field",
+        "reaction_cut": "dramatic Indian TV serial emotional reaction close-up angle, intense facial expression, cinematic sidelighting, 85mm lens",
+        "action_mid": "dynamic medium live-action Indian TV serial confrontation shot, intense gesturing and eye contact, 50mm cinema lens",
+        "main": "medium close-up live-action Indian Hindi TV serial shot facing camera, natural realistic expression, 85mm cinema lens",
+    }
+    shot_desc = shot_framing_map.get(shot_clean, shot_framing_map["closeup_drama"])
 
-    # 2. Volumetric Diagonal Cinema Spotlights
-    spot = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    sdraw = ImageDraw.Draw(spot)
-    sdraw.polygon(
-        [(int(W * 0.12), 0), (int(W * 0.34), 0), (int(W * 0.82), H), (int(W * 0.42), H)],
-        fill=(rim[0], rim[1], rim[2], 42),
-    )
-    sdraw.polygon(
-        [(int(W * 0.66), 0), (int(W * 0.88), 0), (int(W * 0.56), H), (int(W * 0.18), H)],
-        fill=(255, 210, 120, 34),
-    )
-    spot = spot.filter(ImageFilter.GaussianBlur(radius=28))
-    bg = Image.alpha_composite(bg.convert("RGBA"), spot)
-    bg = Image.alpha_composite(bg, layer)
-
-    # 3. Dramatic Illustrated Bollywood Character Portrait (Centered & Crisp!)
-    if include_hero:
-        char_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        cd = ImageDraw.Draw(char_layer)
-        cx = W // 2
-        head_y = int(H * (0.37 if H > W else 0.40))
-        hr = int(min(W, H) * (0.175 if H > W else 0.19))
-
-        # Backlight aura behind character silhouette
-        aura = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        ad = ImageDraw.Draw(aura)
-        aura_col = {
-            "villain": (220, 36, 48, 145),
-            "saas": (235, 145, 35, 140),
-            "female": (255, 110, 170, 135),
-            "narrator": (90, 175, 255, 125),
-        }.get(hero_role, (255, 195, 70, 145))
-        ad.ellipse([cx - int(hr * 1.9), head_y - int(hr * 1.5), cx + int(hr * 1.9), head_y + int(hr * 2.4)], fill=aura_col)
-        aura = aura.filter(ImageFilter.GaussianBlur(radius=42))
-        bg = Image.alpha_composite(bg, aura)
-
-        # Skin, hair & wardrobe palette tailored per speaking role
-        role_pal = {
-            "hero":     ((218, 162, 124), (24, 18, 20), (24, 32, 58),  (255, 208, 92)),
-            "female":   ((232, 178, 144), (26, 16, 18), (156, 22, 68), (255, 205, 115)),
-            "villain":  ((196, 142, 110), (16, 14, 18), (34, 16, 22),  (235, 58, 58)),
-            "saas":     ((214, 158, 124), (42, 38, 44), (132, 22, 42), (255, 212, 74)),
-            "narrator": ((184, 140, 112), (20, 20, 28), (18, 22, 38),  (110, 200, 255)),
-        }.get(hero_role, ((218, 162, 124), (24, 18, 20), (24, 32, 58), (255, 208, 92)))
-        skin_c, hair_c, outfit_c, accent_c = role_pal
-
-        # Shoulders & royal/cinematic outfit
-        sh_w = int(hr * 2.35)
-        sh_top = head_y + int(hr * 0.92)
-        cd.pieslice([cx - sh_w, sh_top, cx + sh_w, sh_top + int(hr * 4.4)], start=180, end=360, fill=(*outfit_c, 255))
-        cd.arc([cx - sh_w, sh_top, cx + sh_w, sh_top + int(hr * 4.4)], start=185, end=355, fill=(*accent_c, 215), width=4)
-        # Collar / Saree Pallu / Coat Lapels
-        cd.polygon(
-            [(cx - int(hr * 0.55), sh_top + 10), (cx, sh_top + int(hr * 1.15)), (cx + int(hr * 0.55), sh_top + 10)],
-            fill=(*accent_c, 195),
-        )
-        # Neck
-        cd.rectangle([cx - int(hr * 0.32), head_y + int(hr * 0.65), cx + int(hr * 0.32), sh_top + int(hr * 0.35)], fill=(skin_c[0] - 24, skin_c[1] - 24, skin_c[2] - 22, 255))
-
-        # Flowing hair back (for Heroine / Saas)
-        if hero_role in ("female", "saas"):
-            cd.ellipse([cx - int(hr * 1.28), head_y - int(hr * 1.05), cx + int(hr * 1.28), head_y + int(hr * 1.65)], fill=(*hair_c, 255))
-            if hero_role == "saas":
-                # Traditional bun + gold earrings
-                cd.ellipse([cx - int(hr * 0.55), head_y - int(hr * 1.38), cx + int(hr * 0.55), head_y - int(hr * 0.65)], fill=(*hair_c, 255))
-
-        # Face oval with subtle rim highlight
-        cd.ellipse([cx - int(hr * 0.86), head_y - hr, cx + int(hr * 0.86), head_y + int(hr * 1.08)], fill=(*skin_c, 255), outline=(*accent_c, 145), width=3)
-
-        # Hair crown
-        cd.pieslice([cx - int(hr * 0.94), head_y - int(hr * 1.14), cx + int(hr * 0.94), head_y + int(hr * 0.25)], start=180, end=360, fill=(*hair_c, 255))
-
-        # Expressive Eyebrows & Glowing Eyes
-        eye_y = head_y - int(hr * 0.08)
-        eye_dx = int(hr * 0.34)
-        eye_rx = max(10, int(hr * 0.16))
-        eye_ry = max(6, int(hr * 0.09))
-        for side in (-1, 1):
-            ex = cx + side * eye_dx
-            # Brow (angled sharply for Villain/Saas/Hero)
-            brow_tilt = int(hr * 0.08) if hero_role in ("villain", "saas", "hero") else 0
-            cd.line(
-                [(ex - eye_rx - 4, eye_y - eye_ry - 8 - side * brow_tilt), (ex + eye_rx + 4, eye_y - eye_ry - 8 + side * brow_tilt)],
-                fill=(*hair_c, 240),
-                width=max(4, hr // 22),
-            )
-            cd.ellipse([ex - eye_rx, eye_y - eye_ry, ex + eye_rx, eye_y + eye_ry], fill=(248, 246, 244, 245))
-            ir = max(4, int(eye_ry * 0.78))
-            cd.ellipse([ex - ir, eye_y - ir, ex + ir, eye_y + ir], fill=(28, 18, 14, 255))
-            cd.ellipse([ex - ir // 2, eye_y - ir // 2, ex - ir // 2 + 3, eye_y - ir // 2 + 3], fill=(255, 255, 255, 255))
-
-        # Nose shadow
-        cd.line([(cx, eye_y + 6), (cx - 4, head_y + int(hr * 0.30)), (cx + 8, head_y + int(hr * 0.30))], fill=(skin_c[0] - 42, skin_c[1] - 42, skin_c[2] - 36, 185), width=3)
-
-        # Role signature features (Bindi, Jewelry, Beard/Mustache)
-        if hero_role in ("female", "saas"):
-            br = max(5, hr // 16)
-            cd.ellipse([cx - br, eye_y - int(hr * 0.28) - br, cx + br, eye_y - int(hr * 0.28) + br], fill=(215, 20, 42, 255))
-            # Gold earrings & necklace
-            for side in (-1, 1):
-                cd.ellipse([cx + side * int(hr * 0.90) - 9, head_y + int(hr * 0.22), cx + side * int(hr * 0.90) + 9, head_y + int(hr * 0.48)], fill=(255, 208, 66, 240))
-            cd.arc([cx - int(hr * 0.65), sh_top - 4, cx + int(hr * 0.65), sh_top + int(hr * 0.75)], start=10, end=170, fill=(255, 212, 74, 245), width=6)
-        elif hero_role in ("villain", "hero"):
-            # Beard / Jawline stubble
-            beard_alpha = 235 if hero_role == "villain" else 135
-            cd.pieslice([cx - int(hr * 0.84), head_y + int(hr * 0.16), cx + int(hr * 0.84), head_y + int(hr * 1.09)], start=18, end=162, fill=(hair_c[0], hair_c[1], hair_c[2], beard_alpha))
-            # Mustache
-            cd.arc([cx - int(hr * 0.36), head_y + int(hr * 0.34), cx + int(hr * 0.36), head_y + int(hr * 0.62)], start=195, end=345, fill=(*hair_c, 245), width=max(5, hr // 16))
-
-        # Mouth / Expressive lips
-        mouth_y = head_y + int(hr * 0.58)
-        lip_col = (188, 42, 68, 240) if hero_role in ("female", "saas") else (138, 66, 58, 230)
-        cd.arc([cx - int(hr * 0.26), mouth_y - 10, cx + int(hr * 0.26), mouth_y + 16], start=15, end=165, fill=lip_col, width=max(5, hr // 18))
-
-        bg = Image.alpha_composite(bg, char_layer)
-
-    # 4. Atmospheric VFX Particles (Rain Streaks / Sparks / Floating Gold Dust)
-    fx = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    fdraw = ImageDraw.Draw(fx)
-    if location_key == "mumbai_rain" or mood == "Suspense":
-        for _ in range(55):
-            rx = rng.randint(0, W)
-            ry = rng.randint(0, H)
-            fdraw.line([(rx, ry), (rx - 8, ry + 34)], fill=(185, 225, 255, rng.randint(55, 130)), width=2)
+    role_subject_map = {
+        "hero": "real handsome 30-year-old Indian male TV serial lead actor wearing tailored black royal bandhgala suit, neat trimmed beard, calm intense confident expression facing camera",
+        "female": "real beautiful 26-year-old Indian female TV serial lead actress wearing rich crimson designer silk saree, gold jhumka earrings and red bindi, emotional expressive eyes facing camera",
+        "villain": "real intimidating 36-year-old Indian male TV serial villain actor wearing sharp black blazer over dark shirt, thick beard, arrogant angry scowl facing camera",
+        "saas": "real commanding 52-year-old Indian matriarch TV serial actress wearing heavy royal Banarasi silk saree, heavy traditional gold necklace and red bindi, stern angry expression facing camera",
+        "narrator": "real Indian family drama cast (matriarch in silk saree, villain in black blazer, heroine in designer saree, hero in black bandhgala suit) in dramatic confrontation",
+        "crowd": "real shocked Indian wedding and family guests in traditional ethnic silk attire reacting dramatically",
+    }
+    if shot_clean == "wide_group":
+        subject_prefix = f"{role_subject_map['narrator']}, {shot_desc}, "
+    elif include_hero:
+        subject_prefix = f"{role_subject_map.get(hero_role, role_subject_map['hero'])}, {shot_desc}, "
     else:
-        for _ in range(38):
-            sx = rng.randint(12, W - 12)
-            sy = rng.randint(12, H - 12)
-            sr = rng.randint(2, 6)
-            fdraw.ellipse([sx - sr, sy - sr, sx + sr, sy + sr], fill=(255, 210, 110, rng.randint(85, 195)))
-    bg = Image.alpha_composite(bg, fx)
+        subject_prefix = f"{shot_desc}, "
 
-    return bg.convert("RGB")
+    scene_detail = f"{hint_clean}, " if hint_clean else ""
+    full_prompt = (
+        f"photorealistic still frame from an Indian Hindi TV serial drama on Dangal TV and StarPlus, "
+        f"{subject_prefix}{scene_detail}{desc}, {mood} dramatic warm cinematic lighting, "
+        f"8k DSLR live-action photography, real Indian human actors, authentic skin texture, natural sharp focus, "
+        f"no cartoon, no illustration, no anime, no 3d animation, no text, no watermark"
+    )
+    encoded = urllib.parse.quote(full_prompt, safe="")
+    seed_val = abs(hash(cache_key)) % 99999
+
+    # Priority 1: Google GenAI Photorealistic Image Generation (Imagen 3 / Gemini Flash Image)
+    gem_img = _try_gemini_photorealistic_image(full_prompt, W, H)
+    if gem_img is not None:
+        try:
+            gem_img.save(cache_path, "JPEG", quality=93)
+        except Exception:
+            pass
+        return gem_img
+
+    # Priority 2: Working Pollinations Real Photo API (`image.pollinations.ai/prompt/...`, timeout=15s)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    cfg = get_runtime_ai_config()
+    if cfg.get("enable_pollinations", True):
+        pref_model = cfg.get("pollinations_model", "flux")
+        alt_model = "turbo" if pref_model != "turbo" else "flux"
+        candidate_urls = [
+            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model={pref_model}&nologo=true&seed={seed_val}", 15),
+            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model={alt_model}&nologo=true&seed={(seed_val + 73) % 99999}", 15),
+            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model=flux&nologo=true&seed={(seed_val + 199) % 99999}", 14),
+        ]
+        for url, t_sec in candidate_urls:
+            try:
+                resp = requests.get(url, headers=headers, timeout=t_sec, allow_redirects=True)
+                ctype = str(resp.headers.get("content-type", "")).lower()
+                if (
+                    resp.status_code == 200
+                    and len(resp.content) > 8000
+                    and ("image" in ctype or resp.content[:2] in (b"\xff\xd8", b"\x89P") or resp.content[:4] == b"RIFF")
+                ):
+                    bg_img = open_upright_image(resp.content).resize((W, H), Image.Resampling.LANCZOS)
+                    bg_img.save(cache_path, "JPEG", quality=93)
+                    return bg_img
+            except Exception:
+                continue
+
+    # Priority 3: Free HuggingFace Fast Photorealistic Image Spaces (`FLUX.1-schnell`, `SDXL-Lightning`, `SDXL-Turbo`, `Playground v2.5`)
+    hf_img = _try_hf_fast_image_spaces(full_prompt, W, H, seed_val, cfg)
+    if hf_img is not None:
+        try:
+            hf_img.save(cache_path, "JPEG", quality=93)
+        except Exception:
+            pass
+        return hf_img
+
+    # Priority 4: Reuse any cached real photorealistic frame (NEVER draw 2D cartoon shapes!)
+    cached_photo = _reuse_cached_photorealistic_scene(W, H, hero_role, seed_val)
+    if cached_photo is not None:
+        return cached_photo
+
+    # Absolute last resort (only if server has zero network & zero cache): clean dark warm cinema backdrop, ZERO cartoon faces!
+    plate = Image.new("RGB", (W, H), (18, 12, 16))
+    _draw_vertical_gradient(plate, (38, 18, 20), (14, 10, 18))
+    return plate
 
 
 def draw_channel_watermark(
@@ -3561,15 +3491,16 @@ def generate_free_ai_video_clip(
                 if _mux_video_with_audio_and_sub(talk_vid):
                     return "Pollinations Flux + LivePortrait/SadTalker"
 
-        # 3. Engine 5 (100% FREE Unlimited Parallel Multi-Shot Motion): Generate 2 additional dynamic keyframes
-        #    in PARALLEL via ThreadPoolExecutor (strict 8s cap) so every scene renders in seconds!
-        keyframe_list = [framed_img_path]
+        # 3. TV Serial Multi-Cut Motion (Wide Group Shot -> Speaking Actor Close-Up -> Dramatic Reaction Shot)
+        #    Generates the Wide Group Shot & Reaction Cut in PARALLEL with 18s budget so real photorealistic stills finish cleanly!
+        wide_kf_path: Optional[str] = None
+        reaction_kf_path: Optional[str] = None
         if not custom_bg_path:
             def _make_kf(variant_idx: int, variant_name: str) -> Optional[str]:
                 kf_path = f"{out_mp4}_kf_{variant_idx}.jpg"
                 try:
                     prepare_character_frame(
-                        angle_face_path,
+                        angle_face_path if variant_name != "wide_group" else "",
                         speaker_name,
                         dialogue_text,
                         kf_path,
@@ -3583,25 +3514,35 @@ def generate_free_ai_video_clip(
                         visual_action_prompt=visual_action_prompt,
                         shot_variant=variant_name,
                     )
-                    if os.path.exists(kf_path) and os.path.getsize(kf_path) > 2000:
+                    if os.path.exists(kf_path) and os.path.getsize(kf_path) > 4000:
                         return kf_path
                 except Exception:
                     pass
                 return None
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as kf_ex:
-                futs = [
-                    kf_ex.submit(_make_kf, 1, "action_mid"),
-                    kf_ex.submit(_make_kf, 2, "closeup_drama"),
-                ]
-                for fut in futs:
-                    try:
-                        res_kf = fut.result(timeout=9.0)
-                        if res_kf:
-                            keyframe_list.append(res_kf)
-                            extra_keyframes.append(res_kf)
-                    except Exception:
-                        continue
+                fut_wide = kf_ex.submit(_make_kf, 1, "wide_group")
+                fut_react = kf_ex.submit(_make_kf, 2, "reaction_cut")
+                try:
+                    wide_kf_path = fut_wide.result(timeout=18.0)
+                    if wide_kf_path:
+                        extra_keyframes.append(wide_kf_path)
+                except Exception:
+                    pass
+                try:
+                    reaction_kf_path = fut_react.result(timeout=18.0)
+                    if reaction_kf_path:
+                        extra_keyframes.append(reaction_kf_path)
+                except Exception:
+                    pass
+
+        # Assemble authentic Indian TV Serial 3-cut order: Wide Group Shot -> Speaking Actor Close-Up -> Reaction Shot
+        keyframe_list = []
+        if wide_kf_path:
+            keyframe_list.append(wide_kf_path)
+        keyframe_list.append(framed_img_path)
+        if reaction_kf_path:
+            keyframe_list.append(reaction_kf_path)
 
         _render_multishot_pollinations_motion_clip(
             keyframe_list,
@@ -3613,7 +3554,7 @@ def generate_free_ai_video_clip(
             subtitle_png_path=rendered_sub,
             aspect_ratio=aspect_ratio,
         )
-        return "Pollinations Flux + Parallel Motion"
+        return "Photorealistic TV Serial Multi-Cut + ZoomPan"
     finally:
         for tmp_p in [mixed_tmp, sub_png] + extra_keyframes:
             if tmp_p and os.path.exists(tmp_p):
