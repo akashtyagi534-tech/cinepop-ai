@@ -809,7 +809,7 @@ def home():
     return {
         "app": "CinePop AI — Pocket Bollywood & Face-Swap Studio",
         "status": "100% Live",
-        "engine_version": "v8-parallel-admin-crm-ai-control-center",
+        "engine_version": "v9-multi-character-pocketfm-drama-engine",
         "devanagari_font": find_devanagari_font_path(bold=True) or "not-found",
         "gemini_configured": bool(GEMINI_API_KEY),
         "opencv_faceswap": OPENCV_AVAILABLE,
@@ -1613,55 +1613,145 @@ def add_free_credit(
     )
 
 
+def _build_multi_character_drama_lines(
+    clean_topic: str,
+    hero_label: str = "Hero",
+    genre: str = "Drama",
+    part_no: int = 1,
+    total_parts: int = 1,
+) -> list[tuple[str, str, str]]:
+    """
+    Build 10 crisp, punchy Pocket FM / Bollywood multi-character drama exchanges
+    (Narrator max 20%: only 1 opening hook + 1 ending cliffhanger; 80% Hero/Heroine/Villain/Saas).
+    Returns list of (speaker, dialogue, mood). Unique dialogue packs per part_no so NO line ever repeats!
+    """
+    topic_short = re.sub(r"\s+", " ", (clean_topic or "ससुराल का अपमान और अरबपति का सच")).strip()[:90]
+    hero = (hero_label or "Hero").strip() or "Hero"
+
+    if part_no == 1:
+        pack = [
+            ("Narrator", f"जब अपनों ने ही औकात पर ताने मारे, तब शुरू हुआ सबसे बड़ा बदला — {topic_short}!", "Suspense"),
+            ("Saas", "इतने गरीब घर जमाई को हमने घर में पनाह दी, और आज यह हमारी बराबरी करने चला है?", "Emotional"),
+            ("Villain", "अरे छोड़ो माँ, इसकी हैसियत एक टूटी साइकिल की भी नहीं, इसे तो आज इस घर से बाहर निकालो!", "Action"),
+            ("Heroine", "बस कीजिए! आप लोग बार-बार इनका अपमान क्यों कर रहे हैं? इन्होंने कभी किसी का बुरा नहीं चाहा!", "Emotional"),
+            (hero, "चुप हो जाओ प्रिया... आज इन्हें बोल लेने दो, क्योंकि कल तक जो मुझे गरीब समझते थे, आज उनकी नींव हिलने वाली है!", "Action"),
+            ("Saas", "बड़ी-बड़ी बातें करने से जेब में पैसे नहीं आ जाते! आज रात की पार्टी में तेरी असली औकात सबको दिखेगी!", "Suspense"),
+            ("Villain", "पार्टी में शहर के सबसे बड़े अरबपति आ रहे हैं, तू तो गेट के बाहर चौकीदारी करने लायक भी नहीं है!", "Action"),
+            ("Heroine", "आप चिंता मत कीजिए, दुनिया कुछ भी कहे... मैं हर हाल में आपके साथ खड़ी हूँ!", "Romantic"),
+            (hero, "जिस अरबपति के इंतज़ार में तुमने ये महफिल सजाई है, ज़रा दरवाज़े पर देखो... उसकी कारें आ चुकी हैं!", "Suspense"),
+            (
+                "Narrator",
+                f"अचानक हवेली के बाहर दस काली मर्सिडीज़ रुकती हैं — आखिर कौन है असली मालिक? देखिए Part {part_no + 1} में!"
+                if total_parts > 1
+                else "अचानक हवेली के बाहर दस काली मर्सिडीज़ रुकती हैं — और हर किसी के होश उड़ जाते हैं!",
+                "Suspense",
+            ),
+        ]
+    elif part_no == 2:
+        pack = [
+            ("Narrator", "महफिल में सन्नाटा छा गया, जब ब्लैक सूट में बॉडीगार्ड्स ने झुककर सलाम किया!", "Suspense"),
+            ("Saas", "ये क्या तमाशा है? शहर के सबसे बड़े बिज़नेसमैन के गार्ड्स इस मामूली लड़के के आगे क्यों झुक रहे हैं?", "Suspense"),
+            ("Villain", "कोई गलतफहमी हुई होगी! अरे सिक्योरिटी, ये तो हमारे घर का बेरोज़गार जमाई है!", "Action"),
+            (hero, "जिस कंपनी के एक कॉन्ट्रैक्ट के लिए तुम महीनों से गिड़गिड़ा रहे थे, उसका चेयरमैन तुम्हारे सामने खड़ा है!", "Action"),
+            ("Heroine", "क्या... सच में? इतने साल आप सब कुछ सहकर भी खामोश रहे सिर्फ इस परिवार की इज़्ज़त के लिए?", "Emotional"),
+            ("Villain", "झूठ! यह सब किराए के लोग हैं! मैं अभी पुलिस बुलाकर तेरा ये नाटक खत्म करता हूँ!", "Action"),
+            (hero, "पुलिस को बुलाने से पहले अपने बैंक का मैसेज पढ़ लो — तुम्हारी पूरी प्रॉपर्टी की नीलामी आज मेरे हाथ में है!", "Action"),
+            ("Saas", "हे भगवान! मेरा बेटा बर्बाद हो जाएगा... बेटा, हमें माफ़ कर दो, हमसे बहुत बड़ी भूल हो गई!", "Emotional"),
+            ("Heroine", "जब मैंने आपसे भीख माँगी थी तब आपने मुझे ताने दिए थे, आज सच सामने है तो माफ़ी याद आ रही है?", "Emotional"),
+            (
+                "Narrator",
+                f"तभी विलेन ने अपनी जेब से एक छुपा हुआ राज़ बाहर निकाला — क्या पलट जाएगी पूरी बाज़ी? देखिए Part {part_no + 1} में!"
+                if part_no < total_parts
+                else "आखिरकार सच्चाई की जीत हुई, और घमंड चकनाचूर हो गया!",
+                "Suspense",
+            ),
+        ]
+    else:
+        pack = [
+            ("Narrator", f"कहानी अब अपने सबसे खतरनाक मोड़ पर पहुँच चुकी है — Part {part_no} में खुलेगा आखिरी राज़!", "Suspense"),
+            ("Villain", "तुमने मेरी दौलत छीन ली, लेकिन अब इस खेल का आखिरी दांव मैं चलूँगा!", "Action"),
+            ("Saas", "रुक जाओ! और कितनी नफ़रत फैलाओगे? अब इस घर को और बर्बाद मत करो!", "Emotional"),
+            (hero, "तेरी हर साज़िश का सबूत मेरे पास पहले से था! अब तेरे बचने का कोई रास्ता नहीं बचा!", "Action"),
+            ("Heroine", "अब डरने का वक़्त खत्म हुआ! सच की ताक़त के आगे कोई भी चाल नहीं टिक सकती!", "Emotional"),
+            ("Villain", "इतनी आसानी से मैं हार नहीं मानूँगा, आज फैसला यहीं इसी वक्त होकर रहेगा!", "Action"),
+            (hero, "फैसला तो उसी दिन हो गया था जिस दिन तुमने अपनों का भरोसा तोड़ा था — अब हिसाब बराबर होगा!", "Action"),
+            ("Saas", "मुझे शर्म आ रही है कि मैंने कभी हीरे को पत्थर समझकर ठुकराया था!", "Emotional"),
+            ("Heroine", "अब इस घर में नफ़रत नहीं, सिर्फ इज़्ज़त और सच्चाई की जीत होगी!", "Romantic"),
+            (
+                "Narrator",
+                f"क्या यही है अंत, या आने वाला है एक और बड़ा तूफ़ान? जुड़े रहिए Part {part_no + 1} में!"
+                if part_no < total_parts
+                else "सच्चाई और आत्मसम्मान की इस जंग में आखिरकार हीरो की शानदार जीत हुई!",
+                "Action",
+            ),
+        ]
+    return pack
+
+
+def _format_drama_script_text(lines: list[tuple[str, str, str]]) -> str:
+    return "\n".join(f'{spk}: "{clean_spoken_dialogue(diag)}"' for spk, diag, _ in lines if clean_spoken_dialogue(diag))
+
+
 @app.post("/ai/generate-story/")
 def ai_generate_story(
     topic: str = Form(...),
     genre: str = Form("Action"),
-    char_names: str = Form("Vikram, Kaal"),
-    duration_minutes: int = Form(30),
+    char_names: str = Form("Hero"),
+    duration_minutes: int = Form(1),
 ):
     clean_topic = topic.strip()
     if len(clean_topic) < 4:
         raise HTTPException(status_code=400, detail="कृपया कम से कम 1 लाइन का टॉपिक लिखें।")
 
-    names = [n.strip() for n in char_names.split(",") if n.strip()] or ["Vikram", "Kaal"]
-    hero = names[0]
-    rival = names[1] if len(names) > 1 else "Villain"
+    names = [n.strip() for n in char_names.split(",") if n.strip()]
+    hero_label = names[0] if names and names[0].lower() not in ("vikram", "kaal") else "Hero"
 
-    fallback_story = f"""शीर्षक: {clean_topic[:36]} ({genre})
-
-[Location: Gaon ka Khet | Mood: Emotional]
-{hero}: यह कहानी हमारे गाँव और अपनों की हिफ़ाज़त से शुरू होती है। {clean_topic}।
-{rival}: तुम जो सोच रहे हो वह आसान नहीं होगा, असली इम्तिहान अब शुरू होगा!
-
-[Location: Mumbai ki Barish | Mood: Suspense]
-{hero}: तेज़ बारिश और अंधेरे में भी सच छुप नहीं सकता। मुझे हर हाल में जवाब ढूंढना होगा।
-{rival}: तुम्हारे हर कदम पर मेरी नज़र है, देखते हैं इस खेल में कौन टिकता है!
-
-[Location: Royal Palace | Mood: Action]
-{hero}: अब वक़्त आ गया है इस कहानी का सबसे बड़ा फैसला करने का!
-{rival}: तो आओ, आज पूरी दुनिया देखेगी कि किसके इरादों में ज़्यादा दम है!"""
+    fallback_lines = _build_multi_character_drama_lines(
+        clean_topic=clean_topic,
+        hero_label=hero_label,
+        genre=genre,
+        part_no=1,
+        total_parts=1,
+    )
+    fallback_story = _format_drama_script_text(fallback_lines)
 
     if not client:
         return {"story": fallback_story, "genre": genre}
 
     try:
-        prompt = f"""तुम एक अवॉर्ड-विनिंग बॉलीवुड स्टोरी और स्क्रिप्ट राइटर हो।
+        prompt = f"""तुम Pocket FM और Bollywood Micro-Drama के नंबर-1 डायलॉग राइटर हो।
 Genre: {genre}
 Topic: "{clean_topic}"
-Characters: {", ".join(names)}
-Duration Target: {duration_minutes} minutes
+Hero Name: {hero_label}
 
-इस 1-लाइन टॉपिक पर पूरी डिटेल्ड, रोमांचक हिंदी कहानी और सीन-बाय-सीन स्क्रिप्ट लिखो जिसे यूज़र पढ़कर एडिट भी कर सके।
-कम से कम 4 अलग-अलग रियल सिनेमैटिक लोकेशंस (जैसे Gaon ka Khet, Purani Haveli, Mumbai ki Barish, Deep Jungle, Police Station, Outer Space, Royal Palace) शामिल करो।
-फॉर्मेट:
-शीर्षक: <फिल्म का नाम>
-[Location: <Location Name> | Mood: <Action/Emotional/Suspense/Comedy/Romantic>]
-{hero}: <दमदार हिंदी डायलॉग>
-{rival}: <दमदार हिंदी डायलॉग>
-सीधे हिंदी कहानी और स्क्रिप्ट लिखो।"""
+सख्त नियम (100% पालन करो):
+1. एक ही Narrator की लंबी कहानी/मोनोलॉग बिल्कुल मत लिखो!
+2. ठीक 10 छोटे, तीखे, पंचदार और ड्रामैटिक हिंदी डायलॉग्स लिखो जिनमें {hero_label}, Heroine, Villain, और Saas आपस में ज़बरदस्त बहस, ताने, इमोशन और ट्विस्ट वाले डायलॉग्स मारें।
+3. Narrator सिर्फ पहली 1 छोटी हुक लाइन और आखिरी 1 सस्पेंस क्लिफहैंगर लाइन बोले (अधिकतम 20%)।
+4. हर लाइन का सख्त फॉर्मेट यही हो (कोई Title:, Scene:, [Location:], markdown, या डबल नाम मत लिखो):
+Narrator: "छोटी हुक लाइन..."
+Saas: "तीखा ताना..."
+Villain: "धमकी या साज़िश..."
+Heroine: "इमोशनल या करारा जवाब..."
+{hero_label}: "मासी या ट्विस्ट वाला डायलॉग..."
+
+सीधे 10 लाइन की मल्टी-कैरेक्टर डायलॉग स्क्रिप्ट लिखो।"""
         res = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-        story = (res.text or "").strip() or fallback_story
+        raw_out = (res.text or "").replace("```", "").strip()
+        # Validate clean multi-character speaker lines (no single narrator wall)
+        cleaned_lines: list[str] = []
+        for ln in raw_out.splitlines():
+            ln_s = ln.strip().lstrip("*-•0123456789.) ").strip()
+            m = re.match(r"^([^:：]{1,26})[:：]\s*(.+)$", ln_s)
+            if not m:
+                continue
+            spk = re.sub(r"[\*\#\_\"'“”]", "", m.group(1)).strip()
+            if spk.lower() in ("title", "शीर्षक", "scene", "सीन", "location", "लोकेशन", "mood", "action"):
+                continue
+            dlg = clean_spoken_dialogue(m.group(2))
+            if len(dlg) >= 3:
+                cleaned_lines.append(f'{spk}: "{dlg}"')
+        story = "\n".join(cleaned_lines[:12]) if len(cleaned_lines) >= 6 else fallback_story
         return {"story": story, "genre": genre}
     except Exception:
         return {"story": fallback_story, "genre": genre}
@@ -2087,12 +2177,12 @@ def render_location_backdrop(
     shot_desc = shot_framing_map.get(shot_clean, shot_framing_map["main"])
 
     role_subject_map = {
-        "villain": "intimidating Indian Bollywood mafia villain man in dark tailored coat looking intense",
-        "saas": "dramatic Indian wealthy matriarch woman in royal silk saree with gold jewelry, intense expression",
-        "female": "expressive young Indian Bollywood actress in stylish ethnic cinematic attire, dramatic rim light",
-        "narrator": "charismatic Indian Bollywood action hero in dramatic lighting looking forward",
-        "crowd": "dramatic Indian cinema characters reacting intensely in cinematic crowd lighting",
-        "hero": "handsome Indian Bollywood action drama hero wearing stylish jacket, intense cinematic expression",
+        "villain": "dramatic close-up of intimidating Indian Bollywood villain man with dark beard and fierce scowl in black blazer, intense eyes facing camera",
+        "saas": "dramatic close-up of wealthy Indian matriarch saas woman in royal silk saree with heavy gold jewelry, sharp angry expression facing camera",
+        "female": "dramatic close-up of expressive young Indian Bollywood heroine actress in elegant ethnic attire, emotional eyes facing camera",
+        "narrator": "dramatic wide establishing Bollywood cinema atmosphere shot with moody silhouette and rich cinematic lighting",
+        "crowd": "dramatic Indian cinema crowd characters reacting intensely in atmospheric lighting",
+        "hero": "dramatic close-up of handsome Indian Bollywood action drama hero wearing stylish jacket, intense confident expression facing camera",
     }
     subject_prefix = (
         f"{role_subject_map.get(hero_role, role_subject_map['hero'])}, {shot_desc}, "
@@ -2210,7 +2300,8 @@ def render_hindi_subtitle_png(
     clean_diag = clean_spoken_dialogue(dialogue)
     if not clean_diag:
         return None
-    full_line = f"{speaker_name.strip()}: {clean_diag}" if speaker_name.strip() else clean_diag
+    clean_spk = re.sub(r"[:：]+$", "", (speaker_name or "").strip()).strip()
+    full_line = f"{clean_spk}: {clean_diag}" if clean_spk else clean_diag
 
     is_vertical = width < 900
     if is_vertical and height < 220:
@@ -3394,8 +3485,10 @@ def parse_manual_script_lines(
     skip_tags = {
         "शीर्षक", "title", "scene", "सीन", "location", "लोकेशन",
         "action", "एक्शन", "mood", "मूड", "sfx", "camera", "कैमरा",
-        "background", "बैकग्राउंड", "int", "ext", "narrator", "सूत्रधार",
+        "background", "बैकग्राउंड", "int", "ext",
     }
+    char_map_dummy = {c: {} for c in (char_names or [])}
+    seen_norm: set[str] = set()
 
     for raw_line in raw_text.splitlines():
         line = raw_line.strip().lstrip("*#-• ").strip()
@@ -3424,18 +3517,18 @@ def parse_manual_script_lines(
 
         m = re.match(r"^([^:：]{1,28})[:：]\s*(.+)$", line)
         if m:
-            speaker_raw = re.sub(r"[\*\#\_]", "", m.group(1)).strip()
+            speaker_raw = re.sub(r"[\*\#\_\"'“”]", "", m.group(1)).strip()
             speaker_low = speaker_raw.lower()
             if speaker_low in skip_tags or re.match(r"^(?:scene|सीन)\s*\d+$", speaker_low):
                 continue
             diag = clean_spoken_dialogue(m.group(2))
             if len(diag) < 2:
                 continue
-            matched = next(
-                (c for c in char_names if c.lower() == speaker_low),
-                speaker_raw if any(k in speaker_low for k in ("villain", "don", "log", "crowd", "विलेन", "लोग", "भीड़"))
-                else char_names[len(parsed) % len(char_names)],
-            )
+            norm_key = re.sub(r"\s+", " ", diag.lower()).strip()
+            if norm_key in seen_norm:
+                continue
+            seen_norm.add(norm_key)
+            matched = resolve_character_name(speaker_raw, char_map_dummy, len(parsed))
             loc_key, loc_label = detect_location_meta(diag, cur_loc_label)
             sfx_val = detect_sfx_type(diag, loc_key, cur_mood)
             parsed.append(
@@ -3471,20 +3564,20 @@ async def autonomous_movie_worker(project_id: str):
 
         if series_mode == "series":
             total_chapters = requested_parts
-            # Pocket FM / Moj fast-paced cuts: 14 scenes (~4.2s each) for 1 Min/Part, 22 scenes for 2 Min/Part
-            scenes_per_chapter = 14 if part_duration <= 1 else 22
+            # Pocket FM / Moj crisp multi-character pacing: 10 punchy dialogues (~50-60s) for 1 Min/Part, 16 for 2 Min/Part
+            scenes_per_chapter = 10 if part_duration <= 1 else 16
         else:
             total_chapters = 1 if duration <= 10 else max(1, duration // 10)
             if duration <= 1:
-                scenes_per_chapter = 14
+                scenes_per_chapter = 10
             elif duration <= 2:
-                scenes_per_chapter = 20
+                scenes_per_chapter = 14
             elif duration <= 5:
-                scenes_per_chapter = 24
+                scenes_per_chapter = 18
             elif duration <= 10:
-                scenes_per_chapter = 28
+                scenes_per_chapter = 22
             else:
-                scenes_per_chapter = 30
+                scenes_per_chapter = 26
 
         story_mode = state.get("story_mode", "ai")
         language = normalize_language(state.get("language", "Hindi"))
@@ -3494,24 +3587,23 @@ async def autonomous_movie_worker(project_id: str):
         watermark_text = state.get("watermark_text", "")
         watermark_position = state.get("watermark_position", "top-right")
 
-        manual_lines = (
-            parse_manual_script_lines(
-                state["idea"], char_names, default_location, default_mood
-            )
-            if story_mode == "manual"
-            else []
+        # Parse structured multi-character `Speaker: Dialogue` script lines in BOTH manual mode
+        # AND AI mode (when user clicked "Generate Full Story with AI" and generated a ready script!)
+        parsed_script_lines = parse_manual_script_lines(
+            state["idea"], char_names, default_location, default_mood
         )
+        manual_lines = parsed_script_lines if (story_mode == "manual" or len(parsed_script_lines) >= 6) else []
 
         if not state.get("outline"):
             state["progress"] = 5
-            if story_mode == "manual" and len(manual_lines) >= 2:
+            if len(manual_lines) >= 2 and (story_mode == "manual" or total_chapters == 1):
                 per_ch = max(1, math.ceil(len(manual_lines) / total_chapters))
                 chunks = [
                     manual_lines[i : i + per_ch]
                     for i in range(0, len(manual_lines), per_ch)
                 ]
                 state["outline"] = {
-                    "title": "Custom Script Series",
+                    "title": "CinePop Multi-Character Drama",
                     "chapters": [
                         {
                             "no": i + 1,
@@ -3628,31 +3720,39 @@ async def autonomous_movie_worker(project_id: str):
 
             if manual_chunks and ch_idx < len(manual_chunks):
                 dialogues = manual_chunks[ch_idx]
+            elif ch_idx == 0 and len(parsed_script_lines) >= 6:
+                # Use the exact Multi-Character script generated/edited by the user for Part 1!
+                dialogues = parsed_script_lines[: max(8, scenes_per_chapter)]
             else:
                 loc_k, loc_l = detect_location_meta(ch["plot"], default_location)
-                fallback_dialogues = [
-                    {
-                        "character": char_names[i % len(char_names)],
-                        "dialogue": (
-                            f"आगे क्या होगा? इस राज़ से पर्दा उठेगा अगले एपिसोड में — देखिए Part {ch_no + 1} में!"
-                            if (series_mode == "series" and ch_no < total_ch_count and i == scenes_per_chapter - 1)
-                            else f"{ch['plot']} - सीन {i+1} का दमदार संवाद।"
-                        ),
-                        "location": loc_l,
-                        "location_key": loc_k,
-                        "mood": default_mood,
-                        "sfx": detect_sfx_type(ch["plot"], loc_k, default_mood),
-                        "camera_angle": ["front", "left", "right", "up", "down"][i % 5],
-                        "visual_action_prompt": build_visual_action_prompt(
-                            char_names[i % len(char_names)],
-                            ch["plot"],
-                            loc_l,
-                            default_mood,
-                            detect_sfx_type(ch["plot"], loc_k, default_mood),
-                        ),
-                    }
-                    for i in range(scenes_per_chapter)
-                ]
+                hero_display = char_names[0] if char_names else "Hero"
+                drama_pack = _build_multi_character_drama_lines(
+                    clean_topic=state.get("idea", ch["plot"]),
+                    hero_label=hero_display,
+                    genre=state.get("genre", "Drama"),
+                    part_no=ch_no,
+                    total_parts=total_ch_count,
+                )
+                fallback_dialogues = []
+                for i, (spk_raw, diag_raw, line_mood) in enumerate(drama_pack[:scenes_per_chapter]):
+                    spk_resolved = resolve_character_name(spk_raw, char_map, i)
+                    diag_clean = clean_spoken_dialogue(diag_raw)
+                    lk_i, ll_i = detect_location_meta(diag_clean, loc_l)
+                    sfx_i = detect_sfx_type(diag_clean, lk_i, line_mood)
+                    fallback_dialogues.append(
+                        {
+                            "character": spk_resolved,
+                            "dialogue": diag_clean,
+                            "location": ll_i,
+                            "location_key": lk_i,
+                            "mood": line_mood,
+                            "sfx": sfx_i,
+                            "camera_angle": ["front", "left", "right", "up", "down"][i % 5],
+                            "visual_action_prompt": build_visual_action_prompt(
+                                spk_resolved, diag_clean, ll_i, line_mood, sfx_i
+                            ),
+                        }
+                    )
 
                 if client:
                     try:
@@ -3665,13 +3765,16 @@ async def autonomous_movie_worker(project_id: str):
                         script_prompt = f"""
                         सीरीज़/फिल्म: {state['outline']['title']} | पिछला सीन: {prev_plot}
                         वर्तमान Part {ch_no}/{total_ch_count}: {ch['plot']}
-                        मुख्य अपलोड किए गए कैरेक्टर: {char_names} (ज़रूरत पड़ने पर Narrator, Villain, Saas या Log/Crowd भी बोल सकते हैं)।
-                        भाषा / Dialect: {language} (सभी डायलॉग्स असली {language} अंदाज़ में छोटे, तेज़-रफ़्तार और पंचदार हों — हर डायलॉग 3-4 सेकंड का हो!)
-                        सख्त नियम: डायलॉग के अंदर कभी भी 'Title:', 'Scene 1:', 'Location:', 'Action:' जैसे स्क्रिप्ट टैग मत लिखो — सिर्फ बोले जाने वाले डायलॉग लिखो!
+                        मुख्य कैरेक्टर (Hero): {hero_display}
+                        मल्टी-कैरेक्टर कास्ट (ज़रूरी): {hero_display}, Heroine, Villain, Saas, और Narrator।
+                        सख्त नियम:
+                        1. एक ही Narrator की लंबी कहानी मत लिखो! Narrator सिर्फ पहला और आखिरी (max 20%) डायलॉग बोले।
+                        2. बाकी 80% सीन्स में {hero_display}, Heroine, Villain, और Saas के बीच तीखे, इमोशनल और ट्विस्ट वाले डायलॉग्स हों।
+                        3. भाषा / Dialect: {language} (हर डायलॉग छोटा, पंचदार और 3-5 सेकंड का हो — कोई भी डायलॉग रिपीट मत करो!)
+                        4. डायलॉग के अंदर कभी भी कैरेक्टर का नाम (जैसे 'Vikram:', 'Hero:') या 'Title:/Scene:/Location:' टैग मत लिखो — सिर्फ बोले जाने वाला डायलॉग लिखो!
                         {cliff_instruction}
-                        ठीक {scenes_per_chapter} फास्ट-कट सीन्स लिखो (हर सीन में अलग कैमरा एंगल: Hero close-up, Villain angry reaction, Ring/Car zoom, Action cut)।
-                        हर सीन के साथ location, mood (Action, Emotional, Suspense, Comedy, Romantic), sfx (none, rain, thunder, punch, explosion, sword, footsteps), camera_angle (front, left, right, up, down), और dramatic English visual_action_prompt दो।
-                        सिर्फ JSON लिस्ट दो: [{{"character": "{char_names[0]}", "dialogue": "डायलॉग...", "location": "Mumbai ki Barish", "mood": "{default_mood}", "sfx": "rain", "camera_angle": "front", "visual_action_prompt": "dramatic close-up in rain, neon reflections, intense thriller lighting"}}]
+                        ठीक {scenes_per_chapter} फास्ट-कट सीन्स लिखो।
+                        सिर्फ JSON लिस्ट दो: [{{"character": "{hero_display}", "dialogue": "डायलॉग...", "location": "Royal Palace", "mood": "{default_mood}", "sfx": "none", "camera_angle": "front", "visual_action_prompt": "dramatic close-up Bollywood actor expression, cinematic rim lighting"}}]
                         """
                         s_res = await asyncio.wait_for(
                             asyncio.to_thread(
@@ -3682,18 +3785,19 @@ async def autonomous_movie_worker(project_id: str):
                             timeout=18.0,
                         )
                         raw_list = safe_extract_json(s_res.text, fallback_dialogues)
-                        raw_list = raw_list[: max(6, scenes_per_chapter + 2)]
+                        raw_list = raw_list[: max(8, scenes_per_chapter)]
                         dialogues = []
+                        seen_lines: set[str] = set()
                         for idx_d, item in enumerate(raw_list):
                             raw_spk = str(item.get("character", "")).strip()
-                            low_spk = raw_spk.lower()
-                            if any(k in low_spk for k in ("narrator", "sutradhar", "villain", "saas", "don", "log", "crowd", "सूत्रधार", "विलेन", "सास", "लोग", "भीड़")):
-                                c_name = raw_spk
-                            else:
-                                c_name = resolve_character_name(raw_spk, char_map, idx_d)
+                            c_name = resolve_character_name(raw_spk, char_map, idx_d)
                             diag_text = clean_spoken_dialogue(str(item.get("dialogue", "")))
                             if len(diag_text) < 2:
                                 continue
+                            norm_k = re.sub(r"\s+", " ", diag_text.lower()).strip()
+                            if norm_k in seen_lines:
+                                continue
+                            seen_lines.add(norm_k)
                             lk, ll = detect_location_meta(
                                 f"{item.get('location', '')} {diag_text}",
                                 item.get("location") or default_location,
@@ -3722,7 +3826,7 @@ async def autonomous_movie_worker(project_id: str):
                                     "visual_action_prompt": vap,
                                 }
                             )
-                        if not dialogues:
+                        if len(dialogues) < 4:
                             dialogues = fallback_dialogues
                     except Exception:
                         dialogues = fallback_dialogues
@@ -3749,15 +3853,15 @@ async def autonomous_movie_worker(project_id: str):
             state["scripts"][str(ch_no)] = dialogues
             state["progress"] = min(94, ch_base_pct + 5)
             state["status_text"] = (
-                f"Part {ch_no}/{total_ch_count} स्क्रिप्ट तैयार ({len(dialogues)} फास्ट-कट सीन्स)! फुल-स्क्रीन AI Lip-Sync वीडियो रेंडर हो रहा है ({state['progress']}%)..."
+                f"Part {ch_no}/{total_ch_count} मल्टी-कैरेक्टर स्क्रिप्ट तैयार ({len(dialogues)} डायलॉग्स)! फुल-स्क्रीन AI Lip-Sync रेंडर हो रहा है ({state['progress']}%)..."
             )
             save_state(proj_dir, state)
 
             clips = []
             total_scenes = max(1, len(dialogues))
-            # Fast-paced Pocket FM / Moj cut pacing: ~60s for 1-Min Part, ~120s for 2-Min Part
+            # Fast-paced Pocket FM / Moj cut pacing: ~55-65s for 1-Min Part, ~110s for 2-Min Part
             if series_mode == "series":
-                target_scene_sec = max(3.2, min(5.5, (part_duration * 60.0) / total_scenes))
+                target_scene_sec = max(3.5, min(6.0, (part_duration * 60.0) / total_scenes))
             elif duration == 1:
                 target_scene_sec = max(3.5, 60.0 / total_scenes)
             else:
@@ -3775,11 +3879,8 @@ async def autonomous_movie_worker(project_id: str):
                     if not os.path.isdir(proj_dir):
                         return (i, "", "")
                     raw_spk = str(d.get("character", "")).strip()
-                    c_name = (
-                        raw_spk
-                        if raw_spk in char_map or any(k in raw_spk.lower() for k in ("narrator", "sutradhar", "villain", "saas", "log", "crowd", "सूत्रधार", "विलेन", "सास", "लोग", "भीड़"))
-                        else resolve_character_name(raw_spk, char_map, i)
-                    )
+                    c_name = resolve_character_name(raw_spk, char_map, i)
+                    role_kind = detect_speaker_role(c_name, char_map)
                     diag_text = clean_spoken_dialogue(d.get("dialogue", "")) or "अब असली खेल शुरू होगा!"
                     loc_key = d.get("location_key") or "city_street"
                     loc_label = d.get("location") or default_location or "Mumbai City Street"
@@ -3795,21 +3896,23 @@ async def autonomous_movie_worker(project_id: str):
                     )
 
                     char_entry = char_map.get(c_name)
+                    # Apply user's 5-angle scanned face ONLY when that uploaded character (e.g. Hero) speaks;
+                    # Heroine, Villain, Saas, and Narrator each get their own distinct Bollywood close-up/scene!
                     if ai_auto_cast:
                         exact_char_photo = ""
                         char_angles_dict = {}
-                    elif char_entry:
+                    elif char_entry and role_kind not in ("narrator", "villain", "saas", "crowd"):
+                        exact_char_photo = select_character_angle_photo(char_entry, scene_angle)
+                        char_angles_dict = char_entry.get("angles") or {}
+                    elif char_entry and c_name in char_map:
                         exact_char_photo = select_character_angle_photo(char_entry, scene_angle)
                         char_angles_dict = char_entry.get("angles") or {}
                     else:
-                        role_kind = detect_speaker_role(c_name, char_map)
-                        if role_kind == "narrator" and char_names:
-                            primary_hero = char_map[char_names[0]]
-                            exact_char_photo = select_character_angle_photo(primary_hero, scene_angle)
-                            char_angles_dict = primary_hero.get("angles") or {}
-                        else:
-                            exact_char_photo = ""
-                            char_angles_dict = {}
+                        exact_char_photo = ""
+                        char_angles_dict = {}
+
+                    # Close-up dramatic shot for speaking characters (Hero/Heroine/Villain/Saas), wide establishing for Narrator
+                    scene_shot_variant = "establishing" if role_kind == "narrator" else "closeup_drama"
 
                     bg_override = d.get("bg_path") or project_custom_bg
                     tts_voice, tts_pitch, tts_rate = resolve_character_voice_profile(
@@ -3846,7 +3949,7 @@ async def autonomous_movie_worker(project_id: str):
                                 watermark_position,
                                 aspect_ratio,
                                 action_prompt,
-                                "establishing",
+                                scene_shot_variant,
                             )
                             used_engine = await asyncio.to_thread(
                                 generate_free_ai_video_clip,
@@ -4956,14 +5059,20 @@ def _make_title_card_clip(
 
 def _build_trailer_and_reel_sync(proj_dir: str, state: dict):
     title = (state.get("outline", {}).get("title") or "CINEPOP BLOCKBUSTER")[:28]
-    # Collect best action/dialogue clips across chapters
+    # Collect best unique action/dialogue clips across chapters (deduplicated by dialogue text!)
     candidate_clips = []
+    seen_diags: set[str] = set()
     for ch_no in sorted(state.get("done_chapters", [])):
         ch_temp = f"{proj_dir}/ch_{ch_no}_clips"
         ch_scripts = state.get("scripts", {}).get(str(ch_no), [])
         for i, d in enumerate(ch_scripts):
             v_file = f"{ch_temp}/v_{i}.mp4"
             if os.path.exists(v_file) and os.path.getsize(v_file) > 1000:
+                diag_key = re.sub(r"\s+", " ", clean_spoken_dialogue(d.get("dialogue", "")).lower()).strip()
+                if diag_key and diag_key in seen_diags:
+                    continue
+                if diag_key:
+                    seen_diags.add(diag_key)
                 score = 3 if d.get("mood") == "Action" else (2 if d.get("mood") == "Suspense" else 1)
                 candidate_clips.append((score, v_file))
 
@@ -4981,13 +5090,18 @@ def _build_trailer_and_reel_sync(proj_dir: str, state: dict):
     os.makedirs(t_dir, exist_ok=True)
     intro_16 = f"{t_dir}/intro_16.mp4"
     outro_16 = f"{t_dir}/outro_16.mp4"
+    intro_9 = f"{t_dir}/intro_9.mp4"
+    outro_9 = f"{t_dir}/outro_9.mp4"
     _make_title_card_clip("OFFICIAL TRAILER", f"{title} • CINEPOP AI", intro_16, 2.4, vertical=False)
     _make_title_card_clip(title, "RELEASING NOW • DIRECTED BY CINEPOP AI", outro_16, 2.6, vertical=False)
+    _make_title_card_clip("OFFICIAL REEL", f"{title} • CINEPOP AI", intro_9, 2.2, vertical=True)
+    _make_title_card_clip(title, "WATCH FULL SERIES • CINEPOP AI", outro_9, 2.4, vertical=True)
 
-    # Trim each chosen clip to snappy 3.2s fast-cut segment for high-energy trailer
+    # Edge-to-edge FULL-SCREEN scaling (ZERO letterbox / ZERO blurred side bars!)
     fast_cuts_16 = [intro_16]
+    fast_cuts_9 = [intro_9]
     for idx, src in enumerate(chosen):
-        cut_out = f"{t_dir}/cut_{idx}.mp4"
+        cut_16 = f"{t_dir}/cut16_{idx}.mp4"
         subprocess.run(
             [
                 "ffmpeg",
@@ -4997,7 +5111,7 @@ def _build_trailer_and_reel_sync(proj_dir: str, state: dict):
                 "-t",
                 "3.2",
                 "-vf",
-                "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+                "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720",
                 "-r",
                 "24",
                 "-c:v",
@@ -5012,53 +5126,57 @@ def _build_trailer_and_reel_sync(proj_dir: str, state: dict):
                 "44100",
                 "-b:a",
                 "96k",
-                cut_out,
+                cut_16,
             ],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        fast_cuts_16.append(cut_out)
+        fast_cuts_16.append(cut_16)
+
+        cut_9 = f"{t_dir}/cut9_{idx}.mp4"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                src,
+                "-t",
+                "3.2",
+                "-vf",
+                "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280",
+                "-r",
+                "24",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-ar",
+                "44100",
+                "-b:a",
+                "96k",
+                cut_9,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        fast_cuts_9.append(cut_9)
+
     fast_cuts_16.append(outro_16)
+    fast_cuts_9.append(outro_9)
 
     trailer_16 = f"{proj_dir}/TRAILER_16_9.mp4"
     ffmpeg_concat(fast_cuts_16, trailer_16)
 
-    # Create 9:16 Vertical Instagram Reel / YouTube Short (720x1280) with blurred cinema backdrop
+    # Direct full-screen 9:16 Vertical Reel (720x1280 edge-to-edge, ZERO blurred side bars!)
     reel_9_16 = f"{proj_dir}/REEL_9_16.mp4"
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            trailer_16,
-            "-filter_complex",
-            "[0:v]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,boxblur=16:2[bg];[0:v]scale=720:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[vout]",
-            "-map",
-            "[vout]",
-            "-map",
-            "0:a?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-pix_fmt",
-            "yuv420p",
-            "-crf",
-            "26",
-            "-c:a",
-            "aac",
-            "-ar",
-            "44100",
-            "-b:a",
-            "96k",
-            reel_9_16,
-        ],
-        check=True,
-        timeout=90,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    ffmpeg_concat(fast_cuts_9, reel_9_16)
+
     shutil.rmtree(t_dir, ignore_errors=True)
     return trailer_16, reel_9_16
 
