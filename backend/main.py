@@ -271,32 +271,39 @@ def load_hindi_font(size: int, bold: bool = True) -> ImageFont.FreeTypeFont | Im
 
 
 SCRIPT_TAG_LINE_RE = re.compile(
-    r"^\s*(?:title|शीर्षक|scene\s*\d*|सीन\s*\d*|location|लोकेशन|action|एक्शन|mood|मूड|sfx|camera|कैमरा|int\.|ext\.|cut\s+to|fade\s+(?:in|out)|narrator|सूत्रधार|background|बैकग्राउंड)\s*[:：\-]?",
+    r"^\s*(?:title|शीर्षक|scene\s*\d*|सीन\s*\d*|location|लोकेशन|action|एक्शन|mood|मूड|sfx|camera|कैमरा|int\.|ext\.|cut\s+to|fade\s+(?:in|out)|background|बैकग्राउंड)\s*[:：\-]?",
     re.IGNORECASE,
+)
+
+LEADING_SPEAKER_PREFIX_RE = re.compile(
+    r"^\s*[\"'“”‘’]*\s*(?:[A-Za-z\u0900-\u097F][A-Za-z\u0900-\u097F0-9_\- ]{0,22})\s*[:：]\s*"
 )
 
 
 def clean_spoken_dialogue(raw_text: str) -> str:
     """
-    Strip ALL script/stage metadata tags (`Title:`, `Scene 1:`, `Location:`, `Action:`, `[...]`, `(...)`, markdown)
-    so TTS characters NEVER read stage directions or headers aloud!
+    Strip ALL script/stage metadata tags AND any embedded leading speaker prefixes
+    (e.g. `Vikram:`, `Hero:`, `अजय:`, `Kaal:`, `Narrator:`) so TTS characters NEVER
+    read character names or stage directions aloud and subtitles NEVER show double prefixes!
     """
     txt = str(raw_text or "").strip()
     if not txt:
         return ""
-    # Remove bracketed & parenthetical stage cues like [Location: ...] or (angrily punches)
     txt = re.sub(r"\[[^\]]*\]", " ", txt)
     txt = re.sub(r"\([^)]*(?:action|scene|location|camera|mood|sfx|angry|shouts|runs|punches|laugh|एक्शन|सीन|लोकेशन)[^)]*\)", " ", txt, flags=re.IGNORECASE)
-    # Remove inline script metadata markers
     txt = re.sub(
         r"\b(?:Title|Scene\s*\d*|Location|Action|Mood|SFX|Camera|Visual|शीर्षक|सीन\s*\d*|लोकेशन|एक्शन|मूड)\s*[:：]\s*[^\n.।!?]*",
         " ",
         txt,
         flags=re.IGNORECASE,
     )
-    # Remove markdown formatting & quotes
     txt = txt.replace("**", "").replace("__", "").replace("##", "").replace("#", "")
     txt = re.sub(r"^[\-\*•\d\.\)\s]+", "", txt)
+    for _ in range(3):
+        stripped = LEADING_SPEAKER_PREFIX_RE.sub("", txt).strip()
+        if stripped == txt or len(stripped) < 2:
+            break
+        txt = stripped
     txt = re.sub(r"\s+", " ", txt).strip(" \"'“”‘’")
     return txt
 
@@ -310,12 +317,14 @@ def detect_speaker_role(speaker_name: str, char_map: Optional[dict] = None) -> s
         return "narrator"
     if any(k in low for k in ("log", "crowd", "public", "villager", "people", "लोग", "भीड़", "जनता", "गाँव वाले", "गांव वाले", "police", "पुलिस")):
         return "crowd"
-    if any(k in low for k in ("saas", "mother-in-law", "stepmother", "aunty", "chachi", "सास", "सौतेली", "बुआ")):
+    if any(k in low for k in ("saas", "mother-in-law", "stepmother", "aunty", "chachi", "maa", "mother", "सास", "सौतेली", "बुआ", "माँ", "मम्मी")):
         return "saas"
-    if any(k in low for k in ("villain", "don", "kaal", "boss", "gunda", "evil", "enemy", "rakshas", "shaitan", "विलेन", "डॉन", "गुंडा", "दुश्मन", "काल")):
+    if any(k in low for k in ("villain", "rival", "don", "kaal", "boss", "gunda", "evil", "enemy", "rakshas", "shaitan", "विलेन", "डॉन", "गुंडा", "दुश्मन", "काल", "साला", "दामाद")):
         return "villain"
-    if any(k in low for k in ("heroine", "priya", "pooja", "anjali", "rani", "maa", "mother", "wife", "bahu", "girl", "woman", "ladki", "lady", "लड़की", "माँ", "रानी", "बहन", "पत्नी", "बहू")):
+    if any(k in low for k in ("heroine", "नायिका", "priya", "kavya", "काव्या", "pooja", "anjali", "meera", "rani", "wife", "bahu", "girl", "woman", "ladki", "lady", "लड़की", "रानी", "बहन", "पत्नी", "बहू")):
         return "female"
+    if any(k in low for k in ("hero", "नायक", "हीरो")):
+        return "hero"
     if char_names and speaker_name == char_names[0]:
         return "hero"
     if len(char_names) >= 2 and speaker_name == char_names[1]:
@@ -338,12 +347,12 @@ def resolve_character_voice_profile(
 ) -> tuple[str, str, str]:
     """
     Return distinct (edge_tts_voice, pitch_hz, rate_pct) per Pocket FM / Bollywood drama role:
-    - Dramatic Narrator: hi-IN-MadhurNeural, suspense storytelling pitch="-4Hz", rate="+4%"
     - Hero: hi-IN-MadhurNeural, bold heroic pitch="+3Hz", rate="+2%"
-    - Villain: hi-IN-MadhurNeural, heavy dangerous bass pitch="-14Hz", rate="-6%"
-    - Saas / Sharp Female Villain: hi-IN-SwaraNeural, sharp tone pitch="-4Hz", rate="+3%"
-    - Female / Heroine: hi-IN-SwaraNeural, pitch="+4Hz", rate="+2%"
-    - Crowd / Log: hi-IN-SwaraNeural / pitch variations
+    - Heroine / Ladki: hi-IN-SwaraNeural, expressive female pitch="+4Hz", rate="+2%"
+    - Villain / Boss: hi-IN-MadhurNeural, deep heavy pitch="-12Hz", rate="-6%"
+    - Saas / Maa: hi-IN-SwaraNeural, sharp dramatic pitch="+6Hz", rate="+4%"
+    - Narrator: hi-IN-MadhurNeural, cinematic storyteller pitch="-4Hz", rate="+3%"
+    - Crowd / Log: dynamic alternating pitch variants
     """
     lang = normalize_language(language)
     role = detect_speaker_role(speaker_name, char_map)
@@ -352,16 +361,15 @@ def resolve_character_voice_profile(
 
     if lang == "English":
         if role == "narrator":
-            return ("en-IN-PrabhatNeural", "-4Hz", "+4%")
+            return ("en-IN-PrabhatNeural", "-4Hz", "+3%")
         if role == "saas":
-            return ("en-IN-NeerjaNeural", "-4Hz", "+3%")
+            return ("en-IN-NeerjaNeural", "+6Hz", "+4%")
         if role in ("female", "crowd") or "Swara" in explicit_voice or "Neerja" in explicit_voice:
-            return ("en-IN-NeerjaNeural", "+4Hz" if role == "female" else "+8Hz", "+4%")
+            return ("en-IN-NeerjaNeural", "+4Hz" if role == "female" else "+8Hz", "+2%")
         if role == "villain":
-            return ("en-IN-PrabhatNeural", "-14Hz", "-6%")
+            return ("en-IN-PrabhatNeural", "-12Hz", "-6%")
         return ("en-IN-PrabhatNeural", "+3Hz", "+2%")
 
-    # Respect explicit non-normal user pitch preset if chosen
     if raw_pitch_key != "normal" and raw_pitch_key in PITCH_PRESETS:
         p = PITCH_PRESETS[raw_pitch_key]
         v = explicit_voice if explicit_voice else ("hi-IN-SwaraNeural" if role in ("female", "saas", "crowd") else "hi-IN-MadhurNeural")
@@ -370,11 +378,11 @@ def resolve_character_voice_profile(
         return (v, p["pitch"], p["rate"])
 
     if role == "narrator":
-        return ("hi-IN-MadhurNeural", "-4Hz", "+4%")
+        return ("hi-IN-MadhurNeural", "-4Hz", "+3%")
     if role == "villain":
-        return ("hi-IN-MadhurNeural", "-14Hz", "-6%")
+        return ("hi-IN-MadhurNeural", "-12Hz", "-6%")
     if role == "saas":
-        return ("hi-IN-SwaraNeural", "-4Hz", "+3%")
+        return ("hi-IN-SwaraNeural", "+6Hz", "+4%")
     if role == "crowd":
         crowd_variants = [
             ("hi-IN-SwaraNeural", "+6Hz", "+6%"),
@@ -384,45 +392,67 @@ def resolve_character_voice_profile(
         return crowd_variants[scene_idx % len(crowd_variants)]
     if role == "female" or "Swara" in explicit_voice:
         return ("hi-IN-SwaraNeural", "+4Hz", "+2%")
-    # Default Hero bold commanding tone
     return ("hi-IN-MadhurNeural", "+3Hz", "+2%")
 
 
 def _get_or_create_role_portrait(role_kind: str, proj_dir: str) -> Optional[str]:
     """
-    Generate and cache a realistic Bollywood Villain or Crowd face portrait ONLY when
-    the script introduces Villain or Log/Crowd speakers that the user did not upload a photo for.
-    Uploaded user characters NEVER use this — they stay 100% locked to the user's 5-angle scan.
+    Generate and cache a realistic Bollywood character close-up portrait when
+    the script introduces Heroine, Villain, Saas, or Crowd speakers that the user did not upload a photo for.
     """
-    clean_role = "crowd" if role_kind == "crowd" else "villain"
+    role_map = {
+        "villain": (
+            "villain",
+            "Close-up cinematic portrait of dramatic Indian Bollywood villain man with intense eyes, dark beard, sharp tailored coat, moody rim lighting, 4K film still, photorealistic, looking at camera",
+            42,
+        ),
+        "saas": (
+            "saas",
+            "Close-up cinematic portrait of wealthy dramatic Indian matriarch saas woman in rich silk saree and gold jewelry, sharp intimidating expression, Bollywood mansion rim lighting, 4K film still, photorealistic",
+            63,
+        ),
+        "female": (
+            "heroine",
+            "Close-up cinematic portrait of expressive young Indian Bollywood heroine actress in stylish ethnic attire, emotional eyes, warm dramatic rim lighting, 4K film still, photorealistic, looking at camera",
+            77,
+        ),
+        "crowd": (
+            "crowd",
+            "Cinematic Bollywood movie shot of expressive Indian street crowd people reacting excitedly in dramatic city night lighting, photorealistic 4K film still, clear faces",
+            99,
+        ),
+    }
+    clean_role, prompt, seed_num = role_map.get(role_kind, role_map["villain"])
     out_path = safe_project_file(proj_dir, f"auto_role_{clean_role}.jpg")
     if os.path.exists(out_path) and os.path.getsize(out_path) > 4000:
         return out_path
 
-    prompt = (
-        "Close-up cinematic portrait of dramatic Indian Bollywood villain man with intense eyes, dark beard, leather jacket, moody rim lighting, 4K film still, photorealistic, looking at camera"
-        if clean_role == "villain"
-        else "Cinematic Bollywood movie shot of expressive Indian street crowd people reacting excitedly in dramatic city night lighting, photorealistic 4K film still, clear faces"
-    )
-    # Fast photorealistic portrait fetch via Pollinations Flux
-    try:
-        encoded = urllib.parse.quote(prompt, safe="")
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=768&model=flux&nologo=true&seed={42 if clean_role == 'villain' else 99}"
-        resp = requests.get(url, timeout=12)
-        if resp.status_code == 200 and len(resp.content) > 5000:
-            save_upright_image_bytes(resp.content, out_path, max_side=960)
-            return out_path
-    except Exception:
-        pass
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    encoded = urllib.parse.quote(prompt, safe="")
+    for url in (
+        f"https://pollinations.ai/p/{encoded}?width=768&height=768&model=flux&nologo=true&seed={seed_num}",
+        f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=768&model=turbo&nologo=true&seed={seed_num}",
+    ):
+        try:
+            resp = requests.get(url, headers=headers, timeout=8)
+            ctype = str(resp.headers.get("content-type", "")).lower()
+            if resp.status_code == 200 and len(resp.content) > 5000 and ("image" in ctype or resp.content[:2] in (b"\xff\xd8", b"\x89P")):
+                save_upright_image_bytes(resp.content, out_path, max_side=960)
+                return out_path
+        except Exception:
+            continue
     return None
 
 
 def resolve_character_name(raw_name: object, char_map: dict, fallback_idx: int = 0) -> str:
-    """Resolve dialogue speaker accurately: preserves Villain/Crowd roles if distinct, and strictly locks user characters."""
+    """Resolve dialogue speaker accurately: preserves Heroine/Villain/Saas/Narrator/Crowd distinctly, and locks Hero to user's primary character."""
     char_names = list(char_map.keys())
+    raw = str(raw_name or "").strip().strip(":：").strip()
     if not char_names:
-        return "Hero"
-    raw = str(raw_name or "").strip()
+        return raw or "Hero"
     if raw in char_map:
         return raw
     raw_low = raw.lower()
@@ -438,14 +468,21 @@ def resolve_character_name(raw_name: object, char_map: dict, fallback_idx: int =
             raw_first = raw_low.split()[0]
             if len(cn_first) >= 2 and cn_first == raw_first:
                 return cn
-        # If user uploaded 2+ characters, map villain mentions to character #2
-        if len(char_names) >= 2 and any(k in raw_low for k in ("villain", "don", "boss", "enemy", "विलेन", "डॉन", "दुश्मन")):
-            return char_names[1]
-        # If user uploaded only 1 hero photo and script explicitly has Villain or Crowd/Log, keep distinct speaker label!
-        if any(k in raw_low for k in ("villain", "don", "kaal", "boss", "विलेन", "डॉन", "दुश्मन")):
+        if raw_low in ("hero", "हीरो", "नायक"):
+            return char_names[0]
+        if any(k in raw_low for k in ("narrator", "sutradhar", "सूत्रधार", "नैरेटर")):
+            return "Narrator"
+        if any(k in raw_low for k in ("saas", "सास", "माँ", "mother-in-law")):
+            return "Saas"
+        if any(k in raw_low for k in ("heroine", "नायिका", "पत्नी", "बहू", "ladki", "लड़की", "priya", "kavya", "meera")):
+            for cn in char_names:
+                if detect_speaker_role(cn, char_map) == "female":
+                    return cn
+            return "Heroine"
+        if any(k in raw_low for k in ("villain", "rival", "don", "kaal", "boss", "विलेन", "डॉन", "दुश्मन", "काल")):
             return "Villain"
         if any(k in raw_low for k in ("log", "crowd", "public", "people", "लोग", "भीड़", "जनता", "गाँव वाले")):
-            return "Log (Crowd)"
+            return "Crowd"
     return char_names[fallback_idx % len(char_names)]
 
 PITCH_PRESETS = {
@@ -2199,58 +2236,279 @@ def render_location_backdrop(
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Referer": "https://pollinations.ai/",
     }
     cfg = get_runtime_ai_config()
     if cfg.get("enable_pollinations", True):
         pref_model = cfg.get("pollinations_model", "flux")
-        model_order = [pref_model] + [m for m in ("flux", "flux-realism") if m != pref_model]
+        alt_model = "turbo" if pref_model != "turbo" else "flux"
+        # Primary mirror uses pollinations.ai/p/ (avoids image.pollinations.ai rate limits), then fallback mirrors
         candidate_urls = [
-            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model={model_order[0]}&nologo=true&seed={seed_val}", 8),
-            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model={model_order[1]}&nologo=true&seed={(seed_val + 137) % 99999}", 7),
+            (f"https://pollinations.ai/p/{encoded}?width={W}&height={H}&model={pref_model}&nologo=true&seed={seed_val}", 9),
+            (f"https://pollinations.ai/p/{encoded}?width={W}&height={H}&model={alt_model}&nologo=true&seed={(seed_val + 73) % 99999}", 8),
+            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model={alt_model}&nologo=true&seed={(seed_val + 137) % 99999}", 7),
         ]
         for url, t_sec in candidate_urls:
             try:
-                resp = requests.get(url, headers=headers, timeout=t_sec)
+                resp = requests.get(url, headers=headers, timeout=t_sec, allow_redirects=True)
                 ctype = str(resp.headers.get("content-type", "")).lower()
-                if resp.status_code == 200 and len(resp.content) > 8000 and ("image" in ctype or resp.content[:2] in (b"\xff\xd8", b"\x89P")):
+                if (
+                    resp.status_code == 200
+                    and len(resp.content) > 8000
+                    and ("image" in ctype or resp.content[:2] in (b"\xff\xd8", b"\x89P") or resp.content[:4] == b"RIFF")
+                ):
                     bg_img = open_upright_image(resp.content).resize((W, H), Image.Resampling.LANCZOS)
                     bg_img.save(cache_path, "JPEG", quality=92)
                     return bg_img
             except Exception:
                 continue
 
-    # Last-resort photorealistic atmospheric lighting backdrop (ZERO cartoon buildings/boxes!)
-    bg = Image.new("RGB", (W, H), (14, 10, 18))
+    # Mirror 2: Free HuggingFace Fast Image Spaces via gradio_client (FLUX.1-schnell, SDXL-Lightning, SDXL-Turbo, Playground v2.5)
+    hf_img = _try_hf_fast_image_spaces(full_prompt, W, H, seed_val, cfg)
+    if hf_img is not None:
+        try:
+            hf_img.save(cache_path, "JPEG", quality=92)
+        except Exception:
+            pass
+        return hf_img
+
+    # Mirror 3: Rich Illustrated Bollywood Character & Set Fallback (NEVER a blank blurred gradient!)
+    return _render_illustrated_bollywood_fallback(W, H, location_key, mood, hero_role, include_hero, cache_key)
+
+
+_HF_IMG_SPACE_COOLDOWN: dict[str, float] = {}
+
+
+def _extract_gradio_image_path(res) -> Optional[str]:
+    if isinstance(res, str) and os.path.exists(res):
+        return res
+    if isinstance(res, dict):
+        for k in ("path", "image", "url"):
+            v = res.get(k)
+            if isinstance(v, str) and os.path.exists(v):
+                return v
+    if isinstance(res, (list, tuple)):
+        for item in res:
+            found = _extract_gradio_image_path(item)
+            if found:
+                return found
+    return None
+
+
+def _try_hf_fast_image_spaces(prompt: str, W: int, H: int, seed_val: int, cfg: dict) -> Optional[Image.Image]:
+    """Try fast free HuggingFace text-to-image Spaces with strict timeout & circuit breaker."""
+    if not GRADIO_AVAILABLE or not cfg.get("enable_public_hf_spaces", True):
+        return None
+    hf_tok = (cfg.get("hf_token") or os.getenv("HF_TOKEN") or "").strip() or None
+    timeout_s = max(6, min(12, int(cfg.get("space_timeout_sec", 8)) + 2))
+    now_t = time.time()
+    space_specs = [
+        ("black-forest-labs/FLUX.1-schnell", lambda c: c.predict(prompt=prompt, seed=seed_val, randomize_seed=False, width=min(1024, W), height=min(1024, H), num_inference_steps=4, api_name="/infer")),
+        ("ByteDance/SDXL-Lightning", lambda c: c.predict(prompt, "4-Step", api_name="/generate_image")),
+        ("stabilityai/sdxl-turbo", lambda c: c.predict(prompt, api_name="/predict")),
+        ("playgroundai/playground-v2.5-1024px-aesthetic", lambda c: c.predict(prompt=prompt, negative_prompt="blurry, text, watermark, cartoon", use_negative_prompt=True, seed=seed_val, width=min(1024, W), height=min(1024, H), guidance_scale=3.0, randomize_seed=False, api_name="/run")),
+    ]
+    for space_id, invoke_fn in space_specs:
+        if now_t - _HF_IMG_SPACE_COOLDOWN.get(space_id, 0.0) < 300:
+            continue
+        def _run_space(sid=space_id, fn=invoke_fn):
+            cli = GradioClient(sid, hf_token=hf_tok) if hf_tok else GradioClient(sid)
+            return fn(cli)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(_run_space)
+                res = fut.result(timeout=timeout_s)
+            img_path = _extract_gradio_image_path(res)
+            if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 4000:
+                return open_upright_image(img_path).resize((W, H), Image.Resampling.LANCZOS)
+        except Exception:
+            _HF_IMG_SPACE_COOLDOWN[space_id] = time.time()
+            continue
+    return None
+
+
+def _render_illustrated_bollywood_fallback(
+    W: int,
+    H: int,
+    location_key: str,
+    mood: str,
+    hero_role: str,
+    include_hero: bool,
+    cache_key: str,
+) -> Image.Image:
+    """
+    Rich graphic-novel Bollywood cinema frame with architectural pillars/set, volumetric spotlights,
+    dramatic illustrated character portrait (Hero/Heroine/Villain/Saas/Narrator), and rain/sparks VFX
+    so the screen NEVER looks like an empty blurred gradient even when offline!
+    """
+    bg = Image.new("RGB", (W, H), (14, 10, 22))
     palettes = {
-        "village_field": ((42, 28, 18), (138, 72, 26)),
-        "haunted_mansion": ((8, 14, 24), (24, 36, 52)),
-        "mumbai_rain": ((10, 20, 34), (22, 52, 76)),
-        "deep_jungle": ((8, 26, 18), (22, 62, 40)),
-        "police_station": ((14, 16, 30), (36, 22, 46)),
-        "outer_space": ((6, 8, 22), (24, 18, 56)),
-        "royal_palace": ((38, 14, 18), (118, 56, 20)),
-        "mountains": ((16, 26, 44), (62, 78, 102)),
-        "desert_fort": ((48, 20, 10), (142, 70, 20)),
-        "courtroom": ((28, 18, 12), (72, 44, 24)),
-        "cyber_lab": ((6, 18, 32), (14, 58, 84)),
-        "city_street": ((14, 16, 28), (44, 26, 48)),
+        "village_field": ((38, 22, 16), (134, 68, 24)),
+        "haunted_mansion": ((8, 14, 28), (24, 40, 62)),
+        "mumbai_rain": ((10, 20, 38), (22, 54, 82)),
+        "deep_jungle": ((8, 26, 18), (22, 64, 42)),
+        "police_station": ((14, 16, 34), (42, 22, 50)),
+        "outer_space": ((6, 8, 26), (26, 18, 62)),
+        "royal_palace": ((42, 14, 18), (124, 58, 22)),
+        "mountains": ((14, 24, 46), (62, 78, 108)),
+        "desert_fort": ((52, 22, 12), (146, 72, 22)),
+        "courtroom": ((30, 18, 12), (78, 46, 24)),
+        "cyber_lab": ((6, 18, 36), (14, 62, 92)),
+        "city_street": ((14, 16, 32), (48, 26, 54)),
     }
-    top_c, bot_c = palettes.get(location_key, palettes["city_street"])
+    top_c, bot_c = palettes.get(location_key, palettes["royal_palace"])
     _draw_vertical_gradient(bg, top_c, bot_c)
 
-    bokeh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    bdraw = ImageDraw.Draw(bokeh)
-    rim = MOOD_RIM_COLORS.get(mood, (255, 88, 60))
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    rim = MOOD_RIM_COLORS.get(mood, (255, 165, 60))
     rng = random.Random(hash(cache_key) & 0xFFFFFFFF)
-    for _ in range(18):
-        bx = rng.randint(-60, W + 60)
-        by = rng.randint(60, H - 60)
-        br = rng.randint(50, 175)
-        col = (rim[0], rim[1], rim[2], rng.randint(26, 68)) if rng.random() > 0.45 else (255, 190, 100, rng.randint(20, 50))
-        bdraw.ellipse([bx - br, by - br, bx + br, by + br], fill=col)
-    bokeh = bokeh.filter(ImageFilter.GaussianBlur(radius=46))
-    bg = Image.alpha_composite(bg.convert("RGBA"), bokeh).convert("RGB")
-    return bg
+
+    # 1. Architectural Bollywood Set (Palace / Haveli Pillars, Arches & Chandelier Glow)
+    pillar_w = max(36, int(W * 0.09))
+    for px in (int(W * 0.04), W - int(W * 0.04) - pillar_w):
+        draw.rectangle([px, 0, px + pillar_w, H], fill=(10, 8, 18, 195))
+        draw.rectangle([px + 4, 0, px + 8, H], fill=(rim[0], rim[1], rim[2], 90))
+        draw.rectangle([px + pillar_w - 8, 0, px + pillar_w - 4, H], fill=(rim[0], rim[1], rim[2], 65))
+    # Grand royal arch across top
+    draw.arc([int(W * 0.08), -int(H * 0.10), int(W * 0.92), int(H * 0.28)], start=0, end=180, fill=(255, 210, 110, 130), width=5)
+    # Glowing chandelier / moon orb at upper center
+    orb_r = int(min(W, H) * 0.14)
+    draw.ellipse([W // 2 - orb_r, int(H * 0.06), W // 2 + orb_r, int(H * 0.06) + orb_r * 2], fill=(255, 225, 150, 58))
+
+    # 2. Volumetric Diagonal Cinema Spotlights
+    spot = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    sdraw = ImageDraw.Draw(spot)
+    sdraw.polygon(
+        [(int(W * 0.12), 0), (int(W * 0.34), 0), (int(W * 0.82), H), (int(W * 0.42), H)],
+        fill=(rim[0], rim[1], rim[2], 42),
+    )
+    sdraw.polygon(
+        [(int(W * 0.66), 0), (int(W * 0.88), 0), (int(W * 0.56), H), (int(W * 0.18), H)],
+        fill=(255, 210, 120, 34),
+    )
+    spot = spot.filter(ImageFilter.GaussianBlur(radius=28))
+    bg = Image.alpha_composite(bg.convert("RGBA"), spot)
+    bg = Image.alpha_composite(bg, layer)
+
+    # 3. Dramatic Illustrated Bollywood Character Portrait (Centered & Crisp!)
+    if include_hero:
+        char_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        cd = ImageDraw.Draw(char_layer)
+        cx = W // 2
+        head_y = int(H * (0.37 if H > W else 0.40))
+        hr = int(min(W, H) * (0.175 if H > W else 0.19))
+
+        # Backlight aura behind character silhouette
+        aura = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ad = ImageDraw.Draw(aura)
+        aura_col = {
+            "villain": (220, 36, 48, 145),
+            "saas": (235, 145, 35, 140),
+            "female": (255, 110, 170, 135),
+            "narrator": (90, 175, 255, 125),
+        }.get(hero_role, (255, 195, 70, 145))
+        ad.ellipse([cx - int(hr * 1.9), head_y - int(hr * 1.5), cx + int(hr * 1.9), head_y + int(hr * 2.4)], fill=aura_col)
+        aura = aura.filter(ImageFilter.GaussianBlur(radius=42))
+        bg = Image.alpha_composite(bg, aura)
+
+        # Skin, hair & wardrobe palette tailored per speaking role
+        role_pal = {
+            "hero":     ((218, 162, 124), (24, 18, 20), (24, 32, 58),  (255, 208, 92)),
+            "female":   ((232, 178, 144), (26, 16, 18), (156, 22, 68), (255, 205, 115)),
+            "villain":  ((196, 142, 110), (16, 14, 18), (34, 16, 22),  (235, 58, 58)),
+            "saas":     ((214, 158, 124), (42, 38, 44), (132, 22, 42), (255, 212, 74)),
+            "narrator": ((184, 140, 112), (20, 20, 28), (18, 22, 38),  (110, 200, 255)),
+        }.get(hero_role, ((218, 162, 124), (24, 18, 20), (24, 32, 58), (255, 208, 92)))
+        skin_c, hair_c, outfit_c, accent_c = role_pal
+
+        # Shoulders & royal/cinematic outfit
+        sh_w = int(hr * 2.35)
+        sh_top = head_y + int(hr * 0.92)
+        cd.pieslice([cx - sh_w, sh_top, cx + sh_w, sh_top + int(hr * 4.4)], start=180, end=360, fill=(*outfit_c, 255))
+        cd.arc([cx - sh_w, sh_top, cx + sh_w, sh_top + int(hr * 4.4)], start=185, end=355, fill=(*accent_c, 215), width=4)
+        # Collar / Saree Pallu / Coat Lapels
+        cd.polygon(
+            [(cx - int(hr * 0.55), sh_top + 10), (cx, sh_top + int(hr * 1.15)), (cx + int(hr * 0.55), sh_top + 10)],
+            fill=(*accent_c, 195),
+        )
+        # Neck
+        cd.rectangle([cx - int(hr * 0.32), head_y + int(hr * 0.65), cx + int(hr * 0.32), sh_top + int(hr * 0.35)], fill=(skin_c[0] - 24, skin_c[1] - 24, skin_c[2] - 22, 255))
+
+        # Flowing hair back (for Heroine / Saas)
+        if hero_role in ("female", "saas"):
+            cd.ellipse([cx - int(hr * 1.28), head_y - int(hr * 1.05), cx + int(hr * 1.28), head_y + int(hr * 1.65)], fill=(*hair_c, 255))
+            if hero_role == "saas":
+                # Traditional bun + gold earrings
+                cd.ellipse([cx - int(hr * 0.55), head_y - int(hr * 1.38), cx + int(hr * 0.55), head_y - int(hr * 0.65)], fill=(*hair_c, 255))
+
+        # Face oval with subtle rim highlight
+        cd.ellipse([cx - int(hr * 0.86), head_y - hr, cx + int(hr * 0.86), head_y + int(hr * 1.08)], fill=(*skin_c, 255), outline=(*accent_c, 145), width=3)
+
+        # Hair crown
+        cd.pieslice([cx - int(hr * 0.94), head_y - int(hr * 1.14), cx + int(hr * 0.94), head_y + int(hr * 0.25)], start=180, end=360, fill=(*hair_c, 255))
+
+        # Expressive Eyebrows & Glowing Eyes
+        eye_y = head_y - int(hr * 0.08)
+        eye_dx = int(hr * 0.34)
+        eye_rx = max(10, int(hr * 0.16))
+        eye_ry = max(6, int(hr * 0.09))
+        for side in (-1, 1):
+            ex = cx + side * eye_dx
+            # Brow (angled sharply for Villain/Saas/Hero)
+            brow_tilt = int(hr * 0.08) if hero_role in ("villain", "saas", "hero") else 0
+            cd.line(
+                [(ex - eye_rx - 4, eye_y - eye_ry - 8 - side * brow_tilt), (ex + eye_rx + 4, eye_y - eye_ry - 8 + side * brow_tilt)],
+                fill=(*hair_c, 240),
+                width=max(4, hr // 22),
+            )
+            cd.ellipse([ex - eye_rx, eye_y - eye_ry, ex + eye_rx, eye_y + eye_ry], fill=(248, 246, 244, 245))
+            ir = max(4, int(eye_ry * 0.78))
+            cd.ellipse([ex - ir, eye_y - ir, ex + ir, eye_y + ir], fill=(28, 18, 14, 255))
+            cd.ellipse([ex - ir // 2, eye_y - ir // 2, ex - ir // 2 + 3, eye_y - ir // 2 + 3], fill=(255, 255, 255, 255))
+
+        # Nose shadow
+        cd.line([(cx, eye_y + 6), (cx - 4, head_y + int(hr * 0.30)), (cx + 8, head_y + int(hr * 0.30))], fill=(skin_c[0] - 42, skin_c[1] - 42, skin_c[2] - 36, 185), width=3)
+
+        # Role signature features (Bindi, Jewelry, Beard/Mustache)
+        if hero_role in ("female", "saas"):
+            br = max(5, hr // 16)
+            cd.ellipse([cx - br, eye_y - int(hr * 0.28) - br, cx + br, eye_y - int(hr * 0.28) + br], fill=(215, 20, 42, 255))
+            # Gold earrings & necklace
+            for side in (-1, 1):
+                cd.ellipse([cx + side * int(hr * 0.90) - 9, head_y + int(hr * 0.22), cx + side * int(hr * 0.90) + 9, head_y + int(hr * 0.48)], fill=(255, 208, 66, 240))
+            cd.arc([cx - int(hr * 0.65), sh_top - 4, cx + int(hr * 0.65), sh_top + int(hr * 0.75)], start=10, end=170, fill=(255, 212, 74, 245), width=6)
+        elif hero_role in ("villain", "hero"):
+            # Beard / Jawline stubble
+            beard_alpha = 235 if hero_role == "villain" else 135
+            cd.pieslice([cx - int(hr * 0.84), head_y + int(hr * 0.16), cx + int(hr * 0.84), head_y + int(hr * 1.09)], start=18, end=162, fill=(hair_c[0], hair_c[1], hair_c[2], beard_alpha))
+            # Mustache
+            cd.arc([cx - int(hr * 0.36), head_y + int(hr * 0.34), cx + int(hr * 0.36), head_y + int(hr * 0.62)], start=195, end=345, fill=(*hair_c, 245), width=max(5, hr // 16))
+
+        # Mouth / Expressive lips
+        mouth_y = head_y + int(hr * 0.58)
+        lip_col = (188, 42, 68, 240) if hero_role in ("female", "saas") else (138, 66, 58, 230)
+        cd.arc([cx - int(hr * 0.26), mouth_y - 10, cx + int(hr * 0.26), mouth_y + 16], start=15, end=165, fill=lip_col, width=max(5, hr // 18))
+
+        bg = Image.alpha_composite(bg, char_layer)
+
+    # 4. Atmospheric VFX Particles (Rain Streaks / Sparks / Floating Gold Dust)
+    fx = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    fdraw = ImageDraw.Draw(fx)
+    if location_key == "mumbai_rain" or mood == "Suspense":
+        for _ in range(55):
+            rx = rng.randint(0, W)
+            ry = rng.randint(0, H)
+            fdraw.line([(rx, ry), (rx - 8, ry + 34)], fill=(185, 225, 255, rng.randint(55, 130)), width=2)
+    else:
+        for _ in range(38):
+            sx = rng.randint(12, W - 12)
+            sy = rng.randint(12, H - 12)
+            sr = rng.randint(2, 6)
+            fdraw.ellipse([sx - sr, sy - sr, sx + sr, sy + sr], fill=(255, 210, 110, rng.randint(85, 195)))
+    bg = Image.alpha_composite(bg, fx)
+
+    return bg.convert("RGB")
 
 
 def draw_channel_watermark(
@@ -2304,16 +2562,12 @@ def render_hindi_subtitle_png(
     full_line = f"{clean_spk}: {clean_diag}" if clean_spk else clean_diag
 
     is_vertical = width < 900
-    if is_vertical and height < 220:
-        height = 240
+    if is_vertical and height < 360:
+        # Raise vertical strip so subtitle text sits cleanly around y = H - 220 (well above bottom player controls!)
+        height = 360
 
     strip = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(strip)
-
-    # Smooth translucent cinema gradient band at bottom (no harsh blocky box!)
-    for y in range(height):
-        alpha = int(218 * ((y / max(1, height - 1)) ** 1.25))
-        draw.line([(0, y), (width, y)], fill=(6, 6, 14, alpha))
 
     font_size = 28 if is_vertical else 30
     font_main = load_hindi_font(font_size, bold=True)
@@ -2340,8 +2594,18 @@ def render_hindi_subtitle_png(
     lines = lines[:max_lines]
 
     line_h = 40 if is_vertical else 42
-    bottom_pad = 64 if is_vertical else 22  # Extra safe-zone above Moj/Reels bottom UI
+    # Place 9:16 subtitles cleanly above bottom player controls (~220px from bottom)
+    bottom_pad = 215 if is_vertical else 24
     start_y = max(18, height - (len(lines) * line_h) - bottom_pad)
+
+    # Smooth translucent cinema band strictly behind the subtitle text (leaves bottom controls clean!)
+    band_top = max(0, start_y - 16)
+    band_bot = min(height - 1, start_y + len(lines) * line_h + 14)
+    draw.rounded_rectangle(
+        [18 if is_vertical else 40, band_top, width - (18 if is_vertical else 40), band_bot],
+        radius=16,
+        fill=(6, 6, 16, 178),
+    )
     for idx, ln in enumerate(lines):
         try:
             bbox = draw.textbbox((0, 0), ln, font=font_main)
