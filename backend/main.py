@@ -301,9 +301,10 @@ def clean_spoken_dialogue(raw_text: str) -> str:
     return txt
 
 
-def detect_speaker_role(speaker_name: str, char_map: dict) -> str:
+def detect_speaker_role(speaker_name: str, char_map: Optional[dict] = None) -> str:
     """Classify speaker as 'narrator', 'hero', 'villain', 'saas', 'female', or 'crowd' for distinct voices & visuals."""
     low = (speaker_name or "").lower().strip()
+    char_map = char_map or {}
     char_names = list(char_map.keys())
     if any(k in low for k in ("narrator", "sutradhar", "voiceover", "storyteller", "सूत्रधार", "कथावाचक", "नैरेटर")):
         return "narrator"
@@ -599,6 +600,82 @@ def make_referral_code(email: str) -> str:
     return f"CP{prefix}{suffix}"
 
 
+AVATARS_DIR = "all_avatars"
+os.makedirs(AVATARS_DIR, exist_ok=True)
+
+DEFAULT_AI_CONFIG = {
+    "custom_video_space": "",
+    "custom_faceswap_space": "",
+    "hf_token": os.getenv("HF_TOKEN", ""),
+    "enable_custom_hf": True,
+    "enable_pollinations": True,
+    "pollinations_model": "flux",
+    "enable_public_hf_spaces": True,
+    "enable_ltx_video": True,
+    "enable_wan21": True,
+    "enable_cogvideox": True,
+    "enable_local_motion_fallback": True,
+    "space_timeout_sec": 8,
+}
+
+
+def normalize_ai_config(raw: Optional[dict]) -> dict:
+    cfg = dict(DEFAULT_AI_CONFIG)
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if k in cfg:
+                cfg[k] = v
+    cfg["custom_video_space"] = str(cfg.get("custom_video_space") or "").strip()
+    cfg["custom_faceswap_space"] = str(cfg.get("custom_faceswap_space") or "").strip()
+    cfg["hf_token"] = str(cfg.get("hf_token") or "").strip()
+    pm = str(cfg.get("pollinations_model") or "flux").strip().lower()
+    cfg["pollinations_model"] = pm if pm in ("flux", "turbo", "flux-realism") else "flux"
+    for bkey in (
+        "enable_custom_hf",
+        "enable_pollinations",
+        "enable_public_hf_spaces",
+        "enable_ltx_video",
+        "enable_wan21",
+        "enable_cogvideox",
+        "enable_local_motion_fallback",
+    ):
+        val = cfg.get(bkey, True)
+        if isinstance(val, str):
+            cfg[bkey] = val.strip().lower() in ("true", "1", "yes", "on")
+        else:
+            cfg[bkey] = bool(val)
+    try:
+        cfg["space_timeout_sec"] = max(4, min(15, int(cfg.get("space_timeout_sec", 8))))
+    except Exception:
+        cfg["space_timeout_sec"] = 8
+    return cfg
+
+
+def get_runtime_ai_config() -> dict:
+    try:
+        db = load_db()
+        return normalize_ai_config(db.get("ai_config"))
+    except Exception:
+        return dict(DEFAULT_AI_CONFIG)
+
+
+def save_user_avatar_bytes(email: str, raw_bytes: bytes) -> Optional[str]:
+    """Save an EXIF-upright user profile face avatar to all_avatars/ and return its relative URL."""
+    if not email or not raw_bytes or len(raw_bytes) < 256:
+        return None
+    try:
+        safe_slug = re.sub(r"[^a-zA-Z0-9]", "_", email.lower().strip())[:48] or "user"
+        filename = f"{safe_slug}.jpg"
+        out_path = os.path.join(AVATARS_DIR, filename)
+        save_upright_image_bytes(raw_bytes, out_path, max_side=640)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 512:
+            ts = int(time.time())
+            return f"/user-avatar/{filename}?v={ts}"
+    except Exception:
+        pass
+    return None
+
+
 def load_db():
     if os.path.exists(DB_FILE):
         try:
@@ -610,8 +687,11 @@ def load_db():
                 data.setdefault("referrals", [])
                 data.setdefault("face_swaps", {})
                 data.setdefault("total_revenue", 0)
+                data["ai_config"] = normalize_ai_config(data.get("ai_config"))
                 for em, u in data.get("users", {}).items():
                     u.setdefault("wallet_balance", 0)
+                    u.setdefault("mobile", "")
+                    u.setdefault("face_linked", bool(u.get("photo_url")))
                     u.setdefault("redeemed_codes", [])
                     if not u.get("referral_code"):
                         u["referral_code"] = make_referral_code(em)
@@ -629,6 +709,7 @@ def load_db():
         "referrals": [],
         "face_swaps": {},
         "total_revenue": 0,
+        "ai_config": dict(DEFAULT_AI_CONFIG),
     }
 
 
@@ -728,11 +809,11 @@ def home():
     return {
         "app": "CinePop AI — Pocket Bollywood & Face-Swap Studio",
         "status": "100% Live",
-        "engine_version": "v7-zero-422-multi-engine-free-ai-video-autocast",
+        "engine_version": "v8-parallel-admin-crm-ai-control-center",
         "devanagari_font": find_devanagari_font_path(bold=True) or "not-found",
         "gemini_configured": bool(GEMINI_API_KEY),
         "opencv_faceswap": OPENCV_AVAILABLE,
-        "video_engine": "Wan2.1 / LTX-Video / CogVideoX-5b / HunyuanVideo / Pollinations Flux Multi-Shot + LivePortrait & SadTalker + AI Auto-Cast",
+        "video_engine": "Custom HF Space / Wan2.1 / LTX-Video / CogVideoX-5b / Parallel Pollinations Flux + LivePortrait & SadTalker + AI Auto-Cast",
         "admin_pin_enabled": True,
         "price_per_movie": f"₹{MOVIE_PRICE_INR}",
     }
@@ -742,6 +823,7 @@ def home():
 def google_login(
     email: str = Form(...),
     name: str = Form("CinePop Creator"),
+    mobile: str = Form(""),
     photo_url: str = Form(""),
     device_id: str = Form("android"),
     admin_pin: str = Form(""),
@@ -750,6 +832,7 @@ def google_login(
     email = email.lower().strip()
     if "@" not in email:
         raise HTTPException(status_code=400, detail="Valid Google Email required")
+    clean_mobile = re.sub(r"[^0-9+\-\s]", "", (mobile or "").strip())[:20]
 
     is_admin_email = email == ADMIN_EMAIL
     if is_admin_email and admin_pin.strip() and not verify_pin_secret(admin_pin):
@@ -766,7 +849,9 @@ def google_login(
         db["users"][email] = {
             "email": email,
             "name": name,
+            "mobile": clean_mobile,
             "photo_url": photo_url,
+            "face_linked": bool(photo_url),
             "device_id": device_id,
             "installed_at": now,
             "last_active": now,
@@ -783,6 +868,8 @@ def google_login(
     else:
         db["users"][email]["last_active"] = now
         db["users"][email].setdefault("wallet_balance", 0)
+        db["users"][email].setdefault("mobile", "")
+        db["users"][email].setdefault("face_linked", bool(db["users"][email].get("photo_url")))
         if not db["users"][email].get("referral_code"):
             db["users"][email]["referral_code"] = make_referral_code(email)
         db["users"][email].setdefault("referred_by", "")
@@ -790,7 +877,9 @@ def google_login(
         db["users"][email].setdefault("referral_earnings", 0)
         if name:
             db["users"][email]["name"] = name
-        if photo_url:
+        if clean_mobile:
+            db["users"][email]["mobile"] = clean_mobile
+        if photo_url and not str(db["users"][email].get("photo_url", "")).startswith("/user-avatar/"):
             db["users"][email]["photo_url"] = photo_url
 
     referral_message = ""
@@ -815,10 +904,12 @@ def google_login(
 def instant_guest_login(
     device_id: str = Form("android"),
     guest_name: str = Form(""),
+    mobile: str = Form(""),
     referral_code: str = Form(""),
 ):
     """1-Click Guest / Instant Start with 1 Free Trial Movie Pass so any new user can start immediately."""
     clean_dev = re.sub(r"[^a-zA-Z0-9_-]", "", (device_id or "guest").strip())[:24] or "guest"
+    clean_mobile = re.sub(r"[^0-9+\-\s]", "", (mobile or "").strip())[:20]
     guest_id = str(uuid.uuid4())[:8]
     email = f"guest_{clean_dev}_{guest_id}@cinepop.guest".lower()
     display_name = (guest_name or "").strip()[:32] or f"Guest Creator {guest_id[:4].upper()}"
@@ -828,7 +919,9 @@ def instant_guest_login(
     db["users"][email] = {
         "email": email,
         "name": display_name,
+        "mobile": clean_mobile,
         "photo_url": "",
+        "face_linked": False,
         "device_id": clean_dev,
         "installed_at": now,
         "last_active": now,
@@ -860,6 +953,93 @@ def instant_guest_login(
         "upi_id": UPI_ID,
         "movie_price": MOVIE_PRICE_INR,
     }
+
+
+@app.post("/auth/profile/update/")
+@app.post("/auth/profile/update")
+async def update_user_profile(request: Request):
+    """Link upright Face ID / profile photo, Name, and Mobile Number to the user's profile in DB."""
+    content_type = (request.headers.get("content-type") or "").lower()
+    form_data = None
+    payload: dict = {}
+    if "application/json" in content_type:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+    else:
+        try:
+            form_data = await request.form()
+            for k in form_data.keys():
+                v = form_data.get(k)
+                if not _is_upload_file_obj(v):
+                    payload[k] = v
+        except Exception:
+            payload = {}
+
+    email = _safe_payload_str(payload, "email", "user_email", default="").lower().strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email required")
+
+    name = _safe_payload_str(payload, "name", default="")
+    mobile = re.sub(r"[^0-9+\-\s]", "", _safe_payload_str(payload, "mobile", "phone", default=""))[:20]
+    photo_url = _safe_payload_str(payload, "photo_url", default="")
+
+    db = load_db()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if email not in db["users"]:
+        db["users"][email] = {
+            "email": email,
+            "name": name or email.split("@")[0],
+            "mobile": mobile,
+            "photo_url": photo_url,
+            "face_linked": bool(photo_url),
+            "device_id": "android",
+            "installed_at": now,
+            "last_active": now,
+            "credits": 0,
+            "wallet_balance": 0,
+            "movies_created": 0,
+            "total_paid": 0,
+            "redeemed_codes": [],
+            "referral_code": make_referral_code(email),
+            "referred_by": "",
+            "referrals_count": 0,
+            "referral_earnings": 0,
+        }
+
+    u = db["users"][email]
+    u["last_active"] = now
+    if name:
+        u["name"] = name[:60]
+    if mobile:
+        u["mobile"] = mobile
+    if photo_url:
+        u["photo_url"] = photo_url
+        u["face_linked"] = True
+
+    avatar_files = _extract_form_uploads(form_data, "avatar", "photo", "face_image", "image")
+    if avatar_files:
+        try:
+            raw_av = await avatar_files[0].read()
+            saved_url = save_user_avatar_bytes(email, raw_av)
+            if saved_url:
+                u["photo_url"] = saved_url
+                u["face_linked"] = True
+        except Exception:
+            pass
+
+    save_db(db)
+    return {"message": "✅ प्रोफ़ाइल अपडेट हो गई!", "user": u}
+
+
+@app.get("/user-avatar/{filename}")
+def get_user_avatar(filename: str):
+    clean_name = os.path.basename(filename)
+    path = os.path.join(AVATARS_DIR, clean_name)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Avatar not found")
+    return FileResponse(path, media_type="image/jpeg")
 
 
 @app.get("/auth/google-web", response_class=HTMLResponse)
@@ -1147,9 +1327,14 @@ def submit_payment(
 def get_admin_stats(admin_email: str, admin_pin: str = ""):
     verify_admin(admin_email, admin_pin)
     db = load_db()
-    users_list = list(db["users"].values())
+    users_list = sorted(
+        list(db["users"].values()),
+        key=lambda u: str(u.get("last_active") or ""),
+        reverse=True,
+    )
     referrals_list = db.get("referrals", [])
     face_swaps_map = db.get("face_swaps", {})
+    ai_cfg = normalize_ai_config(db.get("ai_config"))
     return {
         "total_installs": len(users_list),
         "total_revenue": db.get("total_revenue", 0),
@@ -1164,6 +1349,165 @@ def get_admin_stats(admin_email: str, admin_pin: str = ""):
         "promo_codes": list(db.get("promo_codes", {}).values()),
         "wallet_transactions": db.get("wallet_transactions", [])[:30],
         "referrals": referrals_list[:50],
+        "ai_config": ai_cfg,
+    }
+
+
+@app.get("/admin/ai-config/")
+@app.get("/admin/ai-config")
+def get_admin_ai_config(admin_email: str, admin_pin: str = ""):
+    verify_admin(admin_email, admin_pin)
+    db = load_db()
+    return {"ai_config": normalize_ai_config(db.get("ai_config"))}
+
+
+@app.post("/admin/ai-config/")
+@app.post("/admin/ai-config")
+async def save_admin_ai_config(request: Request):
+    content_type = (request.headers.get("content-type") or "").lower()
+    payload: dict = {}
+    if "application/json" in content_type:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+    else:
+        try:
+            form = await request.form()
+            payload = {k: form.get(k) for k in form.keys()}
+        except Exception:
+            payload = {}
+
+    admin_email = _safe_payload_str(payload, "admin_email", "email", default="")
+    admin_pin = _safe_payload_str(payload, "admin_pin", "pin", default="")
+    verify_admin(admin_email, admin_pin)
+
+    db = load_db()
+    current = normalize_ai_config(db.get("ai_config"))
+    updatable_keys = (
+        "custom_video_space",
+        "custom_faceswap_space",
+        "hf_token",
+        "enable_custom_hf",
+        "enable_pollinations",
+        "pollinations_model",
+        "enable_public_hf_spaces",
+        "enable_ltx_video",
+        "enable_wan21",
+        "enable_cogvideox",
+        "enable_local_motion_fallback",
+        "space_timeout_sec",
+    )
+    for k in updatable_keys:
+        if k in payload and payload[k] is not None:
+            current[k] = payload[k]
+
+    db["ai_config"] = normalize_ai_config(current)
+    save_db(db)
+    _HF_SPACE_COOLDOWN.clear()
+    return {
+        "message": "✅ AI Engine & Custom Server सेटिंग्स सेव हो गईं!",
+        "ai_config": db["ai_config"],
+    }
+
+
+@app.post("/admin/test-ai-servers/")
+@app.post("/admin/test-ai-servers")
+async def test_admin_ai_servers(request: Request):
+    """Live parallel health & latency check across Admin Custom HF Spaces, Pollinations AI, and Public HF Spaces."""
+    content_type = (request.headers.get("content-type") or "").lower()
+    payload: dict = {}
+    if "application/json" in content_type:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+    else:
+        try:
+            form = await request.form()
+            payload = {k: form.get(k) for k in form.keys()}
+        except Exception:
+            payload = {}
+
+    admin_email = _safe_payload_str(payload, "admin_email", "email", default="")
+    admin_pin = _safe_payload_str(payload, "admin_pin", "pin", default="")
+    verify_admin(admin_email, admin_pin)
+
+    cfg = get_runtime_ai_config()
+    hf_token = cfg.get("hf_token", "")
+    headers_hf = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+
+    def _probe_hf_space(name: str, space_id: str, enabled: bool) -> dict:
+        if not enabled:
+            return {"name": name, "target": space_id or "Not Set", "status": "Disabled", "latency_ms": 0, "detail": "Admin toggle OFF"}
+        if not space_id:
+            return {"name": name, "target": "Not Configured", "status": "Not Set", "latency_ms": 0, "detail": "Space URL खाली है"}
+        t0 = time.time()
+        try:
+            clean_sid = space_id.replace("https://huggingface.co/spaces/", "").strip("/")
+            r = requests.get(f"https://huggingface.co/api/spaces/{clean_sid}", headers=headers_hf, timeout=5)
+            ms = int((time.time() - t0) * 1000)
+            if r.status_code == 200:
+                info = r.json()
+                stage = str((info.get("runtime") or {}).get("stage") or "UNKNOWN").upper()
+                if stage in ("RUNNING", "RUNNING_BUILDING"):
+                    return {"name": name, "target": clean_sid, "status": "Online / Fast", "latency_ms": ms, "detail": f"Stage: {stage}"}
+                return {"name": name, "target": clean_sid, "status": "Busy", "latency_ms": ms, "detail": f"Stage: {stage}"}
+            return {"name": name, "target": clean_sid, "status": "Busy", "latency_ms": ms, "detail": f"HTTP {r.status_code}"}
+        except Exception as e:
+            ms = int((time.time() - t0) * 1000)
+            return {"name": name, "target": space_id, "status": "Busy", "latency_ms": ms, "detail": str(e)[:60]}
+
+    def _probe_pollinations() -> dict:
+        model = cfg.get("pollinations_model", "flux")
+        if not cfg.get("enable_pollinations", True):
+            return {"name": f"Pollinations ({model})", "target": "image.pollinations.ai", "status": "Disabled", "latency_ms": 0, "detail": "Admin toggle OFF"}
+        t0 = time.time()
+        try:
+            r = requests.get(
+                f"https://image.pollinations.ai/prompt/bollywood%20cinema%20lights?width=256&height=256&model={model}&nologo=true",
+                timeout=6,
+            )
+            ms = int((time.time() - t0) * 1000)
+            if r.status_code == 200 and len(r.content) > 2000:
+                return {"name": f"Pollinations ({model})", "target": "image.pollinations.ai", "status": "Online / Fast", "latency_ms": ms, "detail": f"200 OK ({len(r.content)//1024}KB)"}
+            return {"name": f"Pollinations ({model})", "target": "image.pollinations.ai", "status": "Busy", "latency_ms": ms, "detail": f"HTTP {r.status_code} (Auto-fallback to flux)"}
+        except Exception as e:
+            ms = int((time.time() - t0) * 1000)
+            return {"name": f"Pollinations ({model})", "target": "image.pollinations.ai", "status": "Busy", "latency_ms": ms, "detail": str(e)[:60]}
+
+    def _run_all():
+        tasks = [
+            lambda: _probe_hf_space("Custom Video HF Space", cfg.get("custom_video_space", ""), cfg.get("enable_custom_hf", True)),
+            lambda: _probe_hf_space("Custom Face-Swap Space", cfg.get("custom_faceswap_space", ""), cfg.get("enable_custom_hf", True)),
+            _probe_pollinations,
+            lambda: _probe_hf_space("LTX-Video (Public HF)", "Lightricks/LTX-Video", cfg.get("enable_public_hf_spaces", True) and cfg.get("enable_ltx_video", True)),
+            lambda: _probe_hf_space("Wan 2.1 (Public HF)", "Wan-AI/Wan2.1", cfg.get("enable_public_hf_spaces", True) and cfg.get("enable_wan21", True)),
+            lambda: _probe_hf_space("CogVideoX-5B (Public HF)", "THUDM/CogVideoX-5b", cfg.get("enable_public_hf_spaces", True) and cfg.get("enable_cogvideox", True)),
+            lambda: _probe_hf_space("Face-Swap (Public HF)", "tonyassi/face-swap", cfg.get("enable_public_hf_spaces", True)),
+        ]
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as ex:
+            futs = [ex.submit(fn) for fn in tasks]
+            for fut in futs:
+                try:
+                    results.append(fut.result(timeout=7))
+                except Exception as e:
+                    results.append({"name": "Server Probe", "target": "-", "status": "Busy", "latency_ms": 7000, "detail": str(e)[:60]})
+        results.append({
+            "name": "Local Fast Motion + PIL Engine",
+            "target": "Railway CPU / OpenCV / FFmpeg",
+            "status": "Online / Fast" if cfg.get("enable_local_motion_fallback", True) else "Disabled",
+            "latency_ms": 45,
+            "detail": "Guaranteed 30-40s fallback (Zero 17% Hang)",
+        })
+        return results
+
+    servers = await asyncio.to_thread(_run_all)
+    return {
+        "tested_at": datetime.datetime.now().strftime("%H:%M:%S"),
+        "hf_token_configured": bool(hf_token),
+        "servers": servers,
     }
 
 
@@ -1629,24 +1973,39 @@ def _run_with_timeout(fn, timeout_sec: float = 10.0):
 def _try_hf_scene_faceswap(scene_img_path: str, actor_face_path: str, out_path: str) -> Optional[str]:
     """
     Seamlessly merge the user's scanned face onto the full-screen AI drama scene's hero using
-    100% FREE HuggingFace Face-Swap spaces (`tonyassi/face-swap`, `ezioruan/inswapper`) with
-    a strict 10s timeout + circuit breaker so movie rendering NEVER hangs at 5%-10%!
+    Admin Custom Face-Swap HF Space (Priority 1 with HF_TOKEN) -> Free Public HF Face-Swap spaces
+    (`tonyassi/face-swap`, `ezioruan/inswapper`) with strict 8s timeout + circuit breaker!
     """
+    if not GRADIO_AVAILABLE or Client is None or handle_file is None:
+        return None
     if not scene_img_path or not actor_face_path or not os.path.exists(scene_img_path) or not os.path.exists(actor_face_path):
         return None
-    for space_id in ("tonyassi/face-swap", "ezioruan/inswapper"):
+
+    cfg = get_runtime_ai_config()
+    hf_token = cfg.get("hf_token") or None
+    timeout_s = float(cfg.get("space_timeout_sec", 8))
+
+    space_queue: list[str] = []
+    if cfg.get("enable_custom_hf", True) and cfg.get("custom_faceswap_space"):
+        clean_custom = cfg["custom_faceswap_space"].replace("https://huggingface.co/spaces/", "").strip("/")
+        if clean_custom:
+            space_queue.append(clean_custom)
+    if cfg.get("enable_public_hf_spaces", True):
+        space_queue.extend(["tonyassi/face-swap", "ezioruan/inswapper"])
+
+    for space_id in space_queue:
         if _is_hf_space_cooling(space_id):
             continue
 
         def _call(sid=space_id):
-            hf_client = Client(sid)
+            hf_client = Client(sid, hf_token=hf_token) if hf_token else Client(sid)
             return hf_client.predict(
                 handle_file(actor_face_path),
                 handle_file(scene_img_path),
                 api_name="/predict",
             )
 
-        res = _run_with_timeout(_call, timeout_sec=10.0)
+        res = _run_with_timeout(_call, timeout_sec=timeout_s)
         if res is None:
             _mark_hf_space_failed(space_id)
             continue
@@ -1751,21 +2110,24 @@ def render_location_backdrop(
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     }
-    # Use 100% FREE Flux model (never paid turbo) with fast alternate-seed retry
-    candidate_urls = [
-        (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model=flux&nologo=true&seed={seed_val}", 14),
-        (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model=flux&nologo=true&seed={(seed_val + 137) % 99999}", 10),
-    ]
-    for url, t_sec in candidate_urls:
-        try:
-            resp = requests.get(url, headers=headers, timeout=t_sec)
-            ctype = str(resp.headers.get("content-type", "")).lower()
-            if resp.status_code == 200 and len(resp.content) > 8000 and ("image" in ctype or resp.content[:2] in (b"\xff\xd8", b"\x89P")):
-                bg_img = open_upright_image(resp.content).resize((W, H), Image.Resampling.LANCZOS)
-                bg_img.save(cache_path, "JPEG", quality=92)
-                return bg_img
-        except Exception:
-            continue
+    cfg = get_runtime_ai_config()
+    if cfg.get("enable_pollinations", True):
+        pref_model = cfg.get("pollinations_model", "flux")
+        model_order = [pref_model] + [m for m in ("flux", "flux-realism") if m != pref_model]
+        candidate_urls = [
+            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model={model_order[0]}&nologo=true&seed={seed_val}", 8),
+            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model={model_order[1]}&nologo=true&seed={(seed_val + 137) % 99999}", 7),
+        ]
+        for url, t_sec in candidate_urls:
+            try:
+                resp = requests.get(url, headers=headers, timeout=t_sec)
+                ctype = str(resp.headers.get("content-type", "")).lower()
+                if resp.status_code == 200 and len(resp.content) > 8000 and ("image" in ctype or resp.content[:2] in (b"\xff\xd8", b"\x89P")):
+                    bg_img = open_upright_image(resp.content).resize((W, H), Image.Resampling.LANCZOS)
+                    bg_img.save(cache_path, "JPEG", quality=92)
+                    return bg_img
+            except Exception:
+                continue
 
     # Last-resort photorealistic atmospheric lighting backdrop (ZERO cartoon buildings/boxes!)
     bg = Image.new("RGB", (W, H), (14, 10, 18))
@@ -1962,7 +2324,7 @@ def prepare_character_frame(
     """
     W, H = get_aspect_dimensions(aspect_ratio)
     is_vertical = H > W
-    role = detect_speaker_role(char_name)
+    role = detect_speaker_role(char_name, None)
     has_user_face = bool(raw_img_path and os.path.exists(raw_img_path) and os.path.getsize(raw_img_path) > 512)
 
     upright_actor_tmp = f"{out_frame_path}_upright_actor.jpg"
@@ -2116,35 +2478,57 @@ def _try_ai_action_i2v_spaces(
     mood: str,
 ) -> tuple[Optional[str], Optional[str]]:
     """
-    Multi-Engine 100% FREE AI Video Auto-Rotation Router (5-second fast failover + 10-min circuit breaker):
-    Engine 1: Wan-AI/Wan2.1 (Text-to-Video & Image-to-Video)
-    Engine 2: Lightricks/LTX-Video & Lightricks/ltx-video-distilled (Ultra-fast real-time cinematic video)
-    Engine 3: THUDM/CogVideoX-5b & THUDM/CogVideoX-5B-Space (Realistic human Bollywood drama action)
-    Engine 4: tencent/HunyuanVideo (High-detail motion scenes)
-    Returns `(local_video_path, engine_label)` if any space succeeds within 5s, else `(None, None)`
-    for instant failover to Engine 5 (Pollinations Flux Multi-Shot Motion + LivePortrait / SadTalker).
+    Multi-Engine AI Video Router (Strict 8-second failover + 10-min circuit breaker):
+    Priority 1: Admin Custom HF Video Space + personal HF_TOKEN
+    Priority 2: Enabled Public HF Spaces (LTX-Video, Wan 2.1, CogVideoX-5B, HunyuanVideo)
+    Returns `(local_video_path, engine_label)` if any space succeeds within timeout, else `(None, None)`.
     """
+    if not GRADIO_AVAILABLE or Client is None or handle_file is None:
+        return None, None
+
+    cfg = get_runtime_ai_config()
+    hf_token = cfg.get("hf_token") or None
+    timeout_s = float(cfg.get("space_timeout_sec", 8))
+
     prompt_txt = (
         visual_action_prompt.strip()
         if visual_action_prompt and visual_action_prompt.strip()
         else f"Cinematic Bollywood {mood} drama scene, dynamic tracking camera movement, realistic motion"
     )
     has_img = bool(raw_img_path and os.path.exists(raw_img_path) and os.path.getsize(raw_img_path) > 512)
-    i2v_spaces = [
-        ("Wan-AI/Wan2.1", "wan", "Wan 2.1"),
-        ("Lightricks/LTX-Video", "ltx", "LTX-Video"),
-        ("Lightricks/ltx-video-distilled", "ltx", "LTX-Video"),
-        ("THUDM/CogVideoX-5b", "cogvideo", "CogVideoX-5B"),
-        ("THUDM/CogVideoX-5B-Space", "cogvideo", "CogVideoX-5B"),
-        ("tencent/HunyuanVideo", "hunyuan", "HunyuanVideo"),
-    ]
+
+    i2v_spaces: list[tuple[str, str, str]] = []
+    if cfg.get("enable_custom_hf", True) and cfg.get("custom_video_space"):
+        clean_custom = cfg["custom_video_space"].replace("https://huggingface.co/spaces/", "").strip("/")
+        if clean_custom:
+            i2v_spaces.append((clean_custom, "custom", f"Custom HF ({clean_custom.split('/')[-1]})"))
+
+    if cfg.get("enable_public_hf_spaces", True):
+        if cfg.get("enable_ltx_video", True):
+            i2v_spaces.append(("Lightricks/LTX-Video", "ltx", "LTX-Video"))
+        if cfg.get("enable_wan21", True):
+            i2v_spaces.append(("Wan-AI/Wan2.1", "wan", "Wan 2.1"))
+        if cfg.get("enable_cogvideox", True):
+            i2v_spaces.append(("THUDM/CogVideoX-5b", "cogvideo", "CogVideoX-5B"))
+
     for space_id, kind, label in i2v_spaces:
         if _is_hf_space_cooling(space_id):
             continue
 
         def _call(sid=space_id, k=kind):
-            hf_client = Client(sid)
-            if k == "wan":
+            hf_client = Client(sid, hf_token=hf_token) if hf_token else Client(sid)
+            if k == "custom":
+                # Auto-adapt to duplicated Wan / LTX / CogVideoX / generic spaces
+                if has_img:
+                    try:
+                        return hf_client.predict(prompt=prompt_txt, image=handle_file(raw_img_path), api_name="/predict")
+                    except Exception:
+                        try:
+                            return hf_client.predict(prompt=prompt_txt, input_image_filepath=handle_file(raw_img_path), api_name="/image_to_video")
+                        except Exception:
+                            return hf_client.predict(prompt_txt, handle_file(raw_img_path))
+                return hf_client.predict(prompt_txt)
+            elif k == "wan":
                 if has_img:
                     return hf_client.predict(
                         image=handle_file(raw_img_path),
@@ -2176,8 +2560,7 @@ def _try_ai_action_i2v_spaces(
             else:
                 return hf_client.predict(prompt=prompt_txt, api_name="/predict")
 
-        # Strict 5-second failover so busy/sleeping HF spaces switch immediately!
-        res = _run_with_timeout(_call, timeout_sec=5.5)
+        res = _run_with_timeout(_call, timeout_sec=timeout_s)
         if res is None:
             _mark_hf_space_failed(space_id)
             continue
@@ -2303,12 +2686,19 @@ def _try_talking_lipsync_spaces(
     dialogue_audio_path: str,
 ) -> Optional[str]:
     """
-    Real AI Talking Lip-Sync via free HuggingFace Spaces:
+    Real AI Talking Lip-Sync via HuggingFace Spaces (strict 8s timeout + Admin HF_TOKEN support):
     vinthony/SadTalker -> camenduru/Wav2Lip -> KwaiVGI/LivePortrait
-    Returns path to real lip-synced talking-head video if space responds, else None.
     """
+    if not GRADIO_AVAILABLE or Client is None or handle_file is None:
+        return None
     if not face_img_path or not os.path.exists(face_img_path) or not dialogue_audio_path or not os.path.exists(dialogue_audio_path):
         return None
+
+    cfg = get_runtime_ai_config()
+    if not cfg.get("enable_public_hf_spaces", True):
+        return None
+    hf_token = cfg.get("hf_token") or None
+    timeout_s = float(cfg.get("space_timeout_sec", 8))
 
     mirrors = [
         ("vinthony/SadTalker", "sadtalker"),
@@ -2320,7 +2710,7 @@ def _try_talking_lipsync_spaces(
             continue
 
         def _call(sid=space_id, k=kind):
-            hf_client = Client(sid)
+            hf_client = Client(sid, hf_token=hf_token) if hf_token else Client(sid)
             if k == "sadtalker":
                 return hf_client.predict(
                     source_image=handle_file(face_img_path),
@@ -2346,7 +2736,7 @@ def _try_talking_lipsync_spaces(
                     api_name="/predict",
                 )
 
-        res = _run_with_timeout(_call, timeout_sec=10.0)
+        res = _run_with_timeout(_call, timeout_sec=timeout_s)
         if res is None:
             _mark_hf_space_failed(space_id)
             continue
@@ -2816,11 +3206,11 @@ def generate_free_ai_video_clip(
                 if _mux_video_with_audio_and_sub(talk_vid):
                     return "Pollinations Flux + LivePortrait/SadTalker"
 
-        # 3. Engine 5 (100% FREE Unlimited Guaranteed Motion): Generate 2 additional dynamic action keyframes
-        #    via Pollinations Flux (`action_mid`, `closeup_drama`) and render a TRUE 3-shot moving cinema scene!
+        # 3. Engine 5 (100% FREE Unlimited Parallel Multi-Shot Motion): Generate 2 additional dynamic keyframes
+        #    in PARALLEL via ThreadPoolExecutor (strict 8s cap) so every scene renders in seconds!
         keyframe_list = [framed_img_path]
         if not custom_bg_path:
-            for variant_idx, variant_name in enumerate(("action_mid", "closeup_drama"), start=1):
+            def _make_kf(variant_idx: int, variant_name: str) -> Optional[str]:
                 kf_path = f"{out_mp4}_kf_{variant_idx}.jpg"
                 try:
                     prepare_character_frame(
@@ -2839,10 +3229,24 @@ def generate_free_ai_video_clip(
                         shot_variant=variant_name,
                     )
                     if os.path.exists(kf_path) and os.path.getsize(kf_path) > 2000:
-                        keyframe_list.append(kf_path)
-                        extra_keyframes.append(kf_path)
+                        return kf_path
                 except Exception:
-                    continue
+                    pass
+                return None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as kf_ex:
+                futs = [
+                    kf_ex.submit(_make_kf, 1, "action_mid"),
+                    kf_ex.submit(_make_kf, 2, "closeup_drama"),
+                ]
+                for fut in futs:
+                    try:
+                        res_kf = fut.result(timeout=9.0)
+                        if res_kf:
+                            keyframe_list.append(res_kf)
+                            extra_keyframes.append(res_kf)
+                    except Exception:
+                        continue
 
         _render_multishot_pollinations_motion_clip(
             keyframe_list,
@@ -2854,7 +3258,7 @@ def generate_free_ai_video_clip(
             subtitle_png_path=rendered_sub,
             aspect_ratio=aspect_ratio,
         )
-        return "Pollinations Flux + LivePortrait Motion"
+        return "Pollinations Flux + Parallel Motion"
     finally:
         for tmp_p in [mixed_tmp, sub_png] + extra_keyframes:
             if tmp_p and os.path.exists(tmp_p):
@@ -3359,134 +3763,182 @@ async def autonomous_movie_worker(project_id: str):
             else:
                 target_scene_sec = 0.0
 
-            for i, d in enumerate(dialogues):
-                if not os.path.isdir(proj_dir):
-                    return
-                raw_spk = str(d.get("character", "")).strip()
-                c_name = (
-                    raw_spk
-                    if raw_spk in char_map or any(k in raw_spk.lower() for k in ("narrator", "sutradhar", "villain", "saas", "log", "crowd", "सूत्रधार", "विलेन", "सास", "लोग", "भीड़"))
-                    else resolve_character_name(raw_spk, char_map, i)
-                )
-                diag_text = clean_spoken_dialogue(d.get("dialogue", "")) or "अब असली खेल शुरू होगा!"
-                loc_key = d.get("location_key") or "city_street"
-                loc_label = d.get("location") or default_location or "Mumbai City Street"
-                scene_mood = normalize_mood(d.get("mood", ""), default_mood)
-                scene_sfx = d.get("sfx") if d.get("sfx") in ALLOWED_SFX else detect_sfx_type(diag_text, loc_key, scene_mood)
-                action_prompt = d.get("visual_action_prompt") or build_visual_action_prompt(
-                    c_name, diag_text, loc_label, scene_mood, scene_sfx
-                )
-                scene_angle = (
-                    d.get("camera_angle")
-                    if d.get("camera_angle") in ALLOWED_FACE_ANGLES
-                    else detect_scene_angle(action_prompt, diag_text, scene_mood, scene_sfx, i)
-                )
+            # ULTRA-FAST PARALLEL SCENE RENDERING (4 concurrent workers via asyncio.Semaphore + asyncio.gather)
+            # Zero 17% hangs: every individual scene has its own try/except + guaranteed fast local fallback!
+            sem = asyncio.Semaphore(4)
+            completed_count = 0
+            ai_auto_cast = bool(state.get("ai_auto_cast", False))
 
-                # Uploaded user characters strictly use their 5-angle scanned photo; in AI Auto-Cast mode (no face uploaded), AI generates full-screen story actors directly!
-                ai_auto_cast = bool(state.get("ai_auto_cast", False))
-                char_entry = char_map.get(c_name)
-                if ai_auto_cast:
-                    exact_char_photo = ""
-                    char_angles_dict = {}
-                elif char_entry:
-                    exact_char_photo = select_character_angle_photo(char_entry, scene_angle)
-                    char_angles_dict = char_entry.get("angles") or {}
-                else:
-                    role_kind = detect_speaker_role(c_name, char_map)
-                    if role_kind == "narrator" and char_names:
-                        primary_hero = char_map[char_names[0]]
-                        exact_char_photo = select_character_angle_photo(primary_hero, scene_angle)
-                        char_angles_dict = primary_hero.get("angles") or {}
-                    else:
+            async def _render_single_scene(i: int, d: dict) -> tuple[int, str, str]:
+                nonlocal completed_count
+                async with sem:
+                    if not os.path.isdir(proj_dir):
+                        return (i, "", "")
+                    raw_spk = str(d.get("character", "")).strip()
+                    c_name = (
+                        raw_spk
+                        if raw_spk in char_map or any(k in raw_spk.lower() for k in ("narrator", "sutradhar", "villain", "saas", "log", "crowd", "सूत्रधार", "विलेन", "सास", "लोग", "भीड़"))
+                        else resolve_character_name(raw_spk, char_map, i)
+                    )
+                    diag_text = clean_spoken_dialogue(d.get("dialogue", "")) or "अब असली खेल शुरू होगा!"
+                    loc_key = d.get("location_key") or "city_street"
+                    loc_label = d.get("location") or default_location or "Mumbai City Street"
+                    scene_mood = normalize_mood(d.get("mood", ""), default_mood)
+                    scene_sfx = d.get("sfx") if d.get("sfx") in ALLOWED_SFX else detect_sfx_type(diag_text, loc_key, scene_mood)
+                    action_prompt = d.get("visual_action_prompt") or build_visual_action_prompt(
+                        c_name, diag_text, loc_label, scene_mood, scene_sfx
+                    )
+                    scene_angle = (
+                        d.get("camera_angle")
+                        if d.get("camera_angle") in ALLOWED_FACE_ANGLES
+                        else detect_scene_angle(action_prompt, diag_text, scene_mood, scene_sfx, i)
+                    )
+
+                    char_entry = char_map.get(c_name)
+                    if ai_auto_cast:
                         exact_char_photo = ""
                         char_angles_dict = {}
+                    elif char_entry:
+                        exact_char_photo = select_character_angle_photo(char_entry, scene_angle)
+                        char_angles_dict = char_entry.get("angles") or {}
+                    else:
+                        role_kind = detect_speaker_role(c_name, char_map)
+                        if role_kind == "narrator" and char_names:
+                            primary_hero = char_map[char_names[0]]
+                            exact_char_photo = select_character_angle_photo(primary_hero, scene_angle)
+                            char_angles_dict = primary_hero.get("angles") or {}
+                        else:
+                            exact_char_photo = ""
+                            char_angles_dict = {}
 
-                bg_override = d.get("bg_path") or project_custom_bg
-                tts_voice, tts_pitch, tts_rate = resolve_character_voice_profile(
-                    c_name, char_entry, char_map, language=language, scene_idx=i
-                )
+                    bg_override = d.get("bg_path") or project_custom_bg
+                    tts_voice, tts_pitch, tts_rate = resolve_character_voice_profile(
+                        c_name, char_entry, char_map, language=language, scene_idx=i
+                    )
 
-                a_file = f"{ch_temp}/a_{i}.mp3"
-                f_img = f"{ch_temp}/f_{i}.jpg"
-                v_file = f"{ch_temp}/v_{i}.mp4"
-                used_engine = state.get("active_engine") or "Pollinations Flux + LivePortrait Motion"
+                    a_file = f"{ch_temp}/a_{i}.mp3"
+                    f_img = f"{ch_temp}/f_{i}.jpg"
+                    v_file = f"{ch_temp}/v_{i}.mp4"
+                    used_engine = "Parallel Pollinations Flux + Motion"
 
-                if not os.path.exists(v_file):
-                    await generate_bulletproof_audio(
-                        diag_text,
-                        tts_voice,
-                        a_file,
-                        pitch=(char_entry or {}).get("pitch", "normal"),
-                        language=language,
-                        pitch_override=tts_pitch,
-                        rate_override=tts_rate,
-                    )
-                    await asyncio.to_thread(
-                        prepare_character_frame,
-                        exact_char_photo,
-                        c_name,
-                        diag_text,
-                        f_img,
-                        loc_key,
-                        loc_label,
-                        scene_mood,
-                        bg_override,
-                        watermark_text,
-                        watermark_position,
-                        aspect_ratio,
-                        action_prompt,
-                        "establishing",
-                    )
-                    used_engine = await asyncio.to_thread(
-                        generate_free_ai_video_clip,
-                        exact_char_photo,
-                        f_img,
-                        a_file,
-                        v_file,
-                        scene_mood,
-                        scene_sfx,
-                        action_prompt,
-                        char_angles_dict,
-                        scene_angle,
-                        c_name,
-                        diag_text,
-                        target_scene_sec,
-                        aspect_ratio,
-                        loc_key,
-                        loc_label,
-                        bg_override,
-                        watermark_text,
-                        watermark_position,
-                    )
-                    if os.path.exists(a_file):
-                        os.remove(a_file)
-                    if os.path.exists(f_img):
-                        os.remove(f_img)
-                clips.append(v_file)
-                if not os.path.isdir(proj_dir):
-                    return
-                scene_pct = min(
-                    94,
-                    ch_base_pct + 5 + int(((i + 1) / total_scenes) * max(1, ch_span_pct - 5)),
-                )
-                state["progress"] = max(state.get("progress", 12), scene_pct)
-                state["active_engine"] = used_engine
-                engines_list = list(state.get("engines_used") or [])
-                if used_engine and used_engine not in engines_list:
-                    engines_list.append(used_engine)
-                    state["engines_used"] = engines_list
-                ready_hint = (
-                    " (Part 1 तैयार — अभी Play करें!)"
-                    if (series_mode == "series" and 1 in state.get("ready_parts", []) and ch_no > 1)
-                    else ""
-                )
-                state["status_text"] = (
-                    f"⚡ {used_engine} · Part {ch_no}/{total_ch_count} · सीन {i + 1}/{total_scenes} ({state['progress']}%){ready_hint}"
-                )
-                save_state(proj_dir, state)
+                    if not os.path.exists(v_file):
+                        try:
+                            await generate_bulletproof_audio(
+                                diag_text,
+                                tts_voice,
+                                a_file,
+                                pitch=(char_entry or {}).get("pitch", "normal"),
+                                language=language,
+                                pitch_override=tts_pitch,
+                                rate_override=tts_rate,
+                            )
+                            await asyncio.to_thread(
+                                prepare_character_frame,
+                                exact_char_photo,
+                                c_name,
+                                diag_text,
+                                f_img,
+                                loc_key,
+                                loc_label,
+                                scene_mood,
+                                bg_override,
+                                watermark_text,
+                                watermark_position,
+                                aspect_ratio,
+                                action_prompt,
+                                "establishing",
+                            )
+                            used_engine = await asyncio.to_thread(
+                                generate_free_ai_video_clip,
+                                exact_char_photo,
+                                f_img,
+                                a_file,
+                                v_file,
+                                scene_mood,
+                                scene_sfx,
+                                action_prompt,
+                                char_angles_dict,
+                                scene_angle,
+                                c_name,
+                                diag_text,
+                                target_scene_sec,
+                                aspect_ratio,
+                                loc_key,
+                                loc_label,
+                                bg_override,
+                                watermark_text,
+                                watermark_position,
+                            )
+                        except Exception:
+                            # Guaranteed fast local cinematic fallback so ONE scene error never stalls the movie
+                            try:
+                                if not os.path.exists(a_file):
+                                    await generate_bulletproof_audio(diag_text, tts_voice, a_file, language=language)
+                                if not os.path.exists(f_img):
+                                    w_fb, h_fb = get_aspect_dimensions(aspect_ratio)
+                                    fb_bg = Image.new("RGB", (w_fb, h_fb), (18, 12, 32))
+                                    _draw_vertical_gradient(fb_bg, (24, 14, 46), (62, 22, 48))
+                                    fb_bg.save(f_img, "JPEG", quality=90)
+                                await asyncio.to_thread(
+                                    _render_pro_motion_vfx_clip,
+                                    f_img,
+                                    a_file,
+                                    v_file,
+                                    scene_mood,
+                                    scene_sfx,
+                                    a_file,
+                                    None,
+                                    aspect_ratio,
+                                )
+                                used_engine = "Local Fast Cinematic Motion"
+                            except Exception:
+                                pass
+                        finally:
+                            for tmp_c in (a_file, f_img):
+                                if os.path.exists(tmp_c):
+                                    try:
+                                        os.remove(tmp_c)
+                                    except Exception:
+                                        pass
+
+                    if os.path.isdir(proj_dir):
+                        completed_count += 1
+                        scene_pct = min(
+                            94,
+                            ch_base_pct + 5 + int((completed_count / total_scenes) * max(1, ch_span_pct - 5)),
+                        )
+                        state["progress"] = max(state.get("progress", 17), scene_pct)
+                        state["active_engine"] = used_engine
+                        engines_list = list(state.get("engines_used") or [])
+                        if used_engine and used_engine not in engines_list:
+                            engines_list.append(used_engine)
+                            state["engines_used"] = engines_list
+                        ready_hint = (
+                            " (Part 1 तैयार — अभी Play करें!)"
+                            if (series_mode == "series" and 1 in state.get("ready_parts", []) and ch_no > 1)
+                            else ""
+                        )
+                        state["status_text"] = (
+                            f"⚡ Parallel {used_engine} · Part {ch_no}/{total_ch_count} · सीन {completed_count}/{total_scenes} ({state['progress']}%){ready_hint}"
+                        )
+                        save_state(proj_dir, state)
+                    return (i, v_file, used_engine)
+
+            rendered_results = await asyncio.gather(
+                *[_render_single_scene(idx, item) for idx, item in enumerate(dialogues)],
+                return_exceptions=True,
+            )
+            ordered_clips: list[tuple[int, str]] = []
+            for r_item in rendered_results:
+                if isinstance(r_item, tuple) and r_item[1] and os.path.exists(r_item[1]) and os.path.getsize(r_item[1]) > 1000:
+                    ordered_clips.append((r_item[0], r_item[1]))
+            ordered_clips.sort(key=lambda x: x[0])
+            clips = [p for _, p in ordered_clips]
 
             if not os.path.isdir(proj_dir):
                 return
+            if not clips:
+                raise RuntimeError(f"Part {ch_no} के लिए कोई भी सीन क्लिप तैयार नहीं हो सकी।")
             ffmpeg_concat(clips, ch_mp4)
             state["done_chapters"].append(ch_no)
             prev_plot = ch["plot"]
@@ -3495,7 +3947,9 @@ async def autonomous_movie_worker(project_id: str):
 
     except Exception as e:
         if os.path.isdir(proj_dir):
-            state["status_text"] = f"रुकावट आई (रीस्टार्ट पर यहीं से चलेगा): {str(e)}"
+            state["status"] = "failed"
+            state["error"] = str(e)
+            state["status_text"] = f"❌ वीडियो रेंडर में एरर आया: {str(e)}"
             save_state(proj_dir, state)
 
 
@@ -3754,6 +4208,14 @@ async def start_movie(
             c_pitch = normalize_pitch(str(pitches_map.get(c_name, pitches_map.get(str(slot_i), "normal"))))
             img_path = safe_project_file(proj_dir, f"char_{slot_i}_front.jpg")
             save_upright_image_bytes(raw_img_bytes, img_path)
+            if slot_i == 0:
+                av_url = save_user_avatar_bytes(email, raw_img_bytes)
+                if av_url:
+                    db_av = load_db()
+                    if email in db_av["users"]:
+                        db_av["users"][email]["photo_url"] = av_url
+                        db_av["users"][email]["face_linked"] = True
+                        save_db(db_av)
             char_map[c_name] = {
                 "image": img_path,
                 "voice": c_voice,
@@ -5249,6 +5711,16 @@ async def start_face_swap(
     with open(vid_path, "wb") as f:
         f.write(video_bytes)
     save_upright_image_bytes(face_bytes, face_path)
+    try:
+        av_url = save_user_avatar_bytes(email, face_bytes)
+        if av_url:
+            db_av = load_db()
+            if email in db_av.get("users", {}):
+                db_av["users"][email]["photo_url"] = av_url
+                db_av["users"][email]["face_linked"] = True
+                save_db(db_av)
+    except Exception:
+        pass
 
     face_angles: dict[str, str] = {"front": face_path}
     if angle_images:

@@ -16,6 +16,7 @@ import 'package:camera/camera.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:image/image.dart' as img;
 import 'package:gal/gal.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 /// Ensures camera/gallery face photos are ALWAYS upright portrait (never 90° rotated or sideways).
 Future<File> _fixUprightPortrait(
@@ -93,6 +94,11 @@ class _CinePopHomeState extends State<CinePopHome> {
   String? userEmail;
   String? userName;
   String? userPhoto;
+  String userMobile = "";
+  String? savedWelcomeEmail;
+  String? savedWelcomeName;
+  String? savedWelcomePhoto;
+  String? savedWelcomeMobile;
   int userCredits = 0;
   int walletBalance = 0;
   String myReferralCode = "";
@@ -127,6 +133,7 @@ class _CinePopHomeState extends State<CinePopHome> {
   final TextEditingController serverController = TextEditingController();
   final TextEditingController manualEmailController = TextEditingController();
   final TextEditingController manualNameController = TextEditingController();
+  final TextEditingController manualMobileController = TextEditingController();
   final TextEditingController loginReferralController = TextEditingController();
   final TextEditingController applyReferralController = TextEditingController();
   int selectedMinutes = 1;
@@ -153,6 +160,8 @@ class _CinePopHomeState extends State<CinePopHome> {
   List<dynamic> readyParts = [];
   Map<String, dynamic> scriptsData = {};
   bool isCompleted = false;
+  bool isProjectFailed = false;
+  String projectErrorText = "";
   bool generatingTrailer = false;
   bool generatingPoster = false;
   bool dubbingMovie = false;
@@ -266,13 +275,32 @@ class _CinePopHomeState extends State<CinePopHome> {
     final savedEmail = prefs.getString('user_email');
     final savedName = prefs.getString('user_name');
     final savedPhoto = prefs.getString('user_photo');
+    final savedMobile = prefs.getString('user_mobile') ?? "";
+    final welEmail = prefs.getString('saved_welcome_email');
+    final welName = prefs.getString('saved_welcome_name');
+    final welPhoto = prefs.getString('saved_welcome_photo');
+    final welMobile = prefs.getString('saved_welcome_mobile');
+    if (mounted) {
+      setState(() {
+        savedWelcomeEmail = welEmail;
+        savedWelcomeName = welName;
+        savedWelcomePhoto = welPhoto;
+        savedWelcomeMobile = welMobile;
+      });
+    }
     if (savedEmail != null && savedEmail.isNotEmpty) {
       setState(() {
         userEmail = savedEmail;
         userName = savedName ?? "Creator";
         userPhoto = savedPhoto;
+        userMobile = savedMobile;
       });
-      await _syncUserWithBackend(savedEmail, userName!, savedPhoto ?? "");
+      await _syncUserWithBackend(
+        savedEmail,
+        userName!,
+        savedPhoto ?? "",
+        mobile: savedMobile,
+      );
       _startBalanceAutoRefresh();
     }
 
@@ -318,8 +346,23 @@ class _CinePopHomeState extends State<CinePopHome> {
       if (res.statusCode == 200 && mounted) {
         final data = jsonDecode(res.body);
         final u = data['user'] ?? {};
+        final srvPhoto = (u['photo_url'] ?? "").toString().trim();
+        final srvMobile = (u['mobile'] ?? "").toString().trim();
+        final srvName = (u['name'] ?? userName ?? "Creator").toString().trim();
+        final prefs = await SharedPreferences.getInstance();
+        if (srvPhoto.isNotEmpty) {
+          await prefs.setString('user_photo', srvPhoto);
+          await prefs.setString('saved_welcome_photo', srvPhoto);
+        }
+        if (srvMobile.isNotEmpty) {
+          await prefs.setString('user_mobile', srvMobile);
+          await prefs.setString('saved_welcome_mobile', srvMobile);
+        }
         setState(() {
           isServerOnline = true;
+          if (srvName.isNotEmpty) userName = srvName;
+          if (srvPhoto.isNotEmpty) userPhoto = srvPhoto;
+          if (srvMobile.isNotEmpty) userMobile = srvMobile;
           userCredits = (u['credits'] ?? userCredits) as int;
           walletBalance = (u['wallet_balance'] ?? walletBalance) as int;
           myReferralCode = (u['referral_code'] ?? myReferralCode).toString();
@@ -349,11 +392,257 @@ class _CinePopHomeState extends State<CinePopHome> {
     serverController.dispose();
     manualEmailController.dispose();
     manualNameController.dispose();
+    manualMobileController.dispose();
     loginReferralController.dispose();
     applyReferralController.dispose();
     fsTitleController.dispose();
     fsDubController.dispose();
     super.dispose();
+  }
+
+  String _resolveMediaUrl(String? raw) {
+    final clean = (raw ?? "").trim();
+    if (clean.isEmpty) return "";
+    if (clean.startsWith("http://") || clean.startsWith("https://")) {
+      return clean;
+    }
+    final base = serverUrl.endsWith("/")
+        ? serverUrl.substring(0, serverUrl.length - 1)
+        : serverUrl;
+    return clean.startsWith("/") ? "$base$clean" : "$base/$clean";
+  }
+
+  Future<void> _uploadProfileUpdate({
+    String? emailOverride,
+    String? name,
+    String? mobile,
+    File? avatarFile,
+  }) async {
+    final targetEmail = (emailOverride ?? userEmail ?? "").trim().toLowerCase();
+    if (targetEmail.isEmpty || !targetEmail.contains("@")) return;
+    try {
+      final req = http.MultipartRequest(
+        'POST',
+        Uri.parse('$serverUrl/auth/profile/update/'),
+      );
+      req.fields['email'] = targetEmail;
+      if (name != null && name.trim().isNotEmpty) {
+        req.fields['name'] = name.trim();
+      }
+      if (mobile != null && mobile.trim().isNotEmpty) {
+        req.fields['mobile'] = mobile.trim();
+      }
+      if (avatarFile != null && await avatarFile.exists()) {
+        req.files.add(
+          await http.MultipartFile.fromPath('avatar', avatarFile.path),
+        );
+      }
+      final streamed = await req.send().timeout(const Duration(seconds: 15));
+      final res = await http.Response.fromStream(streamed);
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final u = data['user'] ?? {};
+        final newName = (u['name'] ?? name ?? userName ?? "Creator").toString();
+        final newMobile = (u['mobile'] ?? mobile ?? userMobile).toString();
+        final newPhoto = (u['photo_url'] ?? userPhoto ?? "").toString();
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('user_name', newName);
+        await prefs.setString('user_mobile', newMobile);
+        await prefs.setString('user_photo', newPhoto);
+        await prefs.setString('saved_welcome_email', targetEmail);
+        await prefs.setString('saved_welcome_name', newName);
+        await prefs.setString('saved_welcome_mobile', newMobile);
+        await prefs.setString('saved_welcome_photo', newPhoto);
+        if (mounted) {
+          setState(() {
+            userName = newName;
+            userMobile = newMobile;
+            userPhoto = newPhoto;
+            savedWelcomeEmail = targetEmail;
+            savedWelcomeName = newName;
+            savedWelcomeMobile = newMobile;
+            savedWelcomePhoto = newPhoto;
+          });
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _showEditProfileSheet() async {
+    final nameCtrl = TextEditingController(text: userName ?? "");
+    final mobCtrl = TextEditingController(text: userMobile);
+    File? pickedPhoto;
+    bool saving = false;
+
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF1B1236),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setModalState) {
+          final resolvedUrl = _resolveMediaUrl(userPhoto);
+          return Padding(
+            padding: EdgeInsets.only(
+              left: 20,
+              right: 20,
+              top: 18,
+              bottom: MediaQuery.of(ctx).viewInsets.bottom + 24,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text(
+                  "👤 My Profile & Face Avatar",
+                  style: TextStyle(
+                    color: Color(0xFFFFD600),
+                    fontSize: 17,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  userEmail ?? "",
+                  style: const TextStyle(color: Colors.white60, fontSize: 12),
+                ),
+                const SizedBox(height: 14),
+                Center(
+                  child: GestureDetector(
+                    onTap: () async {
+                      final picker = ImagePicker();
+                      final pic = await picker.pickImage(
+                        source: ImageSource.gallery,
+                        imageQuality: 85,
+                      );
+                      if (pic != null) {
+                        final upright = await _fixUprightPortrait(File(pic.path));
+                        setModalState(() => pickedPhoto = upright);
+                      }
+                    },
+                    child: Stack(
+                      alignment: Alignment.bottomRight,
+                      children: [
+                        Container(
+                          width: 84,
+                          height: 84,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: const Color(0xFF00E5FF),
+                              width: 2.5,
+                            ),
+                            color: const Color(0xFF0E091D),
+                          ),
+                          child: ClipOval(
+                            child: pickedPhoto != null
+                                ? Image.file(
+                                    pickedPhoto!,
+                                    fit: BoxFit.cover,
+                                    alignment: Alignment.topCenter,
+                                  )
+                                : resolvedUrl.isNotEmpty
+                                    ? Image.network(
+                                        resolvedUrl,
+                                        fit: BoxFit.cover,
+                                        alignment: Alignment.topCenter,
+                                        errorBuilder: (_, __, ___) => const Icon(
+                                          Icons.person,
+                                          size: 42,
+                                          color: Color(0xFF00E5FF),
+                                        ),
+                                      )
+                                    : const Icon(
+                                        Icons.person,
+                                        size: 42,
+                                        color: Color(0xFF00E5FF),
+                                      ),
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.all(5),
+                          decoration: const BoxDecoration(
+                            color: Color(0xFFFF007F),
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(
+                            Icons.camera_alt,
+                            color: Colors.white,
+                            size: 16,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                TextField(
+                  controller: nameCtrl,
+                  decoration: const InputDecoration(
+                    filled: true,
+                    fillColor: Color(0xFF0E091D),
+                    border: OutlineInputBorder(),
+                    prefixIcon: Icon(Icons.person, color: Color(0xFFFFD600)),
+                    labelText: "Full Name",
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: mobCtrl,
+                  keyboardType: TextInputType.phone,
+                  decoration: const InputDecoration(
+                    filled: true,
+                    fillColor: Color(0xFF0E091D),
+                    border: OutlineInputBorder(),
+                    prefixIcon: Icon(Icons.phone, color: Color(0xFF00E5FF)),
+                    labelText: "Mobile Number",
+                    hintText: "+91 9876543210",
+                  ),
+                ),
+                const SizedBox(height: 14),
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFFFF007F),
+                    padding: const EdgeInsets.symmetric(vertical: 13),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                  onPressed: saving
+                      ? null
+                      : () async {
+                          setModalState(() => saving = true);
+                          await _uploadProfileUpdate(
+                            name: nameCtrl.text.trim(),
+                            mobile: mobCtrl.text.trim(),
+                            avatarFile: pickedPhoto,
+                          );
+                          if (ctx.mounted) Navigator.pop(ctx);
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text("✅ Profile & Face Avatar सेव हो गया!"),
+                              ),
+                            );
+                          }
+                        },
+                  icon: const Icon(Icons.save, color: Colors.white),
+                  label: Text(
+                    saving ? "सेव हो रहा है..." : "Save Profile & Photo",
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
   }
 
   Future<void> _handleGoogleSignIn() async {
@@ -377,14 +666,22 @@ class _CinePopHomeState extends State<CinePopHome> {
     }
   }
 
-  Future<void> _handleInstantGuestLogin() async {
+  Future<void> _handleInstantGuestLogin({
+    String? guestName,
+    String? mobile,
+    File? avatarFile,
+  }) async {
     if (isInstantLoggingIn) return;
     setState(() => isInstantLoggingIn = true);
     try {
+      final cleanMobile = (mobile ?? manualMobileController.text).trim();
+      final cleanName = (guestName ?? manualNameController.text).trim();
       final res = await http.post(
         Uri.parse('$serverUrl/auth/instant-login/'),
         body: {
           "device_id": Platform.operatingSystem,
+          "guest_name": cleanName,
+          "mobile": cleanMobile,
           "referral_code": loginReferralController.text.trim(),
         },
       ).timeout(const Duration(seconds: 8));
@@ -394,16 +691,25 @@ class _CinePopHomeState extends State<CinePopHome> {
         final em = (u['email'] ?? "guest_${DateTime.now().millisecondsSinceEpoch}@cinepop.guest")
             .toString();
         final nm = (u['name'] ?? "Guest Creator").toString();
+        final mob = (u['mobile'] ?? cleanMobile).toString();
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString('user_email', em);
         await prefs.setString('user_name', nm);
+        await prefs.setString('user_mobile', mob);
         await prefs.setString('user_photo', "");
+        await prefs.setString('saved_welcome_email', em);
+        await prefs.setString('saved_welcome_name', nm);
+        await prefs.setString('saved_welcome_mobile', mob);
         if (mounted) {
           setState(() {
             isServerOnline = true;
             userEmail = em;
             userName = nm;
+            userMobile = mob;
             userPhoto = "";
+            savedWelcomeEmail = em;
+            savedWelcomeName = nm;
+            savedWelcomeMobile = mob;
             userCredits = (u['credits'] ?? 1) as int;
             walletBalance = (u['wallet_balance'] ?? 0) as int;
             myReferralCode = (u['referral_code'] ?? "").toString();
@@ -413,6 +719,14 @@ class _CinePopHomeState extends State<CinePopHome> {
             adminUpiId = (data['upi_id'] ?? adminUpiId).toString();
             moviePrice = (data['movie_price'] ?? moviePrice) as int;
           });
+          if (avatarFile != null) {
+            await _uploadProfileUpdate(
+              emailOverride: em,
+              name: nm,
+              mobile: mob,
+              avatarFile: avatarFile,
+            );
+          }
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               backgroundColor: Colors.green.shade700,
@@ -437,10 +751,17 @@ class _CinePopHomeState extends State<CinePopHome> {
     // Fallback local guest entry synced immediately on next call
     final fallbackEmail =
         "guest_${DateTime.now().millisecondsSinceEpoch}@cinepop.guest";
-    await _completeLogin(fallbackEmail, "Guest Creator", "");
+    await _completeLogin(
+      fallbackEmail,
+      "Guest Creator",
+      "",
+      mobile: (mobile ?? manualMobileController.text).trim(),
+      avatarFile: avatarFile,
+    );
   }
 
   Future<void> _showQuickGoogleIdDialog() async {
+    File? pickedAvatar;
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -448,164 +769,249 @@ class _CinePopHomeState extends State<CinePopHome> {
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
-      builder: (ctx) => Padding(
-        padding: EdgeInsets.only(
-          left: 20,
-          right: 20,
-          top: 20,
-          bottom: MediaQuery.of(ctx).viewInsets.bottom + 24,
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Center(
-              child: Container(
-                width: 44,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: Colors.white24,
-                  borderRadius: BorderRadius.circular(10),
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
-            const Row(
-              children: [
-                Icon(Icons.account_circle, color: Color(0xFFFFD600), size: 28),
-                SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    "Google Account से तुरंत लॉगिन करें",
-                    style: TextStyle(
-                      color: Color(0xFFFFD600),
-                      fontSize: 17,
-                      fontWeight: FontWeight.bold,
-                    ),
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setSheetState) => SingleChildScrollView(
+          padding: EdgeInsets.only(
+            left: 20,
+            right: 20,
+            top: 18,
+            bottom: MediaQuery.of(ctx).viewInsets.bottom + 24,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Center(
+                child: Container(
+                  width: 44,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: Colors.white24,
+                    borderRadius: BorderRadius.circular(10),
                   ),
                 ),
-              ],
-            ),
-            const SizedBox(height: 6),
-            const Text(
-              "अपनी Gmail ID और नाम डालें — बिना किसी SHA-1 या Google Play एरर के 1 क्लिक में लॉगिन होगा।",
-              style: TextStyle(color: Colors.white70, fontSize: 12),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: manualEmailController,
-              keyboardType: TextInputType.emailAddress,
-              autofocus: true,
-              decoration: const InputDecoration(
-                filled: true,
-                fillColor: Color(0xFF0E091D),
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.email, color: Color(0xFF00E5FF)),
-                labelText: "आपकी Gmail ID",
-                hintText: "example@gmail.com",
               ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: manualNameController,
-              textCapitalization: TextCapitalization.words,
-              decoration: const InputDecoration(
-                filled: true,
-                fillColor: Color(0xFF0E091D),
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.person, color: Color(0xFFFFD600)),
-                labelText: "आपका नाम (Creator Name)",
-                hintText: "जैसे: Rahul Sharma",
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: loginReferralController,
-              textCapitalization: TextCapitalization.characters,
-              decoration: const InputDecoration(
-                filled: true,
-                fillColor: Color(0xFF0E091D),
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.card_giftcard, color: Colors.greenAccent),
-                labelText: "🎁 दोस्त का Referral Code (Optional)",
-                hintText: "जैसे: CPABC123 (+1 Free Movie Pass)",
-              ),
-            ),
-            const SizedBox(height: 16),
-            ElevatedButton.icon(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFFFF007F),
-                padding: const EdgeInsets.symmetric(vertical: 14),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
-                ),
-              ),
-              onPressed: () async {
-                final em = manualEmailController.text.trim().toLowerCase();
-                final nm = manualNameController.text.trim();
-                if (!em.contains("@")) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text("कृपया सही Gmail ID डालें (जैसे: name@gmail.com)"),
+              const SizedBox(height: 14),
+              Row(
+                children: [
+                  GestureDetector(
+                    onTap: () async {
+                      final picker = ImagePicker();
+                      final pic = await picker.pickImage(
+                        source: ImageSource.gallery,
+                        imageQuality: 85,
+                      );
+                      if (pic != null) {
+                        final upright = await _fixUprightPortrait(File(pic.path));
+                        setSheetState(() => pickedAvatar = upright);
+                      }
+                    },
+                    child: Container(
+                      width: 54,
+                      height: 54,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: const Color(0xFF00E5FF),
+                          width: 2,
+                        ),
+                        color: const Color(0xFF0E091D),
+                      ),
+                      child: ClipOval(
+                        child: pickedAvatar != null
+                            ? Image.file(
+                                pickedAvatar!,
+                                fit: BoxFit.cover,
+                                alignment: Alignment.topCenter,
+                              )
+                            : const Icon(
+                                Icons.add_a_photo,
+                                color: Color(0xFFFFD600),
+                                size: 24,
+                              ),
+                      ),
                     ),
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          "प्रोफ़ाइल और Gmail से लॉगिन करें",
+                          style: TextStyle(
+                            color: Color(0xFFFFD600),
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        SizedBox(height: 2),
+                        Text(
+                          "Photo (Optional) • Name • Mobile • Gmail",
+                          style: TextStyle(color: Colors.white70, fontSize: 11),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: manualEmailController,
+                keyboardType: TextInputType.emailAddress,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  filled: true,
+                  fillColor: Color(0xFF0E091D),
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.email, color: Color(0xFF00E5FF)),
+                  labelText: "आपकी Gmail ID",
+                  hintText: "example@gmail.com",
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: manualNameController,
+                textCapitalization: TextCapitalization.words,
+                decoration: const InputDecoration(
+                  filled: true,
+                  fillColor: Color(0xFF0E091D),
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.person, color: Color(0xFFFFD600)),
+                  labelText: "आपका पूरा नाम (Full Name)",
+                  hintText: "जैसे: Rahul Sharma",
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: manualMobileController,
+                keyboardType: TextInputType.phone,
+                decoration: const InputDecoration(
+                  filled: true,
+                  fillColor: Color(0xFF0E091D),
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.phone, color: Colors.greenAccent),
+                  labelText: "मोबाइल नंबर (Mobile Number)",
+                  hintText: "+91 9876543210",
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: loginReferralController,
+                textCapitalization: TextCapitalization.characters,
+                decoration: const InputDecoration(
+                  filled: true,
+                  fillColor: Color(0xFF0E091D),
+                  border: OutlineInputBorder(),
+                  prefixIcon:
+                      Icon(Icons.card_giftcard, color: Colors.greenAccent),
+                  labelText: "🎁 दोस्त का Referral Code (Optional)",
+                  hintText: "जैसे: CPABC123 (+1 Free Movie Pass)",
+                ),
+              ),
+              const SizedBox(height: 14),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFFFF007F),
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+                onPressed: () async {
+                  final em = manualEmailController.text.trim().toLowerCase();
+                  final nm = manualNameController.text.trim();
+                  final mob = manualMobileController.text.trim();
+                  if (!em.contains("@")) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text(
+                          "कृपया सही Gmail ID डालें (जैसे: name@gmail.com)",
+                        ),
+                      ),
+                    );
+                    return;
+                  }
+                  Navigator.pop(ctx);
+                  await _completeLogin(
+                    em,
+                    nm.isNotEmpty ? nm : em.split("@")[0],
+                    "",
+                    mobile: mob,
+                    avatarFile: pickedAvatar,
                   );
-                  return;
-                }
-                Navigator.pop(ctx);
-                await _completeLogin(
-                  em,
-                  nm.isNotEmpty ? nm : em.split("@")[0],
-                  "",
-                );
-              },
-              icon: const Icon(Icons.login, color: Colors.white),
-              label: const Text(
-                "1-Click Google Login करें",
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 15,
-                  fontWeight: FontWeight.bold,
+                },
+                icon: const Icon(Icons.login, color: Colors.white),
+                label: const Text(
+                  "1-Click Google Login करें",
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 15,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(height: 10),
-            OutlinedButton.icon(
-              style: OutlinedButton.styleFrom(
-                side: const BorderSide(color: Color(0xFF00E5FF)),
-                padding: const EdgeInsets.symmetric(vertical: 12),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
+              const SizedBox(height: 10),
+              OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  side: const BorderSide(color: Color(0xFF00E5FF)),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  _handleInstantGuestLogin(
+                    guestName: manualNameController.text.trim(),
+                    mobile: manualMobileController.text.trim(),
+                    avatarFile: pickedAvatar,
+                  );
+                },
+                icon: const Icon(Icons.bolt, color: Color(0xFF00E5FF)),
+                label: const Text(
+                  "⚡ बिना ईमेल के Guest / Instant Start करें",
+                  style: TextStyle(
+                    color: Color(0xFF00E5FF),
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
-              onPressed: () {
-                Navigator.pop(ctx);
-                _handleInstantGuestLogin();
-              },
-              icon: const Icon(Icons.bolt, color: Color(0xFF00E5FF)),
-              label: const Text(
-                "⚡ बिना ईमेल के Guest / Instant Start करें",
-                style: TextStyle(
-                  color: Color(0xFF00E5FF),
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
   }
 
-  Future<void> _completeLogin(String email, String name, String photo) async {
+  Future<void> _completeLogin(
+    String email,
+    String name,
+    String photo, {
+    String mobile = "",
+    File? avatarFile,
+  }) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('user_email', email);
     await prefs.setString('user_name', name);
     await prefs.setString('user_photo', photo);
+    await prefs.setString('user_mobile', mobile);
+    await prefs.setString('saved_welcome_email', email);
+    await prefs.setString('saved_welcome_name', name);
+    await prefs.setString('saved_welcome_mobile', mobile);
+    if (photo.isNotEmpty) {
+      await prefs.setString('saved_welcome_photo', photo);
+    }
 
     setState(() {
       userEmail = email;
       userName = name;
       userPhoto = photo;
+      userMobile = mobile;
+      savedWelcomeEmail = email;
+      savedWelcomeName = name;
+      savedWelcomeMobile = mobile;
+      if (photo.isNotEmpty) savedWelcomePhoto = photo;
       isAdmin = false;
       _verifiedAdminPin = "";
     });
@@ -614,8 +1020,17 @@ class _CinePopHomeState extends State<CinePopHome> {
       email,
       name,
       photo,
+      mobile: mobile,
       referralCode: loginReferralController.text.trim(),
     );
+    if (avatarFile != null) {
+      await _uploadProfileUpdate(
+        emailOverride: email,
+        name: name,
+        mobile: mobile,
+        avatarFile: avatarFile,
+      );
+    }
     _startBalanceAutoRefresh();
   }
 
@@ -623,6 +1038,7 @@ class _CinePopHomeState extends State<CinePopHome> {
     String email,
     String name,
     String photo, {
+    String mobile = "",
     String adminPin = "",
     String referralCode = "",
   }) async {
@@ -632,6 +1048,7 @@ class _CinePopHomeState extends State<CinePopHome> {
         body: {
           "email": email,
           "name": name,
+          "mobile": mobile,
           "photo_url": photo,
           "device_id": Platform.operatingSystem,
           "admin_pin": adminPin,
@@ -641,8 +1058,29 @@ class _CinePopHomeState extends State<CinePopHome> {
       if (res.statusCode == 200 && mounted) {
         final data = jsonDecode(res.body);
         final u = data['user'] ?? {};
+        final srvPhoto = (u['photo_url'] ?? "").toString().trim();
+        final srvMobile = (u['mobile'] ?? mobile).toString().trim();
+        final srvName = (u['name'] ?? name).toString().trim();
+        final prefs = await SharedPreferences.getInstance();
+        if (srvPhoto.isNotEmpty) {
+          await prefs.setString('user_photo', srvPhoto);
+          await prefs.setString('saved_welcome_photo', srvPhoto);
+        }
+        if (srvMobile.isNotEmpty) {
+          await prefs.setString('user_mobile', srvMobile);
+          await prefs.setString('saved_welcome_mobile', srvMobile);
+        }
         setState(() {
           isServerOnline = true;
+          if (srvName.isNotEmpty) userName = srvName;
+          if (srvPhoto.isNotEmpty) {
+            userPhoto = srvPhoto;
+            savedWelcomePhoto = srvPhoto;
+          }
+          if (srvMobile.isNotEmpty) {
+            userMobile = srvMobile;
+            savedWelcomeMobile = srvMobile;
+          }
           userCredits = (u['credits'] ?? 0) as int;
           walletBalance = (u['wallet_balance'] ?? 0) as int;
           myReferralCode = (u['referral_code'] ?? "").toString();
@@ -816,8 +1254,21 @@ class _CinePopHomeState extends State<CinePopHome> {
     } catch (_) {}
     balanceTimer?.cancel();
     final prefs = await SharedPreferences.getInstance();
+    if (userEmail != null && userEmail!.isNotEmpty) {
+      await prefs.setString('saved_welcome_email', userEmail!);
+      await prefs.setString('saved_welcome_name', userName ?? "Creator");
+      await prefs.setString('saved_welcome_mobile', userMobile);
+      if (userPhoto != null && userPhoto!.isNotEmpty) {
+        await prefs.setString('saved_welcome_photo', userPhoto!);
+      }
+    }
     await prefs.remove('user_email');
     setState(() {
+      savedWelcomeEmail = userEmail ?? savedWelcomeEmail;
+      savedWelcomeName = userName ?? savedWelcomeName;
+      savedWelcomeMobile = userMobile.isNotEmpty ? userMobile : savedWelcomeMobile;
+      savedWelcomePhoto =
+          (userPhoto != null && userPhoto!.isNotEmpty) ? userPhoto : savedWelcomePhoto;
       userEmail = null;
       isAdmin = false;
       isAdminEmail = false;
@@ -1736,11 +2187,13 @@ class _CinePopHomeState extends State<CinePopHome> {
               });
               _updateDataEstimate();
               Navigator.pop(ctx);
+              // Automatically link scanned/uploaded Face ID photo as User Profile Avatar
+              _uploadProfileUpdate(avatarFile: primaryPhoto);
               if (angleCount >= 5 && mounted) {
                 ScaffoldMessenger.of(context).showSnackBar(
                   SnackBar(
                     content: Text(
-                      "✅ $cleanName: 5-Angle 3D Face Profile Ready!",
+                      "✅ $cleanName: 5-Angle 3D Face Profile Ready & Profile Avatar Synced!",
                     ),
                     backgroundColor: Colors.green.shade700,
                   ),
@@ -1897,6 +2350,10 @@ class _CinePopHomeState extends State<CinePopHome> {
             walletBalance = data['remaining_wallet_balance'] as int;
           }
           activeProjectId = data['project_id'];
+          isProjectFailed = false;
+          projectErrorText = "";
+          isCompleted = false;
+          progress = 5;
           activeAiAutoCast = (data['ai_auto_cast'] ?? useAutoCast) == true;
           if (data['active_engine'] != null) {
             activeAiEngine = data['active_engine'].toString();
@@ -1904,6 +2361,7 @@ class _CinePopHomeState extends State<CinePopHome> {
           statusMessage = data['status_text'] ?? "";
         });
         _startAutoSync();
+        _refreshUserBalance();
       } else if (res.statusCode == 402) {
         _showBuyCreditDialog();
       } else {
@@ -1993,6 +2451,9 @@ class _CinePopHomeState extends State<CinePopHome> {
             .timeout(const Duration(seconds: 6));
         if (res.statusCode == 200 && mounted) {
           final data = jsonDecode(res.body);
+          final String srvStatus = (data['status'] ?? "").toString().toLowerCase();
+          final String srvErr = (data['error'] ?? "").toString().trim();
+          final bool failedNow = srvStatus == "failed" || srvErr.isNotEmpty;
           setState(() {
             isServerOnline = true;
             progress = (data['progress'] ?? 0) as int;
@@ -2000,6 +2461,10 @@ class _CinePopHomeState extends State<CinePopHome> {
             readyParts = (data['ready_parts'] ?? []) as List<dynamic>;
             scriptsData = (data['scripts'] ?? {}) as Map<String, dynamic>;
             isCompleted = (data['is_completed'] ?? false) as bool;
+            isProjectFailed = failedNow;
+            projectErrorText = srvErr.isNotEmpty
+                ? srvErr
+                : (failedNow ? statusMessage : "");
             if (data['aspect_ratio'] != null) {
               activeAspectRatio = data['aspect_ratio'].toString();
             }
@@ -2017,7 +2482,7 @@ class _CinePopHomeState extends State<CinePopHome> {
               activeAiAutoCast = data['ai_auto_cast'] == true;
             }
           });
-          if (isCompleted) syncTimer?.cancel();
+          if (isCompleted || failedNow) syncTimer?.cancel();
         }
       } catch (_) {
         if (mounted) {
@@ -2991,6 +3456,7 @@ class _CinePopHomeState extends State<CinePopHome> {
   @override
   Widget build(BuildContext context) {
     if (userEmail == null) {
+      final welcomePhotoUrl = _resolveMediaUrl(savedWelcomePhoto);
       return Scaffold(
         body: Container(
           decoration: const BoxDecoration(
@@ -3000,129 +3466,244 @@ class _CinePopHomeState extends State<CinePopHome> {
               end: Alignment.bottomRight,
             ),
           ),
-          child: Center(
-            child: Padding(
-              padding: const EdgeInsets.all(24.0),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(32),
-                    child: Image.asset('assets/logo.png', width: 140, height: 140),
-                  ),
-                  const SizedBox(height: 20),
-                  const Text(
-                    "CinePop AI 🎬",
-                    style: TextStyle(
-                      fontSize: 34,
-                      fontWeight: FontWeight.w900,
-                      color: Color(0xFFFFD600),
-                      shadows: [Shadow(color: Color(0xFFFF007F), blurRadius: 16)],
+          child: SafeArea(
+            child: Center(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(24.0),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(32),
+                      child: Image.asset('assets/logo.png', width: 118, height: 118),
                     ),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    "फोटो डालो, कहानी बताओ — रियल सिनेमैटिक लोकेशन के साथ पूरी मूवी तैयार!\nसिर्फ ₹50 प्रति मूवी",
-                    textAlign: TextAlign.center,
-                    style: TextStyle(fontSize: 15, color: Color(0xFF00E5FF)),
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(
-                        Icons.circle,
-                        size: 10,
-                        color: isServerOnline
-                            ? Colors.greenAccent
-                            : Colors.redAccent,
+                    const SizedBox(height: 16),
+                    const Text(
+                      "CinePop AI 🎬",
+                      style: TextStyle(
+                        fontSize: 32,
+                        fontWeight: FontWeight.w900,
+                        color: Color(0xFFFFD600),
+                        shadows: [Shadow(color: Color(0xFFFF007F), blurRadius: 16)],
                       ),
-                      const SizedBox(width: 6),
-                      Text(
-                        isServerOnline
-                            ? "Server Online"
-                            : "Server Offline (Settings में Railway URL डालें)",
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Colors.white70,
+                    ),
+                    const SizedBox(height: 6),
+                    const Text(
+                      "फोटो डालो, कहानी बताओ — रियल सिनेमैटिक लोकेशन के साथ पूरी मूवी तैयार!\nसिर्फ ₹50 प्रति मूवी",
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 14, color: Color(0xFF00E5FF)),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          Icons.circle,
+                          size: 10,
+                          color: isServerOnline
+                              ? Colors.greenAccent
+                              : Colors.redAccent,
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          isServerOnline
+                              ? "Server Online"
+                              : "Server Offline (Settings में Railway URL डालें)",
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.white70,
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (savedWelcomeEmail != null &&
+                        savedWelcomeEmail!.contains("@")) ...[
+                      const SizedBox(height: 20),
+                      Container(
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1E133A),
+                          borderRadius: BorderRadius.circular(18),
+                          border: Border.all(
+                            color: const Color(0xFF00E5FF).withOpacity(0.55),
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            Container(
+                              width: 54,
+                              height: 54,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: const Color(0xFF00E5FF),
+                                  width: 2,
+                                ),
+                                color: const Color(0xFF0E091D),
+                              ),
+                              child: ClipOval(
+                                child: welcomePhotoUrl.isNotEmpty
+                                    ? Image.network(
+                                        welcomePhotoUrl,
+                                        fit: BoxFit.cover,
+                                        alignment: Alignment.topCenter,
+                                        errorBuilder: (_, __, ___) => const Icon(
+                                          Icons.person,
+                                          color: Color(0xFF00E5FF),
+                                          size: 28,
+                                        ),
+                                      )
+                                    : const Icon(
+                                        Icons.person,
+                                        color: Color(0xFF00E5FF),
+                                        size: 28,
+                                      ),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text(
+                                    "WELCOME BACK · QUICK LOGIN",
+                                    style: TextStyle(
+                                      color: Color(0xFF00E5FF),
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.bold,
+                                      letterSpacing: 0.7,
+                                    ),
+                                  ),
+                                  Text(
+                                    savedWelcomeName ?? "Creator",
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  Text(
+                                    (savedWelcomeMobile ?? "").isNotEmpty
+                                        ? "${savedWelcomeMobile!} • $savedWelcomeEmail"
+                                        : savedWelcomeEmail!,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: Colors.white60,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            ElevatedButton(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFF00E5FF),
+                                foregroundColor: const Color(0xFF0E091D),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 14,
+                                  vertical: 10,
+                                ),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                              ),
+                              onPressed: () => _completeLogin(
+                                savedWelcomeEmail!,
+                                savedWelcomeName ?? "Creator",
+                                savedWelcomePhoto ?? "",
+                                mobile: savedWelcomeMobile ?? "",
+                              ),
+                              child: const Text(
+                                "Continue",
+                                style: TextStyle(
+                                  fontWeight: FontWeight.w900,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
                       ),
                     ],
-                  ),
-                  const SizedBox(height: 30),
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.white,
-                        foregroundColor: Colors.black,
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 24,
-                          vertical: 16,
+                    const SizedBox(height: 24),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.white,
+                          foregroundColor: Colors.black,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 24,
+                            vertical: 15,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(30),
+                          ),
                         ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(30),
+                        onPressed: _handleGoogleSignIn,
+                        icon: const Icon(Icons.login, color: Color(0xFFFF007F)),
+                        label: const Text(
+                          "Continue with Google / Mobile",
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
                       ),
-                      onPressed: _handleGoogleSignIn,
-                      icon: const Icon(Icons.login, color: Color(0xFFFF007F)),
+                    ),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF00E5FF),
+                          foregroundColor: const Color(0xFF0E091D),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 24,
+                            vertical: 15,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(30),
+                          ),
+                        ),
+                        onPressed:
+                            isInstantLoggingIn ? null : _handleInstantGuestLogin,
+                        icon: const Icon(Icons.bolt, color: Color(0xFF0E091D)),
+                        label: Text(
+                          isInstantLoggingIn
+                              ? "तुरंत लॉगिन हो रहा है..."
+                              : "⚡ 1-Click Guest / Instant Start",
+                          style: const TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      "नए यूज़र को 1 Free Trial Video Pass तुरंत मिलेगा!",
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFFFFD600),
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    TextButton.icon(
+                      onPressed: _configureServerUrl,
+                      icon: const Icon(Icons.settings, color: Colors.white54),
                       label: const Text(
-                        "Continue with Google",
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold,
-                        ),
+                        "Server Setup",
+                        style: TextStyle(color: Colors.white54),
                       ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF00E5FF),
-                        foregroundColor: const Color(0xFF0E091D),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 24,
-                          vertical: 16,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(30),
-                        ),
-                      ),
-                      onPressed:
-                          isInstantLoggingIn ? null : _handleInstantGuestLogin,
-                      icon: const Icon(Icons.bolt, color: Color(0xFF0E091D)),
-                      label: Text(
-                        isInstantLoggingIn
-                            ? "तुरंत लॉगिन हो रहा है..."
-                            : "⚡ 1-Click Guest / Instant Start",
-                        style: const TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w900,
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    "नए यूज़र को 1 Free Trial Video Pass तुरंत मिलेगा!",
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: Color(0xFFFFD600),
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  TextButton.icon(
-                    onPressed: _configureServerUrl,
-                    icon: const Icon(Icons.settings, color: Colors.white54),
-                    label: const Text(
-                      "Server Setup",
-                      style: TextStyle(color: Colors.white54),
-                    ),
-                  )
-                ],
+                    )
+                  ],
+                ),
               ),
             ),
           ),
@@ -3130,32 +3711,77 @@ class _CinePopHomeState extends State<CinePopHome> {
       );
     }
 
+    final topAvatarUrl = _resolveMediaUrl(userPhoto);
     return Scaffold(
       appBar: AppBar(
         backgroundColor: const Color(0xFF1A0E36),
-        title: Row(
-          children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: Image.asset('assets/logo.png', width: 30, height: 30),
-            ),
-            const SizedBox(width: 8),
-            const Text(
-              "CinePop AI",
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.w900,
-                color: Color(0xFFFFD600),
+        titleSpacing: 10,
+        title: GestureDetector(
+          onTap: _showEditProfileSheet,
+          child: Row(
+            children: [
+              Container(
+                width: 34,
+                height: 34,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: const Color(0xFF00E5FF),
+                    width: 1.8,
+                  ),
+                  color: const Color(0xFF0E091D),
+                ),
+                child: ClipOval(
+                  child: topAvatarUrl.isNotEmpty
+                      ? Image.network(
+                          topAvatarUrl,
+                          fit: BoxFit.cover,
+                          alignment: Alignment.topCenter,
+                          errorBuilder: (_, __, ___) => Image.asset(
+                            'assets/logo.png',
+                            fit: BoxFit.cover,
+                          ),
+                        )
+                      : Image.asset('assets/logo.png', fit: BoxFit.cover),
+                ),
               ),
-            ),
-          ],
+              const SizedBox(width: 8),
+              Flexible(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      "CinePop AI",
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w900,
+                        color: Color(0xFFFFD600),
+                        height: 1.1,
+                      ),
+                    ),
+                    Text(
+                      userName ?? "Creator",
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Colors.white70,
+                        height: 1.1,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
         ),
         actions: [
           GestureDetector(
             onTap: _showBuyCreditDialog,
             child: Container(
-              margin: const EdgeInsets.symmetric(vertical: 10),
-              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+              margin: const EdgeInsets.symmetric(vertical: 11),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               decoration: BoxDecoration(
                 gradient: const LinearGradient(
                   colors: [Color(0xFFFF007F), Color(0xFF7000FF)],
@@ -3165,7 +3791,7 @@ class _CinePopHomeState extends State<CinePopHome> {
               child: Center(
                 child: Text(
                   isAdmin
-                      ? "👑 ADMIN FREE"
+                      ? "👑 ADMIN"
                       : "₹$walletBalance | 🎟️$userCredits",
                   style: const TextStyle(
                     fontWeight: FontWeight.bold,
@@ -3185,11 +3811,11 @@ class _CinePopHomeState extends State<CinePopHome> {
               onPressed: _openAdminPanelWithPinLock,
             ),
           IconButton(
-            icon: const Icon(Icons.settings),
+            icon: const Icon(Icons.settings, size: 21),
             onPressed: _configureServerUrl,
           ),
           IconButton(
-            icon: const Icon(Icons.logout, color: Colors.redAccent),
+            icon: const Icon(Icons.logout, color: Colors.redAccent, size: 21),
             onPressed: _logout,
           ),
         ],
@@ -4270,14 +4896,18 @@ class _CinePopHomeState extends State<CinePopHome> {
         Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
-            color: isCompleted
-                ? const Color(0xFF103324)
-                : const Color(0xFF1B1236),
+            color: isProjectFailed
+                ? const Color(0xFF3A121E)
+                : isCompleted
+                    ? const Color(0xFF103324)
+                    : const Color(0xFF1B1236),
             borderRadius: BorderRadius.circular(16),
             border: Border.all(
-              color: isCompleted
-                  ? Colors.greenAccent
-                  : const Color(0xFFFF007F).withOpacity(0.6),
+              color: isProjectFailed
+                  ? Colors.redAccent
+                  : isCompleted
+                      ? Colors.greenAccent
+                      : const Color(0xFFFF007F).withOpacity(0.6),
             ),
           ),
           child: Column(
@@ -4293,13 +4923,19 @@ class _CinePopHomeState extends State<CinePopHome> {
                     padding:
                         const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                     decoration: BoxDecoration(
-                      color: isCompleted
-                          ? Colors.green
-                          : const Color(0xFFFF007F),
+                      color: isProjectFailed
+                          ? Colors.redAccent
+                          : isCompleted
+                              ? Colors.green
+                              : const Color(0xFFFF007F),
                       borderRadius: BorderRadius.circular(20),
                     ),
                     child: Text(
-                      isCompleted ? "✅ 100% READY" : "⚡ $progress%",
+                      isProjectFailed
+                          ? "❌ FAILED"
+                          : isCompleted
+                              ? "✅ 100% READY"
+                              : "⚡ $progress%",
                       style: const TextStyle(
                         color: Colors.white,
                         fontWeight: FontWeight.w900,
@@ -4309,15 +4945,37 @@ class _CinePopHomeState extends State<CinePopHome> {
                   ),
                 ],
               ),
+              if (isProjectFailed && projectErrorText.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Colors.black38,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: Colors.redAccent.withOpacity(0.6)),
+                  ),
+                  child: Text(
+                    "⚠️ एरर: $projectErrorText",
+                    style: const TextStyle(
+                      color: Colors.redAccent,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ],
               const SizedBox(height: 10),
               ClipRRect(
                 borderRadius: BorderRadius.circular(8),
                 child: LinearProgressIndicator(
                   value: (progress.clamp(2, 100)) / 100.0,
                   minHeight: 12,
-                  color: isCompleted
-                      ? Colors.greenAccent
-                      : const Color(0xFFFF007F),
+                  color: isProjectFailed
+                      ? Colors.redAccent
+                      : isCompleted
+                          ? Colors.greenAccent
+                          : const Color(0xFFFF007F),
                   backgroundColor: const Color(0xFF281854),
                 ),
               ),
@@ -5580,10 +6238,53 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
   List<dynamic> referrals = [];
   bool loading = true;
 
+  // Tab 1 Search
+  final TextEditingController _userSearchCtrl = TextEditingController();
+  String _searchQuery = "";
+
+  // Tab 2 AI Engine & Custom Server Manager
+  final TextEditingController _customVideoSpaceCtrl = TextEditingController();
+  final TextEditingController _customFaceSwapSpaceCtrl = TextEditingController();
+  final TextEditingController _hfTokenCtrl = TextEditingController();
+  bool _hideHfToken = true;
+  bool _enableCustomHf = true;
+  bool _enablePollinations = true;
+  String _pollinationsModel = "flux";
+  bool _enablePublicHf = true;
+  bool _enableLtx = true;
+  bool _enableWan21 = true;
+  bool _enableCogVideo = true;
+  bool _enableLocalFallback = true;
+  bool _savingAiConfig = false;
+  bool _testingServers = false;
+  List<dynamic> _serverTestResults = [];
+  String _lastTestedAt = "";
+
   @override
   void initState() {
     super.initState();
     _fetchAdminData();
+  }
+
+  @override
+  void dispose() {
+    _userSearchCtrl.dispose();
+    _customVideoSpaceCtrl.dispose();
+    _customFaceSwapSpaceCtrl.dispose();
+    _hfTokenCtrl.dispose();
+    super.dispose();
+  }
+
+  String _resolveUrl(String? raw) {
+    final clean = (raw ?? "").trim();
+    if (clean.isEmpty) return "";
+    if (clean.startsWith("http://") || clean.startsWith("https://")) {
+      return clean;
+    }
+    final base = widget.serverUrl.endsWith("/")
+        ? widget.serverUrl.substring(0, widget.serverUrl.length - 1)
+        : widget.serverUrl;
+    return clean.startsWith("/") ? "$base$clean" : "$base/$clean";
   }
 
   Future<void> _fetchAdminData() async {
@@ -5596,6 +6297,7 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
       );
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
+        final aiCfg = data['ai_config'];
         setState(() {
           totalInstalls = data['total_installs'] ?? 0;
           totalRevenue = data['total_revenue'] ?? 0;
@@ -5607,10 +6309,266 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
           pendingPayments = data['pending_payments'] ?? [];
           promoCodes = data['promo_codes'] ?? [];
           referrals = data['referrals'] ?? [];
+          if (aiCfg is Map) {
+            _customVideoSpaceCtrl.text =
+                (aiCfg['custom_video_space'] ?? "").toString();
+            _customFaceSwapSpaceCtrl.text =
+                (aiCfg['custom_faceswap_space'] ?? "").toString();
+            _hfTokenCtrl.text = (aiCfg['hf_token'] ?? "").toString();
+            _enableCustomHf = aiCfg['enable_custom_hf'] != false;
+            _enablePollinations = aiCfg['enable_pollinations'] != false;
+            final m = (aiCfg['pollinations_model'] ?? "flux").toString();
+            _pollinationsModel =
+                (m == "turbo" || m == "flux-realism") ? m : "flux";
+            _enablePublicHf = aiCfg['enable_public_hf_spaces'] != false;
+            _enableLtx = aiCfg['enable_ltx_video'] != false;
+            _enableWan21 = aiCfg['enable_wan21'] != false;
+            _enableCogVideo = aiCfg['enable_cogvideox'] != false;
+            _enableLocalFallback =
+                aiCfg['enable_local_motion_fallback'] != false;
+          }
         });
       }
     } catch (_) {}
     if (mounted) setState(() => loading = false);
+  }
+
+  Future<void> _saveAiConfig() async {
+    setState(() => _savingAiConfig = true);
+    try {
+      final res = await http.post(
+        Uri.parse('${widget.serverUrl}/admin/ai-config/'),
+        headers: {"Content-Type": "application/json"},
+        body: jsonEncode({
+          "admin_email": widget.adminEmail,
+          "admin_pin": widget.adminPin,
+          "custom_video_space": _customVideoSpaceCtrl.text.trim(),
+          "custom_faceswap_space": _customFaceSwapSpaceCtrl.text.trim(),
+          "hf_token": _hfTokenCtrl.text.trim(),
+          "enable_custom_hf": _enableCustomHf,
+          "enable_pollinations": _enablePollinations,
+          "pollinations_model": _pollinationsModel,
+          "enable_public_hf_spaces": _enablePublicHf,
+          "enable_ltx_video": _enableLtx,
+          "enable_wan21": _enableWan21,
+          "enable_cogvideox": _enableCogVideo,
+          "enable_local_motion_fallback": _enableLocalFallback,
+        }),
+      );
+      final data = jsonDecode(res.body);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor:
+                res.statusCode == 200 ? Colors.green.shade700 : Colors.red,
+            content: Text(
+              (data['message'] ?? data['detail'] ?? "AI Settings Saved!")
+                  .toString(),
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Error saving AI config: $e")),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _savingAiConfig = false);
+    }
+  }
+
+  Future<void> _testAllAiServers() async {
+    setState(() => _testingServers = true);
+    try {
+      final res = await http
+          .post(
+            Uri.parse('${widget.serverUrl}/admin/test-ai-servers/'),
+            headers: {"Content-Type": "application/json"},
+            body: jsonEncode({
+              "admin_email": widget.adminEmail,
+              "admin_pin": widget.adminPin,
+            }),
+          )
+          .timeout(const Duration(seconds: 20));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        setState(() {
+          _serverTestResults = (data['results'] ?? []) as List<dynamic>;
+          _lastTestedAt = (data['tested_at'] ?? "").toString();
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Test failed: $e")),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _testingServers = false);
+    }
+  }
+
+  Future<void> _copyToClipboard(String text, String label) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          duration: const Duration(seconds: 2),
+          content: Text("📋 $label कॉपी हो गया: $text"),
+        ),
+      );
+    }
+  }
+
+  Future<void> _launchCall(String mobile) async {
+    final cleaned = mobile.replaceAll(RegExp(r'\s+'), '');
+    if (cleaned.isEmpty) return;
+    final uri = Uri.parse('tel:$cleaned');
+    try {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {
+      await _copyToClipboard(cleaned, "Mobile");
+    }
+  }
+
+  Future<void> _launchWhatsApp(String mobile) async {
+    String digits = mobile.replaceAll(RegExp(r'\D'), '');
+    if (digits.length == 10) digits = '91$digits';
+    if (digits.length < 10) return;
+    final uri = Uri.parse('https://wa.me/$digits');
+    try {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {
+      await _copyToClipboard(mobile, "WhatsApp Number");
+    }
+  }
+
+  void _showAvatarZoomDialog(Map<String, dynamic> u) {
+    final photoUrl = _resolveUrl(u['photo_url']?.toString());
+    final mobile = (u['mobile'] ?? "").toString().trim();
+    final email = (u['email'] ?? "").toString().trim();
+    final name = (u['name'] ?? "User").toString().trim();
+
+    showDialog(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: const Color(0xFF1B1236),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            ClipRRect(
+              borderRadius:
+                  const BorderRadius.vertical(top: Radius.circular(20)),
+              child: Container(
+                height: 310,
+                color: const Color(0xFF0E091D),
+                child: photoUrl.isNotEmpty
+                    ? InteractiveViewer(
+                        minScale: 1.0,
+                        maxScale: 4.0,
+                        child: Image.network(
+                          photoUrl,
+                          fit: BoxFit.cover,
+                          alignment: Alignment.topCenter,
+                          errorBuilder: (_, __, ___) => const Center(
+                            child: Icon(
+                              Icons.person,
+                              size: 80,
+                              color: Colors.white38,
+                            ),
+                          ),
+                        ),
+                      )
+                    : const Center(
+                        child: Icon(
+                          Icons.person,
+                          size: 80,
+                          color: Colors.white38,
+                        ),
+                      ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    name,
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    email,
+                    style:
+                        const TextStyle(fontSize: 12, color: Colors.white70),
+                  ),
+                  if (mobile.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      "📞 $mobile",
+                      style: const TextStyle(
+                        fontSize: 13,
+                        color: Color(0xFF00E5FF),
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      if (mobile.isNotEmpty) ...[
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.blueAccent,
+                            ),
+                            onPressed: () => _launchCall(mobile),
+                            icon: const Icon(Icons.call,
+                                size: 16, color: Colors.white),
+                            label: const Text("Call",
+                                style: TextStyle(color: Colors.white)),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.green,
+                            ),
+                            onPressed: () => _launchWhatsApp(mobile),
+                            icon: const Icon(Icons.chat,
+                                size: 16, color: Colors.white),
+                            label: const Text("WhatsApp",
+                                style: TextStyle(color: Colors.white)),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton(
+                      onPressed: () => Navigator.pop(ctx),
+                      child: const Text("Close"),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _showAdjustWalletDialog(Map<String, dynamic> targetUser) async {
@@ -5622,9 +6580,9 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF1B1236),
-        title: Text(
+        title: const Text(
           "💰 वॉलेट / पास अपडेट करें",
-          style: const TextStyle(color: Color(0xFFFFD600), fontSize: 17),
+          style: TextStyle(color: Color(0xFFFFD600), fontSize: 17),
         ),
         content: SingleChildScrollView(
           child: Column(
@@ -5851,236 +6809,813 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text("👑 Admin Control Panel"),
-        backgroundColor: const Color(0xFF1A0E36),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: _fetchAdminData,
-          )
-        ],
-      ),
-      body: loading
-          ? const Center(child: CircularProgressIndicator())
-          : ListView(
-              padding: const EdgeInsets.all(16),
-              children: [
-                Row(
-                  children: [
-                    _statCard(
-                      "कुल यूज़र",
-                      "$totalInstalls",
-                      const Color(0xFF00E5FF),
-                    ),
-                    const SizedBox(width: 8),
-                    _statCard("कमाई", "₹$totalRevenue", Colors.greenAccent),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    _statCard(
-                      "कुल वॉलेट ₹",
-                      "₹$totalWallets",
-                      Colors.lightGreenAccent,
-                    ),
-                    const SizedBox(width: 8),
-                    _statCard(
-                      "कुल मूवीज़",
-                      "$totalMovies",
-                      const Color(0xFFFFD600),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    _statCard(
-                      "🎁 रेफरल्स",
-                      "$totalReferrals",
-                      const Color(0xFFFF007F),
-                    ),
-                    const SizedBox(width: 8),
-                    _statCard(
-                      "🎭 Face-Swaps",
-                      "$totalFaceSwaps",
-                      Colors.purpleAccent,
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 20),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text(
-                      "🎟️ एक्टिव Promo Codes:",
-                      style: TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.bold,
-                        color: Color(0xFFFFD600),
+    final q = _searchQuery.trim().toLowerCase();
+    final filteredUsers = users.where((u) {
+      if (q.isEmpty) return true;
+      final name = (u['name'] ?? "").toString().toLowerCase();
+      final email = (u['email'] ?? "").toString().toLowerCase();
+      final mobile = (u['mobile'] ?? "").toString().toLowerCase();
+      return name.contains(q) || email.contains(q) || mobile.contains(q);
+    }).toList();
+
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text("👑 Admin Control Center"),
+          backgroundColor: const Color(0xFF1A0E36),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              onPressed: _fetchAdminData,
+            )
+          ],
+          bottom: const TabBar(
+            indicatorColor: Color(0xFFFFD600),
+            labelColor: Color(0xFFFFD600),
+            unselectedLabelColor: Colors.white60,
+            tabs: [
+              Tab(
+                icon: Icon(Icons.people),
+                text: "👥 Users & CRM",
+              ),
+              Tab(
+                icon: Icon(Icons.rocket_launch),
+                text: "🚀 AI Server Manager",
+              ),
+            ],
+          ),
+        ),
+        body: loading
+            ? const Center(child: CircularProgressIndicator())
+            : TabBarView(
+                children: [
+                  // ==================== TAB 1: USERS DIRECTORY CRM & BILLING ====================
+                  ListView(
+                    padding: const EdgeInsets.all(14),
+                    children: [
+                      Row(
+                        children: [
+                          _statCard(
+                            "कुल यूज़र",
+                            "$totalInstalls",
+                            const Color(0xFF00E5FF),
+                          ),
+                          const SizedBox(width: 8),
+                          _statCard(
+                              "कमाई", "₹$totalRevenue", Colors.greenAccent),
+                        ],
                       ),
-                    ),
-                    ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF7000FF),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          _statCard(
+                            "कुल वॉलेट ₹",
+                            "₹$totalWallets",
+                            Colors.lightGreenAccent,
+                          ),
+                          const SizedBox(width: 8),
+                          _statCard(
+                            "कुल मूवीज़",
+                            "$totalMovies",
+                            const Color(0xFFFFD600),
+                          ),
+                        ],
                       ),
-                      onPressed: _showCreatePromoDialog,
-                      icon:
-                          const Icon(Icons.add, color: Colors.white, size: 18),
-                      label: const Text(
-                        "नया कोड",
-                        style: TextStyle(color: Colors.white),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          _statCard(
+                            "🎁 रेफरल्स",
+                            "$totalReferrals",
+                            const Color(0xFFFF007F),
+                          ),
+                          const SizedBox(width: 8),
+                          _statCard(
+                            "🎭 Face-Swaps",
+                            "$totalFaceSwaps",
+                            Colors.purpleAccent,
+                          ),
+                        ],
                       ),
-                    ),
-                  ],
-                ),
-                if (promoCodes.isEmpty)
-                  const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 6),
-                    child: Text(
-                      "अभी कोई Promo Code नहीं बना है।",
-                      style: TextStyle(color: Colors.white54),
-                    ),
-                  ),
-                ...promoCodes.map(
-                  (pc) => Card(
-                    color: const Color(0xFF231342),
-                    child: ListTile(
-                      title: Text(
-                        "${pc['code']} (${pc['free_credits']} फ्री मूवी)",
-                        style: const TextStyle(
+                      const SizedBox(height: 18),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text(
+                            "👥 Registered Users & Face IDs",
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFF00E5FF),
+                            ),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF00E5FF).withOpacity(0.18),
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                            child: Text(
+                              "${filteredUsers.length} / $totalInstalls",
+                              style: const TextStyle(
+                                color: Color(0xFF00E5FF),
+                                fontWeight: FontWeight.bold,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: _userSearchCtrl,
+                        onChanged: (v) => setState(() => _searchQuery = v),
+                        decoration: InputDecoration(
+                          filled: true,
+                          fillColor: const Color(0xFF1B1236),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          prefixIcon: const Icon(Icons.search,
+                              color: Color(0xFF00E5FF)),
+                          hintText: "Search Name, Mobile Number, or Gmail...",
+                          suffixIcon: _searchQuery.isNotEmpty
+                              ? IconButton(
+                                  icon: const Icon(Icons.clear, size: 18),
+                                  onPressed: () {
+                                    _userSearchCtrl.clear();
+                                    setState(() => _searchQuery = "");
+                                  },
+                                )
+                              : null,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      if (filteredUsers.isEmpty)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 12),
+                          child: Text(
+                            "कोई मैचिंग यूज़र नहीं मिला।",
+                            style: TextStyle(color: Colors.white54),
+                          ),
+                        ),
+                      ...filteredUsers.map((rawU) {
+                        final u = Map<String, dynamic>.from(rawU as Map);
+                        final photoUrl = _resolveUrl(u['photo_url']?.toString());
+                        final mobile = (u['mobile'] ?? "").toString().trim();
+                        final email = (u['email'] ?? "").toString().trim();
+                        final name = (u['name'] ?? "User").toString().trim();
+                        final lastActive =
+                            (u['last_active'] ?? "").toString().trim();
+                        return Card(
+                          color: const Color(0xFF1B1236),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                            side: BorderSide(
+                              color: Colors.white.withOpacity(0.1),
+                            ),
+                          ),
+                          margin: const EdgeInsets.only(bottom: 10),
+                          child: Padding(
+                            padding: const EdgeInsets.all(12),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    GestureDetector(
+                                      onTap: () => _showAvatarZoomDialog(u),
+                                      child: Container(
+                                        width: 54,
+                                        height: 54,
+                                        decoration: BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          border: Border.all(
+                                            color: const Color(0xFF00E5FF),
+                                            width: 2,
+                                          ),
+                                          color: const Color(0xFF0E091D),
+                                        ),
+                                        child: ClipOval(
+                                          child: photoUrl.isNotEmpty
+                                              ? Image.network(
+                                                  photoUrl,
+                                                  fit: BoxFit.cover,
+                                                  alignment: Alignment.topCenter,
+                                                  errorBuilder: (_, __, ___) =>
+                                                      const Icon(
+                                                    Icons.person,
+                                                    color: Colors.white54,
+                                                  ),
+                                                )
+                                              : const Icon(
+                                                  Icons.person,
+                                                  color: Colors.white54,
+                                                ),
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            name,
+                                            style: const TextStyle(
+                                              fontSize: 15,
+                                              fontWeight: FontWeight.bold,
+                                              color: Colors.white,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 2),
+                                          Row(
+                                            children: [
+                                              Expanded(
+                                                child: Text(
+                                                  email,
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: const TextStyle(
+                                                    fontSize: 12,
+                                                    color: Colors.white70,
+                                                  ),
+                                                ),
+                                              ),
+                                              InkWell(
+                                                onTap: () => _copyToClipboard(
+                                                    email, "Gmail"),
+                                                child: const Padding(
+                                                  padding: EdgeInsets.all(4),
+                                                  child: Icon(
+                                                    Icons.copy,
+                                                    size: 15,
+                                                    color: Color(0xFF00E5FF),
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                          const SizedBox(height: 2),
+                                          Row(
+                                            children: [
+                                              const Icon(Icons.phone,
+                                                  size: 13,
+                                                  color: Colors.greenAccent),
+                                              const SizedBox(width: 4),
+                                              Expanded(
+                                                child: Text(
+                                                  mobile.isNotEmpty
+                                                      ? mobile
+                                                      : "Mobile not added",
+                                                  style: TextStyle(
+                                                    fontSize: 12,
+                                                    color: mobile.isNotEmpty
+                                                        ? Colors.greenAccent
+                                                        : Colors.white38,
+                                                    fontWeight: FontWeight.w600,
+                                                  ),
+                                                ),
+                                              ),
+                                              if (mobile.isNotEmpty) ...[
+                                                InkWell(
+                                                  onTap: () =>
+                                                      _launchCall(mobile),
+                                                  child: const Padding(
+                                                    padding: EdgeInsets.all(5),
+                                                    child: Icon(Icons.call,
+                                                        size: 17,
+                                                        color: Colors
+                                                            .lightBlueAccent),
+                                                  ),
+                                                ),
+                                                InkWell(
+                                                  onTap: () =>
+                                                      _launchWhatsApp(mobile),
+                                                  child: const Padding(
+                                                    padding: EdgeInsets.all(5),
+                                                    child: Icon(Icons.chat,
+                                                        size: 17,
+                                                        color: Colors
+                                                            .greenAccent),
+                                                  ),
+                                                ),
+                                                InkWell(
+                                                  onTap: () => _copyToClipboard(
+                                                      mobile, "Mobile"),
+                                                  child: const Padding(
+                                                    padding: EdgeInsets.all(5),
+                                                    child: Icon(Icons.copy,
+                                                        size: 15,
+                                                        color: Colors.white70),
+                                                  ),
+                                                ),
+                                              ],
+                                            ],
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const Divider(
+                                    height: 16, color: Colors.white12),
+                                Row(
+                                  mainAxisAlignment:
+                                      MainAxisAlignment.spaceBetween,
+                                  children: [
+                                    Expanded(
+                                      child: Text(
+                                        "₹${u['wallet_balance'] ?? 0} • 🎟️${u['credits'] ?? 0} • 🎬${u['movies_created'] ?? 0}\nActive: $lastActive",
+                                        style: const TextStyle(
+                                          fontSize: 11,
+                                          color: Colors.white70,
+                                        ),
+                                      ),
+                                    ),
+                                    ElevatedButton(
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor:
+                                            const Color(0xFFFFD600),
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 12,
+                                          vertical: 6,
+                                        ),
+                                      ),
+                                      onPressed: () =>
+                                          _showAdjustWalletDialog(u),
+                                      child: const Text(
+                                        "₹ / पास",
+                                        style: TextStyle(
+                                          color: Colors.black,
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      }),
+                      const Divider(height: 28),
+                      const Text(
+                        "💰 पेंडिंग ₹50 पेमेंट रिक्वेस्ट:",
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFFFF007F),
+                        ),
+                      ),
+                      if (pendingPayments.isEmpty)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 6),
+                          child: Text(
+                            "कोई पेंडिंग पेमेंट नहीं है।",
+                            style: TextStyle(color: Colors.white54),
+                          ),
+                        ),
+                      ...pendingPayments.map(
+                        (p) => Card(
+                          color: const Color(0xFF28144A),
+                          child: ListTile(
+                            title: Text(
+                              "${p['name']} (₹${p['amount']} - ${p['movies_count']} मूवी)",
+                            ),
+                            subtitle: Text(
+                              "Google ID: ${p['email']}\nUTR: ${p['utr']}",
+                            ),
+                            trailing: ElevatedButton(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.green,
+                              ),
+                              onPressed: () => _approvePayment(p['req_id']),
+                              child: const Text(
+                                "Approve",
+                                style: TextStyle(color: Colors.white),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const Divider(height: 28),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text(
+                            "🎟️ एक्टिव Promo Codes:",
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFFFFD600),
+                            ),
+                          ),
+                          ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF7000FF),
+                            ),
+                            onPressed: _showCreatePromoDialog,
+                            icon: const Icon(Icons.add,
+                                color: Colors.white, size: 18),
+                            label: const Text(
+                              "नया कोड",
+                              style: TextStyle(color: Colors.white),
+                            ),
+                          ),
+                        ],
+                      ),
+                      if (promoCodes.isEmpty)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 6),
+                          child: Text(
+                            "अभी कोई Promo Code नहीं बना है।",
+                            style: TextStyle(color: Colors.white54),
+                          ),
+                        ),
+                      ...promoCodes.map(
+                        (pc) => Card(
+                          color: const Color(0xFF231342),
+                          child: ListTile(
+                            title: Text(
+                              "${pc['code']} (${pc['free_credits']} फ्री मूवी)",
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                color: Color(0xFFFFD600),
+                              ),
+                            ),
+                            subtitle: Text(
+                              "यूज़ हुआ: ${pc['used_count']} / ${pc['max_uses']}",
+                            ),
+                            trailing: IconButton(
+                              icon: const Icon(Icons.delete,
+                                  color: Colors.redAccent),
+                              onPressed: () => _deletePromo(pc['code']),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const Divider(height: 28),
+                      const Text(
+                        "🎁 Refer & Earn Tracking:",
+                        style: TextStyle(
+                          fontSize: 16,
                           fontWeight: FontWeight.bold,
                           color: Color(0xFFFFD600),
                         ),
                       ),
-                      subtitle: Text(
-                        "यूज़ हुआ: ${pc['used_count']} / ${pc['max_uses']}",
-                      ),
-                      trailing: IconButton(
-                        icon:
-                            const Icon(Icons.delete, color: Colors.redAccent),
-                        onPressed: () => _deletePromo(pc['code']),
-                      ),
-                    ),
-                  ),
-                ),
-                const Divider(height: 28),
-                const Text(
-                  "💰 पेंडिंग ₹50 पेमेंट रिक्वेस्ट:",
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xFFFF007F),
-                  ),
-                ),
-                if (pendingPayments.isEmpty)
-                  const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 6),
-                    child: Text(
-                      "कोई पेंडिंग पेमेंट नहीं है।",
-                      style: TextStyle(color: Colors.white54),
-                    ),
-                  ),
-                ...pendingPayments.map(
-                  (p) => Card(
-                    color: const Color(0xFF28144A),
-                    child: ListTile(
-                      title: Text(
-                        "${p['name']} (₹${p['amount']} - ${p['movies_count']} मूवी)",
-                      ),
-                      subtitle: Text(
-                        "Google ID: ${p['email']}\nUTR: ${p['utr']}",
-                      ),
-                      trailing: ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.green,
+                      if (referrals.isEmpty)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 6),
+                          child: Text(
+                            "अभी कोई रेफरल क्लेम नहीं हुआ है।",
+                            style: TextStyle(color: Colors.white54),
+                          ),
                         ),
-                        onPressed: () => _approvePayment(p['req_id']),
-                        child: const Text(
-                          "Approve",
-                          style: TextStyle(color: Colors.white),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-                const Divider(height: 28),
-                const Text(
-                  "👥 कस्टमर वॉलेट & पास कंट्रोल:",
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xFF00E5FF),
-                  ),
-                ),
-                const SizedBox(height: 8),
-                ...users.map(
-                  (u) => Card(
-                    color: const Color(0xFF1B1236),
-                    child: ListTile(
-                      leading: const CircleAvatar(
-                        backgroundColor: Color(0xFFFF007F),
-                        child: Icon(Icons.person, color: Colors.white),
-                      ),
-                      title: Text(u['name'] ?? "User"),
-                      subtitle: Text(
-                        "${u['email']}\nवॉलेट: ₹${u['wallet_balance'] ?? 0} | पास: ${u['credits'] ?? 0} | मूवी: ${u['movies_created'] ?? 0} | Ref: ${u['referral_code'] ?? '-'}",
-                      ),
-                      trailing: ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFFFFD600),
-                          padding: const EdgeInsets.symmetric(horizontal: 10),
-                        ),
-                        onPressed: () =>
-                            _showAdjustWalletDialog(Map<String, dynamic>.from(u)),
-                        child: const Text(
-                          "₹ / पास",
-                          style: TextStyle(
-                            color: Colors.black,
-                            fontWeight: FontWeight.bold,
-                            fontSize: 12,
+                      ...referrals.map(
+                        (r) => Card(
+                          color: const Color(0xFF231342),
+                          child: ListTile(
+                            title: Text(
+                              "${r['referrer_email']} ➔ ${r['referee_email']}",
+                              style: const TextStyle(
+                                  fontSize: 12, fontWeight: FontWeight.bold),
+                            ),
+                            subtitle: Text(
+                              "Code: ${r['code']} • +${r['reward_passes'] ?? 1} Pass Both • ${r['created_at'] ?? ''}",
+                              style: const TextStyle(
+                                  fontSize: 11, color: Colors.greenAccent),
+                            ),
                           ),
                         ),
                       ),
-                    ),
+                    ],
                   ),
-                ),
-                const Divider(height: 28),
-                const Text(
-                  "🎁 Refer & Earn Tracking:",
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xFFFFD600),
-                  ),
-                ),
-                if (referrals.isEmpty)
-                  const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 6),
-                    child: Text(
-                      "अभी कोई रेफरल क्लेम नहीं हुआ है।",
-                      style: TextStyle(color: Colors.white54),
-                    ),
-                  ),
-                ...referrals.map(
-                  (r) => Card(
-                    color: const Color(0xFF231342),
-                    child: ListTile(
-                      title: Text(
-                        "${r['referrer_email']} ➔ ${r['referee_email']}",
-                        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+
+                  // ==================== TAB 2: AI ENGINE & CUSTOM SERVER MANAGER ====================
+                  ListView(
+                    padding: const EdgeInsets.all(14),
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1B1236),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
+                            color: const Color(0xFF00E5FF).withOpacity(0.45),
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              "🚀 Personal HuggingFace Spaces & Token",
+                              style: TextStyle(
+                                color: Color(0xFF00E5FF),
+                                fontSize: 15,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            const Text(
+                              "अपना खुद का डुप्लीकेट किया हुआ HuggingFace Space URL और HF_TOKEN डालें — बिना कोड बदले तुरंत लाइव चलेगा!",
+                              style: TextStyle(
+                                  color: Colors.white60, fontSize: 11),
+                            ),
+                            const SizedBox(height: 12),
+                            TextField(
+                              controller: _customVideoSpaceCtrl,
+                              decoration: const InputDecoration(
+                                filled: true,
+                                fillColor: Color(0xFF0E091D),
+                                border: OutlineInputBorder(),
+                                labelText: "Custom Video AI Space URL",
+                                hintText: "akashtyagi534/my-video-space",
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            TextField(
+                              controller: _customFaceSwapSpaceCtrl,
+                              decoration: const InputDecoration(
+                                filled: true,
+                                fillColor: Color(0xFF0E091D),
+                                border: OutlineInputBorder(),
+                                labelText: "Custom Face-Swap / Lip-Sync Space",
+                                hintText: "akashtyagi534/my-faceswap-space",
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            TextField(
+                              controller: _hfTokenCtrl,
+                              obscureText: _hideHfToken,
+                              decoration: InputDecoration(
+                                filled: true,
+                                fillColor: const Color(0xFF0E091D),
+                                border: const OutlineInputBorder(),
+                                labelText: "Personal HF_TOKEN (hf_...)",
+                                hintText: "hf_xxxxxxxxxxxxxxxx",
+                                suffixIcon: IconButton(
+                                  icon: Icon(
+                                    _hideHfToken
+                                        ? Icons.visibility
+                                        : Icons.visibility_off,
+                                    color: const Color(0xFFFFD600),
+                                  ),
+                                  onPressed: () => setState(
+                                      () => _hideHfToken = !_hideHfToken),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
-                      subtitle: Text(
-                        "Code: ${r['code']} • +${r['reward_passes'] ?? 1} Pass Both • ${r['created_at'] ?? ''}",
-                        style: const TextStyle(fontSize: 11, color: Colors.greenAccent),
+                      const SizedBox(height: 14),
+                      Container(
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1B1236),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
+                            color: Colors.white.withOpacity(0.14),
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              "⚙️ Engine Priority & Live Toggles",
+                              style: TextStyle(
+                                color: Color(0xFFFFD600),
+                                fontSize: 15,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            SwitchListTile(
+                              contentPadding: EdgeInsets.zero,
+                              activeColor: const Color(0xFF00E5FF),
+                              title: const Text(
+                                "Priority 1: Custom HF Space",
+                                style: TextStyle(fontSize: 13),
+                              ),
+                              value: _enableCustomHf,
+                              onChanged: (v) =>
+                                  setState(() => _enableCustomHf = v),
+                            ),
+                            SwitchListTile(
+                              contentPadding: EdgeInsets.zero,
+                              activeColor: const Color(0xFF00E5FF),
+                              title: const Text(
+                                "Priority 2A: Pollinations Parallel Engine",
+                                style: TextStyle(fontSize: 13),
+                              ),
+                              value: _enablePollinations,
+                              onChanged: (v) =>
+                                  setState(() => _enablePollinations = v),
+                            ),
+                            Wrap(
+                              spacing: 8,
+                              children: ["flux", "turbo", "flux-realism"]
+                                  .map(
+                                    (m) => ChoiceChip(
+                                      label: Text(m),
+                                      selected: _pollinationsModel == m,
+                                      selectedColor: const Color(0xFFFFD600),
+                                      labelStyle: TextStyle(
+                                        color: _pollinationsModel == m
+                                            ? Colors.black
+                                            : Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 12,
+                                      ),
+                                      onSelected: (_) => setState(
+                                          () => _pollinationsModel = m),
+                                    ),
+                                  )
+                                  .toList(),
+                            ),
+                            SwitchListTile(
+                              contentPadding: EdgeInsets.zero,
+                              activeColor: const Color(0xFF00E5FF),
+                              title: const Text(
+                                "Priority 2B: Public HF Spaces (8s Cap)",
+                                style: TextStyle(fontSize: 13),
+                              ),
+                              value: _enablePublicHf,
+                              onChanged: (v) =>
+                                  setState(() => _enablePublicHf = v),
+                            ),
+                            Wrap(
+                              spacing: 8,
+                              children: [
+                                FilterChip(
+                                  label: const Text("LTX-Video"),
+                                  selected: _enableLtx,
+                                  onSelected: (v) =>
+                                      setState(() => _enableLtx = v),
+                                ),
+                                FilterChip(
+                                  label: const Text("Wan2.1"),
+                                  selected: _enableWan21,
+                                  onSelected: (v) =>
+                                      setState(() => _enableWan21 = v),
+                                ),
+                                FilterChip(
+                                  label: const Text("CogVideoX"),
+                                  selected: _enableCogVideo,
+                                  onSelected: (v) =>
+                                      setState(() => _enableCogVideo = v),
+                                ),
+                              ],
+                            ),
+                            SwitchListTile(
+                              contentPadding: EdgeInsets.zero,
+                              activeColor: Colors.greenAccent,
+                              title: const Text(
+                                "Priority 3: Fast Cinematic Fallback (Zero Hang)",
+                                style: TextStyle(fontSize: 13),
+                              ),
+                              value: _enableLocalFallback,
+                              onChanged: (v) =>
+                                  setState(() => _enableLocalFallback = v),
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
+                      const SizedBox(height: 14),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFFFF007F),
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 14),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                              ),
+                              onPressed: _savingAiConfig ? null : _saveAiConfig,
+                              icon: const Icon(Icons.save, color: Colors.white),
+                              label: Text(
+                                _savingAiConfig
+                                    ? "Saving..."
+                                    : "Save AI Settings",
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFFFFD600),
+                                foregroundColor: Colors.black,
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 14),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                              ),
+                              onPressed:
+                                  _testingServers ? null : _testAllAiServers,
+                              icon: const Icon(Icons.bolt, color: Colors.black),
+                              label: Text(
+                                _testingServers
+                                    ? "Testing..."
+                                    : "⚡ Test All Servers",
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w900,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      if (_serverTestResults.isNotEmpty) ...[
+                        const SizedBox(height: 16),
+                        Text(
+                          "📡 Live Server Health (${_lastTestedAt.isNotEmpty ? _lastTestedAt : 'Just Now'})",
+                          style: const TextStyle(
+                            color: Color(0xFF00E5FF),
+                            fontWeight: FontWeight.bold,
+                            fontSize: 14,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        ..._serverTestResults.map((rawR) {
+                          final r = Map<String, dynamic>.from(rawR as Map);
+                          final bool online = r['online'] == true;
+                          final int ms = (r['latency_ms'] ?? 0) is int
+                              ? r['latency_ms'] as int
+                              : int.tryParse("${r['latency_ms']}") ?? 0;
+                          final String status =
+                              (r['status'] ?? "Unknown").toString();
+                          return Card(
+                            color: online
+                                ? const Color(0xFF103324)
+                                : const Color(0xFF2B1535),
+                            child: ListTile(
+                              leading: Icon(
+                                online
+                                    ? Icons.check_circle
+                                    : Icons.warning_amber_rounded,
+                                color: online
+                                    ? Colors.greenAccent
+                                    : Colors.amberAccent,
+                              ),
+                              title: Text(
+                                (r['name'] ?? "AI Server").toString(),
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 13,
+                                ),
+                              ),
+                              subtitle: Text(
+                                "${r['target'] ?? ''}\n${ms > 0 ? '${(ms / 1000).toStringAsFixed(2)}s (${ms}ms)' : '—'} • ${r['note'] ?? ''}",
+                                style: const TextStyle(fontSize: 11),
+                              ),
+                              trailing: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: online
+                                      ? Colors.green.withOpacity(0.25)
+                                      : Colors.amber.withOpacity(0.25),
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: Text(
+                                  status,
+                                  style: TextStyle(
+                                    color: online
+                                        ? Colors.greenAccent
+                                        : Colors.amberAccent,
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          );
+                        }),
+                      ],
+                    ],
                   ),
-                ),
-              ],
-            ),
+                ],
+              ),
+      ),
     );
   }
 
