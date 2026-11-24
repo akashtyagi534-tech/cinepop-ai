@@ -112,6 +112,8 @@ class _CinePopHomeState extends State<CinePopHome> {
   String _verifiedAdminPin = "";
   String adminUpiId = "8269045143@ybl";
   int moviePrice = 50;
+  String announcementBanner = "";
+  bool bannerDismissed = false;
 
   // Navigation: 0=Studio, 1=Face-Swap, 2=Library, 3=Refer & Earn
   int currentTab = 0;
@@ -271,6 +273,7 @@ class _CinePopHomeState extends State<CinePopHome> {
     }
     serverController.text = serverUrl;
     await _checkServerHealth();
+    _fetchPublicAppConfig();
 
     final savedEmail = prefs.getString('user_email');
     final savedName = prefs.getString('user_name');
@@ -309,6 +312,26 @@ class _CinePopHomeState extends State<CinePopHome> {
       setState(() => activeProjectId = savedId);
       _startAutoSync();
     }
+  }
+
+  Future<void> _fetchPublicAppConfig() async {
+    try {
+      final res = await http
+          .get(Uri.parse('$serverUrl/public/app-config/'))
+          .timeout(const Duration(seconds: 6));
+      if (res.statusCode == 200 && mounted) {
+        final cfg = jsonDecode(res.body);
+        setState(() {
+          if (cfg['upi_id'] != null && cfg['upi_id'].toString().isNotEmpty) {
+            adminUpiId = cfg['upi_id'].toString();
+          }
+          if (cfg['movie_price'] != null) {
+            moviePrice = int.tryParse("${cfg['movie_price']}") ?? moviePrice;
+          }
+          announcementBanner = (cfg['announcement_banner'] ?? "").toString().trim();
+        });
+      }
+    } catch (_) {}
   }
 
   Future<void> _checkServerHealth() async {
@@ -3822,15 +3845,61 @@ class _CinePopHomeState extends State<CinePopHome> {
       ),
       body: Padding(
         padding: const EdgeInsets.all(16.0),
-        child: currentTab == 0
-            ? (activeProjectId != null
-                ? _buildStudioScreen()
-                : _buildSetupScreen())
-            : currentTab == 1
-                ? _buildFaceSwapScreen()
-                : currentTab == 2
-                    ? _buildLibraryScreen()
-                    : _buildReferEarnScreen(),
+        child: Column(
+          children: [
+            if (announcementBanner.isNotEmpty && !bannerDismissed)
+              Container(
+                margin: const EdgeInsets.only(bottom: 12),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [Color(0xFF3A1246), Color(0xFF1F1642)],
+                  ),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: const Color(0xFFFFD600).withOpacity(0.55),
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.campaign,
+                        color: Color(0xFFFFD600), size: 20),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        announcementBanner,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    InkWell(
+                      onTap: () => setState(() => bannerDismissed = true),
+                      child: const Padding(
+                        padding: EdgeInsets.all(4.0),
+                        child: Icon(Icons.close,
+                            color: Colors.white60, size: 16),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            Expanded(
+              child: currentTab == 0
+                  ? (activeProjectId != null
+                      ? _buildStudioScreen()
+                      : _buildSetupScreen())
+                  : currentTab == 1
+                      ? _buildFaceSwapScreen()
+                      : currentTab == 2
+                          ? _buildLibraryScreen()
+                          : _buildReferEarnScreen(),
+            ),
+          ],
+        ),
       ),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: currentTab,
@@ -6242,10 +6311,25 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
   final TextEditingController _userSearchCtrl = TextEditingController();
   String _searchQuery = "";
 
-  // Tab 2 AI Engine & Custom Server Manager
+  // Tab 2 All-in-One Auto-Failover API Vault & Business Controls
+  final TextEditingController _geminiKeyCtrl = TextEditingController();
+  final TextEditingController _groqKeyCtrl = TextEditingController();
+  final TextEditingController _cfAccountCtrl = TextEditingController();
+  final TextEditingController _cfTokenCtrl = TextEditingController();
+  final TextEditingController _togetherKeyCtrl = TextEditingController();
   final TextEditingController _customVideoSpaceCtrl = TextEditingController();
   final TextEditingController _customFaceSwapSpaceCtrl = TextEditingController();
   final TextEditingController _hfTokenCtrl = TextEditingController();
+  final TextEditingController _freeTrialCtrl = TextEditingController(text: "2");
+  final TextEditingController _pack50Ctrl = TextEditingController(text: "5");
+  final TextEditingController _upiCtrl =
+      TextEditingController(text: "8269045143@ybl");
+  final TextEditingController _announcementCtrl = TextEditingController();
+
+  bool _hideGeminiKey = true;
+  bool _hideGroqKey = true;
+  bool _hideCfToken = true;
+  bool _hideTogetherKey = true;
   bool _hideHfToken = true;
   bool _enableCustomHf = true;
   bool _enablePollinations = true;
@@ -6269,9 +6353,18 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
   @override
   void dispose() {
     _userSearchCtrl.dispose();
+    _geminiKeyCtrl.dispose();
+    _groqKeyCtrl.dispose();
+    _cfAccountCtrl.dispose();
+    _cfTokenCtrl.dispose();
+    _togetherKeyCtrl.dispose();
     _customVideoSpaceCtrl.dispose();
     _customFaceSwapSpaceCtrl.dispose();
     _hfTokenCtrl.dispose();
+    _freeTrialCtrl.dispose();
+    _pack50Ctrl.dispose();
+    _upiCtrl.dispose();
+    _announcementCtrl.dispose();
     super.dispose();
   }
 
@@ -6310,11 +6403,24 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
           promoCodes = data['promo_codes'] ?? [];
           referrals = data['referrals'] ?? [];
           if (aiCfg is Map) {
+            _geminiKeyCtrl.text = (aiCfg['gemini_api_key'] ?? "").toString();
+            _groqKeyCtrl.text = (aiCfg['groq_api_key'] ?? "").toString();
+            _cfAccountCtrl.text = (aiCfg['cf_account_id'] ?? "").toString();
+            _cfTokenCtrl.text = (aiCfg['cf_api_token'] ?? "").toString();
+            _togetherKeyCtrl.text =
+                (aiCfg['together_api_key'] ?? "").toString();
             _customVideoSpaceCtrl.text =
                 (aiCfg['custom_video_space'] ?? "").toString();
             _customFaceSwapSpaceCtrl.text =
                 (aiCfg['custom_faceswap_space'] ?? "").toString();
             _hfTokenCtrl.text = (aiCfg['hf_token'] ?? "").toString();
+            _freeTrialCtrl.text =
+                (aiCfg['free_trial_passes'] ?? 2).toString();
+            _pack50Ctrl.text = (aiCfg['pack_50_passes'] ?? 5).toString();
+            _upiCtrl.text =
+                (aiCfg['upi_id'] ?? "8269045143@ybl").toString();
+            _announcementCtrl.text =
+                (aiCfg['announcement_banner'] ?? "").toString();
             _enableCustomHf = aiCfg['enable_custom_hf'] != false;
             _enablePollinations = aiCfg['enable_pollinations'] != false;
             final m = (aiCfg['pollinations_model'] ?? "flux").toString();
@@ -6333,6 +6439,35 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
     if (mounted) setState(() => loading = false);
   }
 
+  Future<void> _quickGiftPasses(
+      Map<String, dynamic> targetUser, int passes) async {
+    try {
+      final res = await http.post(
+        Uri.parse('${widget.serverUrl}/admin/add-balance/'),
+        body: {
+          "admin_email": widget.adminEmail,
+          "admin_pin": widget.adminPin,
+          "target_email": targetUser['email'].toString(),
+          "amount": "0",
+          "credits": passes.toString(),
+          "note": "Admin 1-Tap Gift +$passes Passes",
+        },
+      );
+      final data = jsonDecode(res.body);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: Colors.green.shade700,
+            content: Text(
+              (data['message'] ?? "+$passes Passes गिफ्ट किए गए!").toString(),
+            ),
+          ),
+        );
+      }
+      _fetchAdminData();
+    } catch (_) {}
+  }
+
   Future<void> _saveAiConfig() async {
     setState(() => _savingAiConfig = true);
     try {
@@ -6342,9 +6477,18 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
         body: jsonEncode({
           "admin_email": widget.adminEmail,
           "admin_pin": widget.adminPin,
+          "gemini_api_key": _geminiKeyCtrl.text.trim(),
+          "groq_api_key": _groqKeyCtrl.text.trim(),
+          "cf_account_id": _cfAccountCtrl.text.trim(),
+          "cf_api_token": _cfTokenCtrl.text.trim(),
+          "together_api_key": _togetherKeyCtrl.text.trim(),
           "custom_video_space": _customVideoSpaceCtrl.text.trim(),
           "custom_faceswap_space": _customFaceSwapSpaceCtrl.text.trim(),
           "hf_token": _hfTokenCtrl.text.trim(),
+          "free_trial_passes": int.tryParse(_freeTrialCtrl.text.trim()) ?? 2,
+          "pack_50_passes": int.tryParse(_pack50Ctrl.text.trim()) ?? 5,
+          "upi_id": _upiCtrl.text.trim(),
+          "announcement_banner": _announcementCtrl.text.trim(),
           "enable_custom_hf": _enableCustomHf,
           "enable_pollinations": _enablePollinations,
           "pollinations_model": _pollinationsModel,
@@ -6362,7 +6506,7 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
             backgroundColor:
                 res.statusCode == 200 ? Colors.green.shade700 : Colors.red,
             content: Text(
-              (data['message'] ?? data['detail'] ?? "AI Settings Saved!")
+              (data['message'] ?? data['detail'] ?? "API Vault Saved!")
                   .toString(),
             ),
           ),
@@ -6371,7 +6515,7 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Error saving AI config: $e")),
+          SnackBar(content: Text("Error saving API Vault: $e")),
         );
       }
     } finally {
@@ -6391,11 +6535,12 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
               "admin_pin": widget.adminPin,
             }),
           )
-          .timeout(const Duration(seconds: 20));
+          .timeout(const Duration(seconds: 22));
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         setState(() {
-          _serverTestResults = (data['results'] ?? []) as List<dynamic>;
+          _serverTestResults =
+              (data['results'] ?? data['servers'] ?? []) as List<dynamic>;
           _lastTestedAt = (data['tested_at'] ?? "").toString();
         });
       }
@@ -7140,25 +7285,51 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
                                         ),
                                       ),
                                     ),
-                                    ElevatedButton(
-                                      style: ElevatedButton.styleFrom(
-                                        backgroundColor:
-                                            const Color(0xFFFFD600),
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 12,
-                                          vertical: 6,
+                                    Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        ElevatedButton(
+                                          style: ElevatedButton.styleFrom(
+                                            backgroundColor:
+                                                const Color(0xFFFF007F),
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 10,
+                                              vertical: 6,
+                                            ),
+                                          ),
+                                          onPressed: () =>
+                                              _quickGiftPasses(u, 5),
+                                          child: const Text(
+                                            "+5 Pass",
+                                            style: TextStyle(
+                                              color: Colors.white,
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 11,
+                                            ),
+                                          ),
                                         ),
-                                      ),
-                                      onPressed: () =>
-                                          _showAdjustWalletDialog(u),
-                                      child: const Text(
-                                        "₹ / पास",
-                                        style: TextStyle(
-                                          color: Colors.black,
-                                          fontWeight: FontWeight.bold,
-                                          fontSize: 12,
+                                        const SizedBox(width: 6),
+                                        ElevatedButton(
+                                          style: ElevatedButton.styleFrom(
+                                            backgroundColor:
+                                                const Color(0xFFFFD600),
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 10,
+                                              vertical: 6,
+                                            ),
+                                          ),
+                                          onPressed: () =>
+                                              _showAdjustWalletDialog(u),
+                                          child: const Text(
+                                            "₹ / पास",
+                                            style: TextStyle(
+                                              color: Colors.black,
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 11,
+                                            ),
+                                          ),
                                         ),
-                                      ),
+                                      ],
                                     ),
                                   ],
                                 ),
@@ -7300,10 +7471,102 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
                     ],
                   ),
 
-                  // ==================== TAB 2: AI ENGINE & CUSTOM SERVER MANAGER ====================
+                  // ==================== TAB 2: ALL-IN-ONE AUTO-FAILOVER API VAULT & CONTROLS ====================
                   ListView(
                     padding: const EdgeInsets.all(14),
                     children: [
+                      // 1. Story Brain Auto-Failover Chain
+                      Container(
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1B1236),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
+                            color: const Color(0xFFFFD600).withOpacity(0.5),
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              "🧠 1. Story Brain Auto-Failover (Gemini → Groq → Built-in)",
+                              style: TextStyle(
+                                color: Color(0xFFFFD600),
+                                fontSize: 14,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            TextField(
+                              controller: _geminiKeyCtrl,
+                              obscureText: _hideGeminiKey,
+                              decoration: InputDecoration(
+                                filled: true,
+                                fillColor: const Color(0xFF0E091D),
+                                border: const OutlineInputBorder(),
+                                labelText: "P1 · GEMINI_API_KEY (Gemini 2.5 Flash)",
+                                hintText: "AIzaSy...",
+                                suffixIcon: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      icon: Icon(
+                                        _hideGeminiKey
+                                            ? Icons.visibility
+                                            : Icons.visibility_off,
+                                        color: const Color(0xFFFFD600),
+                                      ),
+                                      onPressed: () => setState(
+                                          () => _hideGeminiKey = !_hideGeminiKey),
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(Icons.clear,
+                                          color: Colors.redAccent, size: 18),
+                                      onPressed: () =>
+                                          setState(() => _geminiKeyCtrl.clear()),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            TextField(
+                              controller: _groqKeyCtrl,
+                              obscureText: _hideGroqKey,
+                              decoration: InputDecoration(
+                                filled: true,
+                                fillColor: const Color(0xFF0E091D),
+                                border: const OutlineInputBorder(),
+                                labelText: "P2 · GROQ_API_KEY (Llama 3.3 70B Free)",
+                                hintText: "gsk_...",
+                                suffixIcon: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      icon: Icon(
+                                        _hideGroqKey
+                                            ? Icons.visibility
+                                            : Icons.visibility_off,
+                                        color: const Color(0xFFFFD600),
+                                      ),
+                                      onPressed: () => setState(
+                                          () => _hideGroqKey = !_hideGroqKey),
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(Icons.clear,
+                                          color: Colors.redAccent, size: 18),
+                                      onPressed: () =>
+                                          setState(() => _groqKeyCtrl.clear()),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      // 2. Visual & Video Auto-Failover Keys
                       Container(
                         padding: const EdgeInsets.all(14),
                         decoration: BoxDecoration(
@@ -7317,20 +7580,134 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             const Text(
-                              "🚀 Personal HuggingFace Spaces & Token",
+                              "🔑 2. Visual & Video Auto-Failover Vault",
                               style: TextStyle(
                                 color: Color(0xFF00E5FF),
-                                fontSize: 15,
+                                fontSize: 14,
                                 fontWeight: FontWeight.bold,
                               ),
                             ),
                             const SizedBox(height: 4),
                             const Text(
-                              "अपना खुद का डुप्लीकेट किया हुआ HuggingFace Space URL और HF_TOKEN डालें — बिना कोड बदले तुरंत लाइव चलेगा!",
+                              "Cloudflare Flux → Together FLUX → HuggingFace Spaces → Pollinations → 30fps Local Motion",
                               style: TextStyle(
                                   color: Colors.white60, fontSize: 11),
                             ),
                             const SizedBox(height: 12),
+                            TextField(
+                              controller: _cfAccountCtrl,
+                              decoration: InputDecoration(
+                                filled: true,
+                                fillColor: const Color(0xFF0E091D),
+                                border: const OutlineInputBorder(),
+                                labelText: "P1A · CF_ACCOUNT_ID (Cloudflare)",
+                                hintText: "32-char Account ID",
+                                suffixIcon: IconButton(
+                                  icon: const Icon(Icons.clear,
+                                      color: Colors.redAccent, size: 18),
+                                  onPressed: () =>
+                                      setState(() => _cfAccountCtrl.clear()),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            TextField(
+                              controller: _cfTokenCtrl,
+                              obscureText: _hideCfToken,
+                              decoration: InputDecoration(
+                                filled: true,
+                                fillColor: const Color(0xFF0E091D),
+                                border: const OutlineInputBorder(),
+                                labelText: "P1B · CF_API_TOKEN (Cloudflare Flux)",
+                                suffixIcon: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      icon: Icon(
+                                        _hideCfToken
+                                            ? Icons.visibility
+                                            : Icons.visibility_off,
+                                        color: const Color(0xFF00E5FF),
+                                      ),
+                                      onPressed: () => setState(
+                                          () => _hideCfToken = !_hideCfToken),
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(Icons.clear,
+                                          color: Colors.redAccent, size: 18),
+                                      onPressed: () =>
+                                          setState(() => _cfTokenCtrl.clear()),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            TextField(
+                              controller: _togetherKeyCtrl,
+                              obscureText: _hideTogetherKey,
+                              decoration: InputDecoration(
+                                filled: true,
+                                fillColor: const Color(0xFF0E091D),
+                                border: const OutlineInputBorder(),
+                                labelText: "P2 · TOGETHER_API_KEY (FLUX Free)",
+                                suffixIcon: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      icon: Icon(
+                                        _hideTogetherKey
+                                            ? Icons.visibility
+                                            : Icons.visibility_off,
+                                        color: const Color(0xFF00E5FF),
+                                      ),
+                                      onPressed: () => setState(() =>
+                                          _hideTogetherKey = !_hideTogetherKey),
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(Icons.clear,
+                                          color: Colors.redAccent, size: 18),
+                                      onPressed: () => setState(
+                                          () => _togetherKeyCtrl.clear()),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            TextField(
+                              controller: _hfTokenCtrl,
+                              obscureText: _hideHfToken,
+                              decoration: InputDecoration(
+                                filled: true,
+                                fillColor: const Color(0xFF0E091D),
+                                border: const OutlineInputBorder(),
+                                labelText: "P3 · HF_TOKEN (HuggingFace)",
+                                hintText: "hf_xxxxxxxxxxxxxxxx",
+                                suffixIcon: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      icon: Icon(
+                                        _hideHfToken
+                                            ? Icons.visibility
+                                            : Icons.visibility_off,
+                                        color: const Color(0xFFFFD600),
+                                      ),
+                                      onPressed: () => setState(
+                                          () => _hideHfToken = !_hideHfToken),
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(Icons.clear,
+                                          color: Colors.redAccent, size: 18),
+                                      onPressed: () =>
+                                          setState(() => _hfTokenCtrl.clear()),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
                             TextField(
                               controller: _customVideoSpaceCtrl,
                               decoration: const InputDecoration(
@@ -7352,26 +7729,81 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
                                 hintText: "akashtyagi534/my-faceswap-space",
                               ),
                             ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      // 3. App Business Controls
+                      Container(
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1B1236),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
+                            color: const Color(0xFFFF007F).withOpacity(0.45),
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              "📢 3. App Business Controls & Live Banner",
+                              style: TextStyle(
+                                color: Color(0xFFFF007F),
+                                fontSize: 14,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: TextField(
+                                    controller: _freeTrialCtrl,
+                                    keyboardType: TextInputType.number,
+                                    decoration: const InputDecoration(
+                                      filled: true,
+                                      fillColor: Color(0xFF0E091D),
+                                      border: OutlineInputBorder(),
+                                      labelText: "Free Trial Passes",
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: TextField(
+                                    controller: _pack50Ctrl,
+                                    keyboardType: TextInputType.number,
+                                    decoration: const InputDecoration(
+                                      filled: true,
+                                      fillColor: Color(0xFF0E091D),
+                                      border: OutlineInputBorder(),
+                                      labelText: "₹50 Pack Passes",
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
                             const SizedBox(height: 10),
                             TextField(
-                              controller: _hfTokenCtrl,
-                              obscureText: _hideHfToken,
-                              decoration: InputDecoration(
+                              controller: _upiCtrl,
+                              decoration: const InputDecoration(
                                 filled: true,
-                                fillColor: const Color(0xFF0E091D),
-                                border: const OutlineInputBorder(),
-                                labelText: "Personal HF_TOKEN (hf_...)",
-                                hintText: "hf_xxxxxxxxxxxxxxxx",
-                                suffixIcon: IconButton(
-                                  icon: Icon(
-                                    _hideHfToken
-                                        ? Icons.visibility
-                                        : Icons.visibility_off,
-                                    color: const Color(0xFFFFD600),
-                                  ),
-                                  onPressed: () => setState(
-                                      () => _hideHfToken = !_hideHfToken),
-                                ),
+                                fillColor: Color(0xFF0E091D),
+                                border: OutlineInputBorder(),
+                                labelText: "UPI ID",
+                                hintText: "8269045143@ybl",
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            TextField(
+                              controller: _announcementCtrl,
+                              decoration: const InputDecoration(
+                                filled: true,
+                                fillColor: Color(0xFF0E091D),
+                                border: OutlineInputBorder(),
+                                labelText: "Home Screen Announcement Banner",
+                                hintText: "🎉 ₹50 में 5 HD Dangal TV मूवी पास!",
                               ),
                             ),
                           ],

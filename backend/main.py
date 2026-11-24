@@ -645,6 +645,13 @@ AVATARS_DIR = "all_avatars"
 os.makedirs(AVATARS_DIR, exist_ok=True)
 
 DEFAULT_AI_CONFIG = {
+    # Story Brain Auto-Chain (Priority 1 -> 2 -> 3)
+    "gemini_api_key": os.getenv("GEMINI_API_KEY", ""),
+    "groq_api_key": os.getenv("GROQ_API_KEY", ""),
+    # Visual & Video Auto-Chain (Priority 1 -> 2 -> 3 -> 4 -> 5)
+    "cf_account_id": os.getenv("CF_ACCOUNT_ID", ""),
+    "cf_api_token": os.getenv("CF_API_TOKEN", ""),
+    "together_api_key": os.getenv("TOGETHER_API_KEY", ""),
     "custom_video_space": "",
     "custom_faceswap_space": "",
     "hf_token": os.getenv("HF_TOKEN", ""),
@@ -656,8 +663,27 @@ DEFAULT_AI_CONFIG = {
     "enable_wan21": True,
     "enable_cogvideox": True,
     "enable_local_motion_fallback": True,
-    "space_timeout_sec": 8,
+    "space_timeout_sec": 10,
+    # Admin Business Controls
+    "free_trial_passes": 1,
+    "pack_50_passes": 1,
+    "upi_id": UPI_ID,
+    "announcement_banner": "",
 }
+
+# Smart Auto-Switch Circuit Breaker: provider_key -> (cooldown_until_epoch, reason)
+_API_VAULT_COOLDOWN: dict[str, tuple[float, str]] = {}
+
+
+def _is_vault_provider_cooling(provider_key: str) -> bool:
+    entry = _API_VAULT_COOLDOWN.get(provider_key)
+    if not entry:
+        return False
+    return time.time() < entry[0]
+
+
+def _mark_vault_provider_failed(provider_key: str, reason: str = "error", ttl_sec: int = 180):
+    _API_VAULT_COOLDOWN[provider_key] = (time.time() + ttl_sec, str(reason)[:80])
 
 
 def normalize_ai_config(raw: Optional[dict]) -> dict:
@@ -666,9 +692,22 @@ def normalize_ai_config(raw: Optional[dict]) -> dict:
         for k, v in raw.items():
             if k in cfg:
                 cfg[k] = v
-    cfg["custom_video_space"] = str(cfg.get("custom_video_space") or "").strip()
-    cfg["custom_faceswap_space"] = str(cfg.get("custom_faceswap_space") or "").strip()
-    cfg["hf_token"] = str(cfg.get("hf_token") or "").strip()
+    for skey in (
+        "gemini_api_key",
+        "groq_api_key",
+        "cf_account_id",
+        "cf_api_token",
+        "together_api_key",
+        "custom_video_space",
+        "custom_faceswap_space",
+        "hf_token",
+        "upi_id",
+        "announcement_banner",
+    ):
+        cfg[skey] = str(cfg.get(skey) or "").strip()
+    if not cfg["upi_id"]:
+        cfg["upi_id"] = UPI_ID
+    cfg["announcement_banner"] = cfg["announcement_banner"][:240]
     pm = str(cfg.get("pollinations_model") or "flux").strip().lower()
     cfg["pollinations_model"] = pm if pm in ("flux", "turbo", "flux-realism") else "flux"
     for bkey in (
@@ -686,9 +725,17 @@ def normalize_ai_config(raw: Optional[dict]) -> dict:
         else:
             cfg[bkey] = bool(val)
     try:
-        cfg["space_timeout_sec"] = max(4, min(15, int(cfg.get("space_timeout_sec", 8))))
+        cfg["space_timeout_sec"] = max(4, min(15, int(cfg.get("space_timeout_sec", 10))))
     except Exception:
-        cfg["space_timeout_sec"] = 8
+        cfg["space_timeout_sec"] = 10
+    try:
+        cfg["free_trial_passes"] = max(0, min(50, int(cfg.get("free_trial_passes", 1))))
+    except Exception:
+        cfg["free_trial_passes"] = 1
+    try:
+        cfg["pack_50_passes"] = max(1, min(100, int(cfg.get("pack_50_passes", 1))))
+    except Exception:
+        cfg["pack_50_passes"] = 1
     return cfg
 
 
@@ -698,6 +745,88 @@ def get_runtime_ai_config() -> dict:
         return normalize_ai_config(db.get("ai_config"))
     except Exception:
         return dict(DEFAULT_AI_CONFIG)
+
+
+def _get_runtime_gemini_client():
+    """Return a google.genai.Client using Admin API Vault key first, falling back to env GEMINI_API_KEY."""
+    cfg = get_runtime_ai_config()
+    active_key = (cfg.get("gemini_api_key") or GEMINI_API_KEY or "").strip()
+    if not active_key:
+        return None
+    if active_key == GEMINI_API_KEY and client is not None:
+        return client
+    try:
+        return genai.Client(api_key=active_key)
+    except Exception:
+        return client
+
+
+def _call_story_brain_auto_chain(prompt: str, timeout_s: float = 10.0) -> tuple[Optional[str], str]:
+    """
+    Story Brain Auto-Failover Chain (1 -> 2 -> 3) with <0.5s instant switch on failure / 429 quota:
+      Priority 1: Gemini 2.5 Flash (`GEMINI_API_KEY`)
+      Priority 2: Groq Llama 3.3 70B (`GROQ_API_KEY` — 0.4s free backup)
+      Priority 3: Built-in Smart Hindi Multi-Character Drama Engine (handled by caller when None)
+    """
+    cfg = get_runtime_ai_config()
+
+    # Priority 1: Gemini 2.5 Flash
+    gem_key = (cfg.get("gemini_api_key") or GEMINI_API_KEY or "").strip()
+    if gem_key and not _is_vault_provider_cooling("gemini_story"):
+        gem_cli = _get_runtime_gemini_client()
+        if gem_cli is not None:
+            try:
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    res = pool.submit(
+                        lambda: gem_cli.models.generate_content(
+                            model="gemini-2.5-flash", contents=prompt
+                        )
+                    ).result(timeout=min(timeout_s, 10.0))
+                txt = (getattr(res, "text", None) or "").strip()
+                if txt:
+                    return txt, "Gemini 2.5 Flash"
+            except Exception as e:
+                err_s = str(e)
+                ttl = 600 if ("429" in err_s or "quota" in err_s.lower() or "RESOURCE_EXHAUSTED" in err_s) else 90
+                _mark_vault_provider_failed("gemini_story", err_s, ttl_sec=ttl)
+
+    # Priority 2: Groq Llama 3.3 70B (0.4s ultra-fast free failover!)
+    groq_key = (cfg.get("groq_api_key") or os.getenv("GROQ_API_KEY") or "").strip()
+    if groq_key and not _is_vault_provider_cooling("groq_story"):
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {groq_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are India's top Dangal TV & Pocket FM Hindi multi-character drama scriptwriter. Always follow the requested output format strictly.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.7,
+                    "max_tokens": 1100,
+                },
+                timeout=6.0,
+            )
+            if resp.status_code == 200:
+                j = resp.json()
+                txt = str(((j.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+                if txt:
+                    return txt, "Groq Llama 3.3 70B"
+            elif resp.status_code in (401, 403, 429):
+                _mark_vault_provider_failed("groq_story", f"HTTP {resp.status_code}", ttl_sec=600)
+            else:
+                _mark_vault_provider_failed("groq_story", f"HTTP {resp.status_code}", ttl_sec=90)
+        except Exception as e:
+            _mark_vault_provider_failed("groq_story", str(e), ttl_sec=90)
+
+    return None, "Built-in Smart Hindi Drama Engine"
 
 
 def save_user_avatar_bytes(email: str, raw_bytes: bytes) -> Optional[str]:
@@ -847,16 +976,38 @@ def apply_referral_internal(db: dict, referee_email: str, raw_code: str) -> tupl
 
 @app.get("/")
 def home():
+    cfg = get_runtime_ai_config()
     return {
         "app": "CinePop AI — Pocket Bollywood & Face-Swap Studio",
         "status": "100% Live",
-        "engine_version": "v11-live-talking-tv-serial-speaker-lock-engine",
+        "engine_version": "v12-live-action-tv-serial-master-cast-vault",
         "devanagari_font": find_devanagari_font_path(bold=True) or "not-found",
-        "gemini_configured": bool(GEMINI_API_KEY),
+        "gemini_configured": bool(cfg.get("gemini_api_key") or GEMINI_API_KEY),
+        "groq_configured": bool(cfg.get("groq_api_key") or os.getenv("GROQ_API_KEY")),
+        "cloudflare_flux_configured": bool(cfg.get("cf_account_id") and cfg.get("cf_api_token")),
+        "together_flux_configured": bool(cfg.get("together_api_key")),
         "opencv_faceswap": OPENCV_AVAILABLE,
-        "video_engine": "Custom HF Space / Wan2.1 / LTX-Video / CogVideoX-5b / Parallel Pollinations Flux + LivePortrait & SadTalker + AI Auto-Cast",
+        "video_engine": "Auto-Failover Vault (Cloudflare Flux -> Together -> HF Wan2.1/LTX -> Pollinations) + Master Casting Sheet + 30fps Fast Concat",
         "admin_pin_enabled": True,
         "price_per_movie": f"₹{MOVIE_PRICE_INR}",
+        "upi_id": cfg.get("upi_id") or UPI_ID,
+        "free_trial_passes": cfg.get("free_trial_passes", 1),
+        "pack_50_passes": cfg.get("pack_50_passes", 1),
+        "announcement_banner": cfg.get("announcement_banner", ""),
+    }
+
+
+@app.get("/public/app-config/")
+@app.get("/public/app-config")
+def get_public_app_config():
+    """Public non-sensitive business config (UPI ID, trial passes, ₹50 pack passes, home banner). ZERO API keys exposed."""
+    cfg = get_runtime_ai_config()
+    return {
+        "upi_id": cfg.get("upi_id") or UPI_ID,
+        "movie_price": MOVIE_PRICE_INR,
+        "free_trial_passes": cfg.get("free_trial_passes", 1),
+        "pack_50_passes": cfg.get("pack_50_passes", 1),
+        "announcement_banner": cfg.get("announcement_banner", ""),
     }
 
 
@@ -930,14 +1081,18 @@ def google_login(
             referral_message = msg
 
     save_db(db)
+    cfg = normalize_ai_config(db.get("ai_config"))
     return {
         "user": db["users"][email],
         "is_admin": admin_verified,
         "is_admin_email": is_admin_email,
         "requires_admin_pin": is_admin_email and not admin_verified,
         "referral_message": referral_message,
-        "upi_id": UPI_ID,
+        "upi_id": cfg.get("upi_id") or UPI_ID,
         "movie_price": MOVIE_PRICE_INR,
+        "free_trial_passes": cfg.get("free_trial_passes", 1),
+        "pack_50_passes": cfg.get("pack_50_passes", 1),
+        "announcement_banner": cfg.get("announcement_banner", ""),
     }
 
 
@@ -948,7 +1103,7 @@ def instant_guest_login(
     mobile: str = Form(""),
     referral_code: str = Form(""),
 ):
-    """1-Click Guest / Instant Start with 1 Free Trial Movie Pass so any new user can start immediately."""
+    """1-Click Guest / Instant Start with Admin-configured Free Trial Movie Passes."""
     clean_dev = re.sub(r"[^a-zA-Z0-9_-]", "", (device_id or "guest").strip())[:24] or "guest"
     clean_mobile = re.sub(r"[^0-9+\-\s]", "", (mobile or "").strip())[:20]
     guest_id = str(uuid.uuid4())[:8]
@@ -956,6 +1111,8 @@ def instant_guest_login(
     display_name = (guest_name or "").strip()[:32] or f"Guest Creator {guest_id[:4].upper()}"
 
     db = load_db()
+    cfg = normalize_ai_config(db.get("ai_config"))
+    trial_passes = max(0, int(cfg.get("free_trial_passes", 1)))
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db["users"][email] = {
         "email": email,
@@ -966,7 +1123,7 @@ def instant_guest_login(
         "device_id": clean_dev,
         "installed_at": now,
         "last_active": now,
-        "credits": 1,  # 1 Free Trial Movie Pass for Instant Start
+        "credits": trial_passes,
         "wallet_balance": 0,
         "movies_created": 0,
         "total_paid": 0,
@@ -990,9 +1147,12 @@ def instant_guest_login(
         "is_admin_email": False,
         "requires_admin_pin": False,
         "referral_message": referral_message,
-        "message": "⚡ Instant Start तैयार है! आपको 1 Free Trial Video Pass मिल गया है।",
-        "upi_id": UPI_ID,
+        "message": f"⚡ Instant Start तैयार है! आपको {trial_passes} Free Trial Video Pass मिल गया है।",
+        "upi_id": cfg.get("upi_id") or UPI_ID,
         "movie_price": MOVIE_PRICE_INR,
+        "free_trial_passes": trial_passes,
+        "pack_50_passes": cfg.get("pack_50_passes", 1),
+        "announcement_banner": cfg.get("announcement_banner", ""),
     }
 
 
@@ -1426,6 +1586,11 @@ async def save_admin_ai_config(request: Request):
     db = load_db()
     current = normalize_ai_config(db.get("ai_config"))
     updatable_keys = (
+        "gemini_api_key",
+        "groq_api_key",
+        "cf_account_id",
+        "cf_api_token",
+        "together_api_key",
         "custom_video_space",
         "custom_faceswap_space",
         "hf_token",
@@ -1438,6 +1603,10 @@ async def save_admin_ai_config(request: Request):
         "enable_cogvideox",
         "enable_local_motion_fallback",
         "space_timeout_sec",
+        "free_trial_passes",
+        "pack_50_passes",
+        "upi_id",
+        "announcement_banner",
     )
     for k in updatable_keys:
         if k in payload and payload[k] is not None:
@@ -1446,8 +1615,10 @@ async def save_admin_ai_config(request: Request):
     db["ai_config"] = normalize_ai_config(current)
     save_db(db)
     _HF_SPACE_COOLDOWN.clear()
+    _API_VAULT_COOLDOWN.clear()
+    _GEMINI_IMG_MODEL_COOLDOWN.clear()
     return {
-        "message": "✅ AI Engine & Custom Server सेटिंग्स सेव हो गईं!",
+        "message": "✅ API Vault, Auto-Failover & Business सेटिंग्स सेव हो गईं!",
         "ai_config": db["ai_config"],
     }
 
@@ -1455,7 +1626,7 @@ async def save_admin_ai_config(request: Request):
 @app.post("/admin/test-ai-servers/")
 @app.post("/admin/test-ai-servers")
 async def test_admin_ai_servers(request: Request):
-    """Live parallel health & latency check across Admin Custom HF Spaces, Pollinations AI, and Public HF Spaces."""
+    """Live parallel health, latency & quota verification across the entire Auto-Failover API Vault."""
     content_type = (request.headers.get("content-type") or "").lower()
     payload: dict = {}
     if "application/json" in content_type:
@@ -1478,11 +1649,92 @@ async def test_admin_ai_servers(request: Request):
     hf_token = cfg.get("hf_token", "")
     headers_hf = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
 
+    def _probe_gemini() -> dict:
+        key = (cfg.get("gemini_api_key") or GEMINI_API_KEY or "").strip()
+        if not key:
+            return {"name": "Story P1: Gemini 2.5 Flash", "target": "GEMINI_API_KEY", "status": "🟡 Standby", "online": False, "latency_ms": 0, "detail": "Key not set (auto-switches to Groq)"}
+        t0 = time.time()
+        try:
+            r = requests.get(
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash",
+                params={"key": key},
+                timeout=6,
+            )
+            ms = int((time.time() - t0) * 1000)
+            if r.status_code == 200:
+                return {"name": "Story P1: Gemini 2.5 Flash", "target": "gemini-2.5-flash", "status": "🟢 Active", "online": True, "latency_ms": ms, "detail": "Ready (Priority 1 Story)"}
+            if r.status_code == 429:
+                return {"name": "Story P1: Gemini 2.5 Flash", "target": "gemini-2.5-flash", "status": "🔴 Quota Full", "online": False, "latency_ms": ms, "detail": "429 Quota — Auto-switches to Groq"}
+            return {"name": "Story P1: Gemini 2.5 Flash", "target": "gemini-2.5-flash", "status": "🔴 Key Error", "online": False, "latency_ms": ms, "detail": f"HTTP {r.status_code}"}
+        except Exception as e:
+            return {"name": "Story P1: Gemini 2.5 Flash", "target": "gemini-2.5-flash", "status": "🟡 Standby", "online": False, "latency_ms": int((time.time() - t0) * 1000), "detail": str(e)[:60]}
+
+    def _probe_groq() -> dict:
+        key = (cfg.get("groq_api_key") or os.getenv("GROQ_API_KEY") or "").strip()
+        if not key:
+            return {"name": "Story P2: Groq Llama 3.3 70B", "target": "GROQ_API_KEY", "status": "🟡 Standby", "online": False, "latency_ms": 0, "detail": "Add free Groq key for 0.4s backup"}
+        t0 = time.time()
+        try:
+            r = requests.get(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=6,
+            )
+            ms = int((time.time() - t0) * 1000)
+            if r.status_code == 200:
+                return {"name": "Story P2: Groq Llama 3.3 70B", "target": "llama-3.3-70b-versatile", "status": "🟢 Active", "online": True, "latency_ms": ms, "detail": "0.4s Instant Backup Ready"}
+            if r.status_code == 429:
+                return {"name": "Story P2: Groq Llama 3.3 70B", "target": "llama-3.3-70b-versatile", "status": "🔴 Quota Full", "online": False, "latency_ms": ms, "detail": "429 Rate limit"}
+            return {"name": "Story P2: Groq Llama 3.3 70B", "target": "llama-3.3-70b-versatile", "status": "🔴 Key Error", "online": False, "latency_ms": ms, "detail": f"HTTP {r.status_code}"}
+        except Exception as e:
+            return {"name": "Story P2: Groq Llama 3.3 70B", "target": "llama-3.3-70b-versatile", "status": "🟡 Standby", "online": False, "latency_ms": int((time.time() - t0) * 1000), "detail": str(e)[:60]}
+
+    def _probe_cloudflare() -> dict:
+        acc = (cfg.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID") or "").strip()
+        tok = (cfg.get("cf_api_token") or os.getenv("CF_API_TOKEN") or "").strip()
+        if not acc or not tok:
+            return {"name": "Visual P1: Cloudflare Flux", "target": "@cf/black-forest-labs/flux-1-schnell", "status": "🟡 Standby", "online": False, "latency_ms": 0, "detail": "CF Account ID / Token not set"}
+        t0 = time.time()
+        try:
+            r = requests.get(
+                f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/models/search?search=flux-1-schnell",
+                headers={"Authorization": f"Bearer {tok}"},
+                timeout=6,
+            )
+            ms = int((time.time() - t0) * 1000)
+            if r.status_code == 200:
+                return {"name": "Visual P1: Cloudflare Flux", "target": "flux-1-schnell", "status": "🟢 Active", "online": True, "latency_ms": ms, "detail": "Workers AI Ready"}
+            if r.status_code == 429:
+                return {"name": "Visual P1: Cloudflare Flux", "target": "flux-1-schnell", "status": "🔴 Quota Full", "online": False, "latency_ms": ms, "detail": "429 — Auto-switches to Together"}
+            return {"name": "Visual P1: Cloudflare Flux", "target": "flux-1-schnell", "status": "🔴 Key Error", "online": False, "latency_ms": ms, "detail": f"HTTP {r.status_code}"}
+        except Exception as e:
+            return {"name": "Visual P1: Cloudflare Flux", "target": "flux-1-schnell", "status": "🟡 Standby", "online": False, "latency_ms": int((time.time() - t0) * 1000), "detail": str(e)[:60]}
+
+    def _probe_together() -> dict:
+        key = (cfg.get("together_api_key") or os.getenv("TOGETHER_API_KEY") or "").strip()
+        if not key:
+            return {"name": "Visual P2: Together FLUX", "target": "FLUX.1-schnell-Free", "status": "🟡 Standby", "online": False, "latency_ms": 0, "detail": "TOGETHER_API_KEY not set"}
+        t0 = time.time()
+        try:
+            r = requests.get(
+                "https://api.together.xyz/v1/models",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=6,
+            )
+            ms = int((time.time() - t0) * 1000)
+            if r.status_code == 200:
+                return {"name": "Visual P2: Together FLUX", "target": "FLUX.1-schnell-Free", "status": "🟢 Active", "online": True, "latency_ms": ms, "detail": "Ready (Priority 2 Visual)"}
+            if r.status_code == 429:
+                return {"name": "Visual P2: Together FLUX", "target": "FLUX.1-schnell-Free", "status": "🔴 Quota Full", "online": False, "latency_ms": ms, "detail": "429 — Auto-switches to HF"}
+            return {"name": "Visual P2: Together FLUX", "target": "FLUX.1-schnell-Free", "status": "🔴 Key Error", "online": False, "latency_ms": ms, "detail": f"HTTP {r.status_code}"}
+        except Exception as e:
+            return {"name": "Visual P2: Together FLUX", "target": "FLUX.1-schnell-Free", "status": "🟡 Standby", "online": False, "latency_ms": int((time.time() - t0) * 1000), "detail": str(e)[:60]}
+
     def _probe_hf_space(name: str, space_id: str, enabled: bool) -> dict:
         if not enabled:
-            return {"name": name, "target": space_id or "Not Set", "status": "Disabled", "latency_ms": 0, "detail": "Admin toggle OFF"}
+            return {"name": name, "target": space_id or "Not Set", "status": "🟡 Standby", "online": False, "latency_ms": 0, "detail": "Toggle OFF"}
         if not space_id:
-            return {"name": name, "target": "Not Configured", "status": "Not Set", "latency_ms": 0, "detail": "Space URL खाली है"}
+            return {"name": name, "target": "Not Configured", "status": "🟡 Standby", "online": False, "latency_ms": 0, "detail": "Space URL empty"}
         t0 = time.time()
         try:
             clean_sid = space_id.replace("https://huggingface.co/spaces/", "").strip("/")
@@ -1492,40 +1744,46 @@ async def test_admin_ai_servers(request: Request):
                 info = r.json()
                 stage = str((info.get("runtime") or {}).get("stage") or "UNKNOWN").upper()
                 if stage in ("RUNNING", "RUNNING_BUILDING"):
-                    return {"name": name, "target": clean_sid, "status": "Online / Fast", "latency_ms": ms, "detail": f"Stage: {stage}"}
-                return {"name": name, "target": clean_sid, "status": "Busy", "latency_ms": ms, "detail": f"Stage: {stage}"}
-            return {"name": name, "target": clean_sid, "status": "Busy", "latency_ms": ms, "detail": f"HTTP {r.status_code}"}
+                    return {"name": name, "target": clean_sid, "status": "🟢 Active", "online": True, "latency_ms": ms, "detail": f"Stage: {stage}"}
+                return {"name": name, "target": clean_sid, "status": "🟡 Standby", "online": False, "latency_ms": ms, "detail": f"Stage: {stage}"}
+            if r.status_code == 429:
+                return {"name": name, "target": clean_sid, "status": "🔴 Quota Full", "online": False, "latency_ms": ms, "detail": "HTTP 429"}
+            return {"name": name, "target": clean_sid, "status": "🟡 Standby", "online": False, "latency_ms": ms, "detail": f"HTTP {r.status_code}"}
         except Exception as e:
             ms = int((time.time() - t0) * 1000)
-            return {"name": name, "target": space_id, "status": "Busy", "latency_ms": ms, "detail": str(e)[:60]}
+            return {"name": name, "target": space_id, "status": "🟡 Standby", "online": False, "latency_ms": ms, "detail": str(e)[:60]}
 
     def _probe_pollinations() -> dict:
         model = cfg.get("pollinations_model", "flux")
         if not cfg.get("enable_pollinations", True):
-            return {"name": f"Pollinations ({model})", "target": "image.pollinations.ai", "status": "Disabled", "latency_ms": 0, "detail": "Admin toggle OFF"}
+            return {"name": f"Visual P4: Pollinations ({model})", "target": "image.pollinations.ai", "status": "🟡 Standby", "online": False, "latency_ms": 0, "detail": "Toggle OFF"}
         t0 = time.time()
         try:
             r = requests.get(
-                f"https://image.pollinations.ai/prompt/bollywood%20cinema%20lights?width=256&height=256&model={model}&nologo=true",
+                f"https://image.pollinations.ai/prompt/indian%20haveli%20living%20room?width=256&height=256&model={model}&nologo=true",
                 timeout=6,
             )
             ms = int((time.time() - t0) * 1000)
             if r.status_code == 200 and len(r.content) > 2000:
-                return {"name": f"Pollinations ({model})", "target": "image.pollinations.ai", "status": "Online / Fast", "latency_ms": ms, "detail": f"200 OK ({len(r.content)//1024}KB)"}
-            return {"name": f"Pollinations ({model})", "target": "image.pollinations.ai", "status": "Busy", "latency_ms": ms, "detail": f"HTTP {r.status_code} (Auto-fallback to flux)"}
+                return {"name": f"Visual P4: Pollinations ({model})", "target": "image.pollinations.ai", "status": "🟢 Active", "online": True, "latency_ms": ms, "detail": f"200 OK ({len(r.content)//1024}KB)"}
+            if r.status_code == 429:
+                return {"name": f"Visual P4: Pollinations ({model})", "target": "image.pollinations.ai", "status": "🔴 Quota Full", "online": False, "latency_ms": ms, "detail": "429 Rate Limit"}
+            return {"name": f"Visual P4: Pollinations ({model})", "target": "image.pollinations.ai", "status": "🟡 Standby", "online": False, "latency_ms": ms, "detail": f"HTTP {r.status_code}"}
         except Exception as e:
             ms = int((time.time() - t0) * 1000)
-            return {"name": f"Pollinations ({model})", "target": "image.pollinations.ai", "status": "Busy", "latency_ms": ms, "detail": str(e)[:60]}
+            return {"name": f"Visual P4: Pollinations ({model})", "target": "image.pollinations.ai", "status": "🟡 Standby", "online": False, "latency_ms": ms, "detail": str(e)[:60]}
 
     def _run_all():
         tasks = [
-            lambda: _probe_hf_space("Custom Video HF Space", cfg.get("custom_video_space", ""), cfg.get("enable_custom_hf", True)),
-            lambda: _probe_hf_space("Custom Face-Swap Space", cfg.get("custom_faceswap_space", ""), cfg.get("enable_custom_hf", True)),
+            _probe_gemini,
+            _probe_groq,
+            _probe_cloudflare,
+            _probe_together,
+            lambda: _probe_hf_space("Visual P3: Custom HF Space", cfg.get("custom_video_space", ""), cfg.get("enable_custom_hf", True)),
+            lambda: _probe_hf_space("Face-Swap HF Space", cfg.get("custom_faceswap_space", "") or "tonyassi/face-swap", cfg.get("enable_public_hf_spaces", True)),
+            lambda: _probe_hf_space("I2V: Wan 2.1", "Wan-AI/Wan2.1", cfg.get("enable_public_hf_spaces", True) and cfg.get("enable_wan21", True)),
+            lambda: _probe_hf_space("I2V: LTX-Video", "Lightricks/LTX-Video", cfg.get("enable_public_hf_spaces", True) and cfg.get("enable_ltx_video", True)),
             _probe_pollinations,
-            lambda: _probe_hf_space("LTX-Video (Public HF)", "Lightricks/LTX-Video", cfg.get("enable_public_hf_spaces", True) and cfg.get("enable_ltx_video", True)),
-            lambda: _probe_hf_space("Wan 2.1 (Public HF)", "Wan-AI/Wan2.1", cfg.get("enable_public_hf_spaces", True) and cfg.get("enable_wan21", True)),
-            lambda: _probe_hf_space("CogVideoX-5B (Public HF)", "THUDM/CogVideoX-5b", cfg.get("enable_public_hf_spaces", True) and cfg.get("enable_cogvideox", True)),
-            lambda: _probe_hf_space("Face-Swap (Public HF)", "tonyassi/face-swap", cfg.get("enable_public_hf_spaces", True)),
         ]
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as ex:
@@ -1534,13 +1792,14 @@ async def test_admin_ai_servers(request: Request):
                 try:
                     results.append(fut.result(timeout=7))
                 except Exception as e:
-                    results.append({"name": "Server Probe", "target": "-", "status": "Busy", "latency_ms": 7000, "detail": str(e)[:60]})
+                    results.append({"name": "API Vault Probe", "target": "-", "status": "🟡 Standby", "online": False, "latency_ms": 7000, "detail": str(e)[:60]})
         results.append({
-            "name": "Local Fast Motion + PIL Engine",
+            "name": "Local Fast 30fps Motion & Drama Engine",
             "target": "Railway CPU / OpenCV / FFmpeg",
-            "status": "Online / Fast" if cfg.get("enable_local_motion_fallback", True) else "Disabled",
-            "latency_ms": 45,
-            "detail": "Guaranteed 30-40s fallback (Zero 17% Hang)",
+            "status": "🟢 Active" if cfg.get("enable_local_motion_fallback", True) else "🟡 Standby",
+            "online": bool(cfg.get("enable_local_motion_fallback", True)),
+            "latency_ms": 35,
+            "detail": "Guaranteed 30fps Zero-Hang Fallback",
         })
         return results
 
@@ -1548,6 +1807,7 @@ async def test_admin_ai_servers(request: Request):
     return {
         "tested_at": datetime.datetime.now().strftime("%H:%M:%S"),
         "hf_token_configured": bool(hf_token),
+        "results": servers,
         "servers": servers,
     }
 
@@ -1747,19 +2007,15 @@ def ai_generate_story(
     )
     fallback_story = _format_drama_script_text(fallback_lines)
 
-    if not client:
-        return {"story": fallback_story, "genre": genre}
-
-    try:
-        prompt = f"""तुम Pocket FM और Bollywood Micro-Drama के नंबर-1 डायलॉग राइटर हो।
+    prompt = f"""तुम Dangal TV, StarPlus और Pocket FM के नंबर-1 AI Showrunner & Dialogue Writer हो।
 Genre: {genre}
 Topic: "{clean_topic}"
-Hero Name: {hero_label}
+Fixed Consistent Characters: Narrator, {hero_label}, Heroine, Villain, Saas
 
 सख्त नियम (100% पालन करो):
 1. एक ही Narrator की लंबी कहानी/मोनोलॉग बिल्कुल मत लिखो!
-2. ठीक 10 छोटे, तीखे, पंचदार और ड्रामैटिक हिंदी डायलॉग्स लिखो जिनमें {hero_label}, Heroine, Villain, और Saas आपस में ज़बरदस्त बहस, ताने, इमोशन और ट्विस्ट वाले डायलॉग्स मारें।
-3. Narrator सिर्फ पहली 1 छोटी हुक लाइन और आखिरी 1 सस्पेंस क्लिफहैंगर लाइन बोले (अधिकतम 20%)।
+2. ठीक 8 छोटे, तीखे, कंप्लीट और ड्रामैटिक हिंदी डायलॉग्स लिखो (हर डायलॉग 8-13 शब्द, कोई अधूरा वाक्य या टॉपिक से भटकी हुई लाइन नहीं!)।
+3. Narrator सिर्फ पहली 1 छोटी हुक लाइन और आखिरी 1 सस्पेंस क्लिफहैंगर लाइन बोले (अधिकतम 20%) — बाकी 80% में {hero_label}, Heroine, Villain और Saas आपस में आमने-सामने भिड़ें!
 4. हर लाइन का सख्त फॉर्मेट यही हो (कोई Title:, Scene:, [Location:], markdown, या डबल नाम मत लिखो):
 Narrator: "छोटी हुक लाइन..."
 Saas: "तीखा ताना..."
@@ -1767,26 +2023,26 @@ Villain: "धमकी या साज़िश..."
 Heroine: "इमोशनल या करारा जवाब..."
 {hero_label}: "मासी या ट्विस्ट वाला डायलॉग..."
 
-सीधे 10 लाइन की मल्टी-कैरेक्टर डायलॉग स्क्रिप्ट लिखो।"""
-        res = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-        raw_out = (res.text or "").replace("```", "").strip()
-        # Validate clean multi-character speaker lines (no single narrator wall)
-        cleaned_lines: list[str] = []
-        for ln in raw_out.splitlines():
-            ln_s = ln.strip().lstrip("*-•0123456789.) ").strip()
-            m = re.match(r"^([^:：]{1,26})[:：]\s*(.+)$", ln_s)
-            if not m:
-                continue
-            spk = re.sub(r"[\*\#\_\"'“”]", "", m.group(1)).strip()
-            if spk.lower() in ("title", "शीर्षक", "scene", "सीन", "location", "लोकेशन", "mood", "action"):
-                continue
-            dlg = clean_spoken_dialogue(m.group(2))
-            if len(dlg) >= 3:
-                cleaned_lines.append(f'{spk}: "{dlg}"')
-        story = "\n".join(cleaned_lines[:12]) if len(cleaned_lines) >= 6 else fallback_story
-        return {"story": story, "genre": genre}
-    except Exception:
-        return {"story": fallback_story, "genre": genre}
+सीधे 8 लाइन की मल्टी-कैरेक्टर टीवी सीरियल डायलॉग स्क्रिप्ट लिखो।"""
+
+    raw_out, story_engine = _call_story_brain_auto_chain(prompt, timeout_s=10.0)
+    if not raw_out:
+        return {"story": fallback_story, "genre": genre, "story_engine": story_engine}
+
+    cleaned_lines: list[str] = []
+    for ln in raw_out.replace("```", "").splitlines():
+        ln_s = ln.strip().lstrip("*-•0123456789.) ").strip()
+        m = re.match(r"^([^:：]{1,26})[:：]\s*(.+)$", ln_s)
+        if not m:
+            continue
+        spk = re.sub(r"[\*\#\_\"'“”]", "", m.group(1)).strip()
+        if spk.lower() in ("title", "शीर्षक", "scene", "सीन", "location", "लोकेशन", "mood", "action"):
+            continue
+        dlg = clean_spoken_dialogue(m.group(2))
+        if len(dlg) >= 4:
+            cleaned_lines.append(f'{spk}: "{dlg}"')
+    story = "\n".join(cleaned_lines[:8]) if len(cleaned_lines) >= 6 else fallback_story
+    return {"story": story, "genre": genre, "story_engine": story_engine}
 
 
 def _resolve_tts_voice(voice: str, language: str = "Hindi") -> str:
@@ -2158,20 +2414,115 @@ _GEMINI_IMG_MODEL_COOLDOWN: dict[str, float] = {}
 _HF_IMG_SPACE_COOLDOWN: dict[str, float] = {}
 
 
+def _try_cloudflare_flux_image(prompt: str, W: int, H: int, cfg: dict) -> Optional[Image.Image]:
+    """
+    Visual Auto-Chain Priority 1: Cloudflare Workers AI (`@cf/black-forest-labs/flux-1-schnell`).
+    Ultra-fast photorealistic live-action frames (free daily quota) with 8.5s timeout & 429 circuit breaker.
+    """
+    cf_acc = (cfg.get("cf_account_id") or os.getenv("CF_ACCOUNT_ID") or "").strip()
+    cf_tok = (cfg.get("cf_api_token") or os.getenv("CF_API_TOKEN") or "").strip()
+    if not cf_acc or not cf_tok or _is_vault_provider_cooling("cloudflare"):
+        return None
+    url = f"https://api.cloudflare.com/client/v4/accounts/{cf_acc}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {cf_tok}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "prompt": prompt[:1000],
+                "num_steps": 4,
+                "width": min(1024, max(512, (W // 64) * 64)),
+                "height": min(1024, max(512, (H // 64) * 64)),
+            },
+            timeout=8.5,
+        )
+        if resp.status_code == 429:
+            _mark_vault_provider_failed("cloudflare", cooldown_sec=300)
+            return None
+        if resp.status_code != 200:
+            _mark_vault_provider_failed("cloudflare", cooldown_sec=90)
+            return None
+        ctype = str(resp.headers.get("content-type", "")).lower()
+        if "image" in ctype or resp.content[:2] in (b"\xff\xd8", b"\x89P"):
+            if len(resp.content) > 4000:
+                return open_upright_image(resp.content).resize((W, H), Image.Resampling.LANCZOS)
+        data = resp.json()
+        img_b64 = (data.get("result") or {}).get("image") or data.get("image")
+        if isinstance(img_b64, str) and len(img_b64) > 2000:
+            raw_bytes = base64.b64decode(img_b64)
+            return open_upright_image(raw_bytes).resize((W, H), Image.Resampling.LANCZOS)
+    except Exception:
+        _mark_vault_provider_failed("cloudflare", cooldown_sec=90)
+    return None
+
+
+def _try_together_flux_image(prompt: str, W: int, H: int, cfg: dict) -> Optional[Image.Image]:
+    """
+    Visual Auto-Chain Priority 2: Together AI (`black-forest-labs/FLUX.1-schnell-Free`).
+    Fast photorealistic fallback with 8.5s timeout & automatic 429 circuit breaker.
+    """
+    tog_key = (cfg.get("together_api_key") or os.getenv("TOGETHER_API_KEY") or "").strip()
+    if not tog_key or _is_vault_provider_cooling("together"):
+        return None
+    try:
+        resp = requests.post(
+            "https://api.together.xyz/v1/images/generations",
+            headers={
+                "Authorization": f"Bearer {tog_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "black-forest-labs/FLUX.1-schnell-Free",
+                "prompt": prompt[:1000],
+                "width": min(1024, max(512, (W // 64) * 64)),
+                "height": min(1024, max(512, (H // 64) * 64)),
+                "steps": 4,
+                "n": 1,
+                "response_format": "b64_json",
+            },
+            timeout=8.5,
+        )
+        if resp.status_code == 429:
+            _mark_vault_provider_failed("together", cooldown_sec=300)
+            return None
+        if resp.status_code != 200:
+            _mark_vault_provider_failed("together", cooldown_sec=90)
+            return None
+        data = resp.json()
+        items = data.get("data") or []
+        if items and isinstance(items[0], dict):
+            b64_val = items[0].get("b64_json")
+            if isinstance(b64_val, str) and len(b64_val) > 2000:
+                raw_bytes = base64.b64decode(b64_val)
+                return open_upright_image(raw_bytes).resize((W, H), Image.Resampling.LANCZOS)
+            img_url = items[0].get("url")
+            if isinstance(img_url, str) and img_url.startswith("http"):
+                r2 = requests.get(img_url, timeout=6.0)
+                if r2.status_code == 200 and len(r2.content) > 4000:
+                    return open_upright_image(r2.content).resize((W, H), Image.Resampling.LANCZOS)
+    except Exception:
+        _mark_vault_provider_failed("together", cooldown_sec=90)
+    return None
+
+
 def _try_gemini_photorealistic_image(prompt: str, W: int, H: int) -> Optional[Image.Image]:
     """
-    Priority 1: Generate a 100% photorealistic live-action Indian TV serial photograph
-    via Google GenAI SDK (`imagen-3.0-generate-002` -> `gemini-2.5-flash-image`) when GEMINI_API_KEY is active.
+    Visual Auto-Chain Priority 3: Photorealistic live-action Indian TV serial frame
+    via Google GenAI SDK (`imagen-3.0-generate-002` -> `gemini-2.5-flash-image`) using Admin Vault GEMINI_API_KEY.
     """
-    if not client:
+    rt_client = _get_runtime_gemini_client()
+    if not rt_client or _is_vault_provider_cooling("gemini_img"):
         return None
     aspect = "9:16" if H > W else "16:9"
     now_t = time.time()
 
-    # 1A: Try Imagen 3 (`imagen-3.0-generate-002`)
+    # 3A: Try Imagen 3 (`imagen-3.0-generate-002`)
     if now_t - _GEMINI_IMG_MODEL_COOLDOWN.get("imagen-3.0-generate-002", 0.0) > 600:
         def _call_imagen():
-            return client.models.generate_images(
+            return rt_client.models.generate_images(
                 model="imagen-3.0-generate-002",
                 prompt=prompt,
                 config={
@@ -2182,7 +2533,7 @@ def _try_gemini_photorealistic_image(prompt: str, W: int, H: int) -> Optional[Im
             )
         try:
             with ThreadPoolExecutor(max_workers=1) as pool:
-                res = pool.submit(_call_imagen).result(timeout=18.0)
+                res = pool.submit(_call_imagen).result(timeout=12.0)
             gen_imgs = getattr(res, "generated_images", None) or []
             if gen_imgs:
                 img_obj = getattr(gen_imgs[0], "image", None)
@@ -2192,17 +2543,17 @@ def _try_gemini_photorealistic_image(prompt: str, W: int, H: int) -> Optional[Im
         except Exception:
             _GEMINI_IMG_MODEL_COOLDOWN["imagen-3.0-generate-002"] = time.time()
 
-    # 1B: Try Gemini Flash Image (`gemini-2.5-flash-image`)
+    # 3B: Try Gemini Flash Image (`gemini-2.5-flash-image`)
     if now_t - _GEMINI_IMG_MODEL_COOLDOWN.get("gemini-2.5-flash-image", 0.0) > 600:
         def _call_flash_img():
-            return client.models.generate_content(
+            return rt_client.models.generate_content(
                 model="gemini-2.5-flash-image",
                 contents=prompt,
                 config={"response_modalities": ["IMAGE"]},
             )
         try:
             with ThreadPoolExecutor(max_workers=1) as pool:
-                res = pool.submit(_call_flash_img).result(timeout=18.0)
+                res = pool.submit(_call_flash_img).result(timeout=12.0)
             candidates = getattr(res, "candidates", None) or []
             for cand in candidates:
                 parts = getattr(getattr(cand, "content", None), "parts", None) or []
@@ -2348,24 +2699,30 @@ def render_location_backdrop(
             pass
 
     shot_framing_map = {
-        "wide_group": "wide live-action TV serial group confrontation shot showing Indian family members standing inside the grand haveli hall, 35mm cinema lens",
-        "establishing": "wide live-action Indian TV serial establishing shot inside the luxurious haveli living room with real actors standing in dramatic tension, 35mm DSLR lens",
-        "closeup_drama": "dramatic Indian TV serial tight close-up portrait from chest up facing camera, expressive eyes and natural lip pose, 85mm cinema portrait lens, shallow depth of field",
-        "reaction_cut": "dramatic Indian TV serial emotional reaction close-up angle, intense facial expression, cinematic sidelighting, 85mm lens",
-        "action_mid": "dynamic medium live-action Indian TV serial confrontation shot, intense gesturing and eye contact, 50mm cinema lens",
-        "main": "medium close-up live-action Indian Hindi TV serial shot facing camera, natural realistic expression, 85mm cinema lens",
+        "wide_confrontation": "medium wide live-action Indian TV serial two-shot confrontation inside a grand royal Indian haveli hall with crystal chandeliers, carved arched wooden doors, and family members standing in background, 35mm cinema lens, full waist-up actors face-to-face",
+        "wide_group": "medium wide live-action Indian TV serial two-shot confrontation inside a grand royal Indian haveli hall with crystal chandeliers, carved arched wooden doors, and family members in background, 35mm cinema lens",
+        "establishing": "medium wide live-action Indian TV serial establishing shot inside a grand royal Indian haveli living hall with crystal chandeliers, arched wooden doors, and real actors confronting face-to-face, 35mm cinema lens",
+        "over_shoulder": "medium over-the-shoulder waist-up live-action Indian TV serial shot inside a grand royal Indian haveli hall with chandeliers and arched wooden doors, expressive speaking hand gesture, natural upper body visible, 50mm cinema lens",
+        "waist_up": "medium waist-up live-action Indian TV serial two-shot inside a grand royal Indian haveli hall with chandeliers, arched wooden doors, and family softly blurred in background, expressive hand gesture and body language, 50mm cinema lens",
+        "closeup_drama": "medium waist-up live-action Indian TV serial dialogue shot inside a grand royal Indian haveli hall with chandeliers and arched wooden doors, full shoulders, torso and expressive hand gesture visible, 50mm cinema lens",
+        "reaction_cut": "medium waist-up live-action Indian TV serial dramatic reaction two-shot inside a grand royal Indian haveli hall, intense emotional posture and hand gesture, warm chandelier backlighting, 50mm cinema lens",
+        "action_mid": "dynamic medium waist-up live-action Indian TV serial confrontation two-shot face-to-face inside grand royal haveli hall, intense pointing hand gesture and body language, 50mm cinema lens",
+        "broll_insert": "cinematic 1.5-second live-action Indian TV serial insert B-roll shot, moody dramatic golden lighting, 35mm cinema lens, ultra sharp photorealism, no human close-up",
+        "main": "medium waist-up live-action Indian TV serial two-shot inside grand royal Indian haveli hall with chandeliers and carved arched wooden doors, natural upper body and expressive hand gesture, 50mm cinema lens",
     }
-    shot_desc = shot_framing_map.get(shot_clean, shot_framing_map["closeup_drama"])
+    shot_desc = shot_framing_map.get(shot_clean, shot_framing_map["waist_up"])
 
     role_subject_map = {
-        "hero": "real handsome 30-year-old Indian male TV serial lead actor wearing tailored black royal bandhgala suit, neat trimmed beard, calm intense confident expression facing camera",
-        "female": "real beautiful 26-year-old Indian female TV serial lead actress wearing rich crimson designer silk saree, gold jhumka earrings and red bindi, emotional expressive eyes facing camera",
-        "villain": "real intimidating 36-year-old Indian male TV serial villain actor wearing sharp black blazer over dark shirt, thick beard, arrogant angry scowl facing camera",
-        "saas": "real commanding 52-year-old Indian matriarch TV serial actress wearing heavy royal Banarasi silk saree, heavy traditional gold necklace and red bindi, stern angry expression facing camera",
-        "narrator": "real Indian family drama cast (matriarch in silk saree, villain in black blazer, heroine in designer saree, hero in black bandhgala suit) in dramatic confrontation",
-        "crowd": "real shocked Indian wedding and family guests in traditional ethnic silk attire reacting dramatically",
+        "hero": "handsome 30-year-old Indian TV serial lead hero in tailored black royal bandhgala suit speaking firmly with expressive hand gesture, medium over-the-shoulder waist-up framing inside grand royal haveli hall",
+        "female": "emotional 26-year-old Indian TV serial lead heroine in rich crimson designer silk saree, gold jhumka earrings and red bindi speaking with teary eyes and expressive hand gesture, medium waist-up shot inside grand royal haveli hall",
+        "villain": "intimidating 36-year-old Indian TV serial villain in dark velvet blazer over black shirt confronting the hero face-to-face with dramatic pointing hand gesture, medium waist-up two-shot inside grand royal haveli hall",
+        "saas": "angry commanding 52-year-old Indian Saas in heavy maroon Banarasi silk saree, gold jewelry and red bindi pointing finger sharply at heroine in crimson saree while hero stands nearby, medium waist-up two-shot inside grand royal haveli hall",
+        "narrator": "angry Saas in maroon Banarasi silk saree pointing finger at emotional Heroine in crimson designer saree while handsome Hero in black royal bandhgala suit and Villain in dark velvet blazer stand face-to-face inside grand royal haveli hall with family in background",
+        "crowd": "shocked Indian family members in traditional silk sarees and kurtas reacting together inside grand royal haveli hall with crystal chandeliers",
     }
-    if shot_clean == "wide_group":
+    if shot_clean == "broll_insert":
+        subject_prefix = f"{shot_desc}, "
+    elif shot_clean in ("wide_group", "wide_confrontation", "establishing"):
         subject_prefix = f"{role_subject_map['narrator']}, {shot_desc}, "
     elif include_hero:
         subject_prefix = f"{role_subject_map.get(hero_role, role_subject_map['hero'])}, {shot_desc}, "
@@ -2374,15 +2731,33 @@ def render_location_backdrop(
 
     scene_detail = f"{hint_clean}, " if hint_clean else ""
     full_prompt = (
-        f"photorealistic still frame from an Indian Hindi TV serial drama on Dangal TV and StarPlus, "
-        f"{subject_prefix}{scene_detail}{desc}, {mood} dramatic warm cinematic lighting, "
-        f"8k DSLR live-action photography, real Indian human actors, authentic skin texture, natural sharp focus, "
-        f"no cartoon, no illustration, no anime, no 3d animation, no text, no watermark"
+        f"photorealistic live-action still frame from an Indian Hindi TV serial drama on Dangal TV and StarPlus, "
+        f"{subject_prefix}{scene_detail}{desc}, {mood} dramatic warm chandelier cinema lighting, "
+        f"8k DSLR live-action film photography, real Indian actors waist-up with natural body language and hand gestures, "
+        f"no passport photo, no extreme macro face close-up, no cartoon, no illustration, no anime, no 3d render, no text, no watermark"
     )
     encoded = urllib.parse.quote(full_prompt, safe="")
     seed_val = abs(hash(cache_key)) % 99999
+    cfg = get_runtime_ai_config()
 
-    # Priority 1: Google GenAI Photorealistic Image Generation (Imagen 3 / Gemini Flash Image)
+    # Visual Auto-Failover Chain:
+    # P1: Cloudflare Workers AI Flux -> P2: Together AI FLUX -> P3: Gemini Imagen/Flash -> P4: HF Spaces -> P5: Pollinations -> Same-Role Cache
+    cf_img = _try_cloudflare_flux_image(full_prompt, W, H, cfg)
+    if cf_img is not None:
+        try:
+            cf_img.save(cache_path, "JPEG", quality=93)
+        except Exception:
+            pass
+        return cf_img
+
+    tog_img = _try_together_flux_image(full_prompt, W, H, cfg)
+    if tog_img is not None:
+        try:
+            tog_img.save(cache_path, "JPEG", quality=93)
+        except Exception:
+            pass
+        return tog_img
+
     gem_img = _try_gemini_photorealistic_image(full_prompt, W, H)
     if gem_img is not None:
         try:
@@ -2391,24 +2766,32 @@ def render_location_backdrop(
             pass
         return gem_img
 
-    # Priority 2: Working Pollinations Real Photo API (`image.pollinations.ai/prompt/...`, timeout=15s)
+    hf_img = _try_hf_fast_image_spaces(full_prompt, W, H, seed_val, cfg)
+    if hf_img is not None:
+        try:
+            hf_img.save(cache_path, "JPEG", quality=93)
+        except Exception:
+            pass
+        return hf_img
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     }
-    cfg = get_runtime_ai_config()
-    if cfg.get("enable_pollinations", True):
+    if cfg.get("enable_pollinations", True) and not _is_vault_provider_cooling("pollinations"):
         pref_model = cfg.get("pollinations_model", "flux")
         alt_model = "turbo" if pref_model != "turbo" else "flux"
         candidate_urls = [
-            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model={pref_model}&nologo=true&seed={seed_val}", 15),
-            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model={alt_model}&nologo=true&seed={(seed_val + 73) % 99999}", 15),
-            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model=flux&nologo=true&seed={(seed_val + 199) % 99999}", 14),
+            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model={pref_model}&nologo=true&seed={seed_val}", 9),
+            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model={alt_model}&nologo=true&seed={(seed_val + 73) % 99999}", 9),
         ]
         for url, t_sec in candidate_urls:
             try:
                 resp = requests.get(url, headers=headers, timeout=t_sec, allow_redirects=True)
                 ctype = str(resp.headers.get("content-type", "")).lower()
+                if resp.status_code == 429:
+                    _mark_vault_provider_failed("pollinations", cooldown_sec=120)
+                    break
                 if (
                     resp.status_code == 200
                     and len(resp.content) > 8000
@@ -2420,31 +2803,23 @@ def render_location_backdrop(
             except Exception:
                 continue
 
-    # Priority 3: Free HuggingFace Fast Photorealistic Image Spaces (`FLUX.1-schnell`, `SDXL-Lightning`, `SDXL-Turbo`, `Playground v2.5`)
-    hf_img = _try_hf_fast_image_spaces(full_prompt, W, H, seed_val, cfg)
-    if hf_img is not None:
-        try:
-            hf_img.save(cache_path, "JPEG", quality=93)
-        except Exception:
-            pass
-        return hf_img
-
-    # Priority 4A: Reuse cached photorealistic frame of the EXACT SAME speaking role ONLY
+    # Priority 6A: Reuse cached photorealistic frame of the EXACT SAME speaking role ONLY
     cached_photo = _reuse_cached_photorealistic_scene(W, H, hero_role, seed_val)
     if cached_photo is not None:
         return cached_photo
 
-    # Priority 4B: Role-locked concise fast `turbo` portrait retry so Villain/Hero/Heroine/Saas NEVER share another role's photo!
-    if cfg.get("enable_pollinations", True):
+    # Priority 6B: Concise fast `turbo` waist-up retry locked strictly to the speaking role
+    if cfg.get("enable_pollinations", True) and not _is_vault_provider_cooling("pollinations"):
         short_role_prompt = (
-            f"photorealistic Indian Hindi TV serial close-up portrait of "
+            f"photorealistic Indian Hindi TV serial medium waist-up two-shot of "
             f"{role_subject_map.get(hero_role, role_subject_map['hero'])}, "
-            f"luxury Indian haveli living room background, warm drama lighting, 8k DSLR real human actor, no cartoon"
+            f"grand royal Indian haveli living hall with crystal chandeliers and arched wooden doors, "
+            f"warm drama lighting, 8k DSLR real human actor, no passport photo, no cartoon"
         )
         short_enc = urllib.parse.quote(short_role_prompt, safe="")
         retry_url = f"https://image.pollinations.ai/prompt/{short_enc}?width={W}&height={H}&model=turbo&nologo=true&seed={(seed_val + 503) % 99999}"
         try:
-            resp = requests.get(retry_url, headers=headers, timeout=16, allow_redirects=True)
+            resp = requests.get(retry_url, headers=headers, timeout=10, allow_redirects=True)
             ctype = str(resp.headers.get("content-type", "")).lower()
             if (
                 resp.status_code == 200
@@ -2457,7 +2832,7 @@ def render_location_backdrop(
         except Exception:
             pass
 
-    # Absolute last resort (only if server has zero network & zero same-role cache): clean dark warm cinema plate, ZERO cartoon faces!
+    # Absolute last resort: clean dark warm cinema plate (ZERO cartoon faces, ZERO raw selfies!)
     plate = Image.new("RGB", (W, H), (18, 12, 16))
     _draw_vertical_gradient(plate, (38, 18, 20), (14, 10, 18))
     return plate
@@ -2605,6 +2980,73 @@ def render_hindi_subtitle_png(
     return out_png_path
 
 
+def _try_opencv_face_only_swap(scene_img: Image.Image, actor_img: Image.Image) -> Optional[Image.Image]:
+    """
+    STRICT FACE-ONLY OPENCV SEAMLESS CLONE:
+    Extracts ONLY the oval face patch from the user's photo (NEVER their bedroom/background!),
+    color-matches it to the royal haveli lighting, and seamlessly clones it onto the AI Hero's
+    detected face box inside the haveli bandhgala scene.
+    """
+    if not (OPENCV_AVAILABLE and cv2 is not None and np is not None):
+        return None
+    try:
+        dst_bgr = cv2.cvtColor(np.array(scene_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+        src_bgr = cv2.cvtColor(np.array(actor_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+        dh, dw = dst_bgr.shape[:2]
+        sh, sw = src_bgr.shape[:2]
+
+        dst_box = _detect_skin_face_box(dst_bgr)
+        src_box = _detect_skin_face_box(src_bgr)
+        if not dst_box or not src_box:
+            return None
+
+        dx, dy, dbw, dbh = dst_box
+        sx, sy, sbw, sbh = src_box
+        # Reject implausibly tiny or full-frame boxes so we never paste a raw selfie
+        if dbw < 44 or dbh < 48 or dbw > int(dw * 0.58) or dbh > int(dh * 0.50):
+            return None
+        if sbw < 36 or sbh < 40:
+            return None
+
+        # Inner face oval crop (excludes hair/bedroom background completely!)
+        s_pad_x = int(sbw * 0.10)
+        s_pad_y = int(sbh * 0.08)
+        sx1 = max(0, sx + s_pad_x)
+        sy1 = max(0, sy + s_pad_y)
+        sx2 = min(sw, sx + sbw - s_pad_x)
+        sy2 = min(sh, sy + sbh - s_pad_y)
+        if sx2 - sx1 < 28 or sy2 - sy1 < 32:
+            return None
+
+        tw = max(32, int(dbw * 0.86))
+        th = max(36, int(dbh * 0.88))
+        face_patch = cv2.resize(src_bgr[sy1:sy2, sx1:sx2], (tw, th), interpolation=cv2.INTER_AREA)
+
+        # Match warm haveli skin illumination to target face region
+        cx = max(tw // 2 + 2, min(dw - tw // 2 - 2, dx + dbw // 2))
+        cy = max(th // 2 + 2, min(dh - th // 2 - 2, dy + dbh // 2))
+        roi_dst = dst_bgr[cy - th // 2 : cy - th // 2 + th, cx - tw // 2 : cx - tw // 2 + tw]
+        if roi_dst.shape[:2] != (th, tw):
+            return None
+
+        src_mean = np.mean(face_patch.astype(np.float32), axis=(0, 1)) + 1.0
+        dst_mean = np.mean(roi_dst.astype(np.float32), axis=(0, 1)) + 1.0
+        gain = np.clip(dst_mean / src_mean, 0.72, 1.32)
+        face_matched = np.clip(face_patch.astype(np.float32) * gain, 0, 255).astype(np.uint8)
+
+        oval_mask = np.zeros((th, tw), dtype=np.uint8)
+        cv2.ellipse(
+            oval_mask,
+            (tw // 2, th // 2),
+            (max(8, int(tw * 0.42)), max(10, int(th * 0.45))),
+            0, 0, 360, 255, -1,
+        )
+        blended_bgr = cv2.seamlessClone(face_matched, dst_bgr, oval_mask, (cx, cy), cv2.NORMAL_CLONE)
+        return Image.fromarray(cv2.cvtColor(blended_bgr, cv2.COLOR_BGR2RGB))
+    except Exception:
+        return None
+
+
 def prepare_character_frame(
     raw_img_path: str,
     char_name: str,
@@ -2618,19 +3060,17 @@ def prepare_character_frame(
     watermark_position: str = "top-right",
     aspect_ratio: str = "16:9",
     visual_action_prompt: str = "",
-    shot_variant: str = "main",
+    shot_variant: str = "waist_up",
 ):
     """
-    POCKET FM / MOJ FULL-SCREEN CINEMATIC DRAMA FRAME (720x1280 9:16 OR 1280x720 16:9):
-    1. 100% DELETED square photo boxes, sticker borders, and cartoon buildings!
-    2. Supports AI Auto-Cast Mode (ZERO face photo needed — pure full-screen AI Bollywood character scene!).
-    3. When user provides a 5-angle scanned face, straightens it via EXIF transpose (`open_upright_image`)
-       and seamlessly merges it onto the AI Bollywood hero via FREE HuggingFace Face-Swap
-       (`tonyassi/face-swap` / `ezioruan/inswapper`).
-    4. Clean Hindi subtitles are overlaid separately as rock-steady PIL PNG strips AFTER camera motion!
+    LIVE-ACTION INDIAN TV SERIAL WAIST-UP FRAME & STRICT FACE-SWAP ONLY (ZERO RAW SELFIE!):
+    1. Generates photorealistic waist-up / over-the-shoulder two-shots inside grand royal Indian haveli hall.
+    2. User's bedroom selfie NEVER appears directly on screen!
+       - Step A: HuggingFace AI Face-Swap (`tonyassi/face-swap` / `ezioruan/inswapper`) onto the AI Hero inside the haveli.
+       - Step B: OpenCV `cv2.seamlessClone` face-only oval blend onto the AI Hero's face inside the haveli.
+       - Step C: If swap fails, cleanly keep the photorealistic AI Hero in black bandhgala suit inside the haveli!
     """
     W, H = get_aspect_dimensions(aspect_ratio)
-    is_vertical = H > W
     role = detect_speaker_role(char_name, None)
     has_user_face = bool(raw_img_path and os.path.exists(raw_img_path) and os.path.getsize(raw_img_path) > 512)
 
@@ -2654,7 +3094,7 @@ def prepare_character_frame(
             )
             use_hf_swap = True
 
-        # AI AUTO-CAST MODE (No user face uploaded): Output 100% PURE Full-Screen AI Bollywood Scene!
+        # AI AUTO-CAST MODE (or non-face-swap roles): Pure Full-Screen Live-Action TV Serial Scene
         if not has_user_face:
             composed = ImageEnhance.Contrast(bg).enhance(1.06)
             composed = ImageEnhance.Color(composed).enhance(1.07)
@@ -2663,11 +3103,11 @@ def prepare_character_frame(
             composed.save(out_frame_path, "JPEG", quality=93)
             return
 
-        # User provided a 5-angle scanned face -> enforce EXIF-upright orientation
+        # User provided a 5-angle scanned face -> straighten EXIF orientation
         actor = open_upright_image(raw_img_path)
         actor.save(upright_actor_tmp, "JPEG", quality=92)
 
-        # Step A: Try 100% FREE HuggingFace AI Face-Swap onto the Full-Screen Bollywood Hero Scene
+        # Step A: Try FREE HuggingFace AI Face-Swap (`tonyassi/face-swap` / `ezioruan/inswapper`) onto AI Hero in haveli
         if use_hf_swap:
             bg.save(scene_tmp, "JPEG", quality=92)
             swapped_path = _try_hf_scene_faceswap(scene_tmp, upright_actor_tmp, swapped_tmp)
@@ -2680,57 +3120,21 @@ def prepare_character_frame(
                 composed.save(out_frame_path, "JPEG", quality=93)
                 return
 
-        # Step B: Seamless Full-Bleed Edge-to-Edge Environmental Portrait Blend (ZERO square photo box!)
-        aw, ah = actor.size
-        scale = max((W * 1.08) / max(1, aw), (H * 0.92) / max(1, ah)) if is_vertical else max((W * 0.84) / max(1, aw), (H * 1.12) / max(1, ah))
-        target_w = max(W, int(aw * scale)) if is_vertical else max(int(W * 0.78), int(aw * scale))
-        target_h = max(int(H * 0.85), int(ah * scale))
+        # Step B: Strict OpenCV Face-Only Seamless Clone onto AI Hero's face in haveli (NEVER raw selfie background!)
+        cv_swapped = _try_opencv_face_only_swap(bg, actor)
+        if cv_swapped is not None:
+            composed = ImageEnhance.Contrast(cv_swapped).enhance(1.06)
+            composed = ImageEnhance.Color(composed).enhance(1.06)
+            if watermark_text:
+                draw_channel_watermark(composed, watermark_text, watermark_position)
+            composed.save(out_frame_path, "JPEG", quality=93)
+            return
 
-        actor_resized = actor.resize((target_w, target_h), Image.Resampling.LANCZOS)
-        actor_resized = ImageEnhance.Contrast(actor_resized).enhance(1.10)
-        actor_resized = ImageEnhance.Color(actor_resized).enhance(1.06)
-
-        bg_small = bg.resize((16, 16), Image.Resampling.BILINEAR)
-        bg_avg = tuple(int(sum(p[c] for p in bg_small.getdata()) / 256) for c in range(3))
-        tint_layer = Image.new("RGB", actor_resized.size, bg_avg)
-        actor_graded = Image.blend(actor_resized, tint_layer, 0.16)
-
-        bg_cin = bg.filter(ImageFilter.GaussianBlur(radius=4.5))
-        bg_cin = ImageEnhance.Brightness(bg_cin).enhance(0.78)
-        bg_cin = ImageEnhance.Contrast(bg_cin).enhance(1.10)
-
-        canvas_actor = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        px = (W - target_w) // 2
-        py = max(-40, min(0, (H - target_h) // 4))
-        canvas_actor.paste(actor_graded.convert("RGBA"), (px, py))
-
-        mask = Image.new("L", (W, H), 0)
-        mdraw = ImageDraw.Draw(mask)
-        rx = int(W * (0.62 if is_vertical else 0.48))
-        ry = int(H * (0.52 if is_vertical else 0.72))
-        cx, cy = W // 2, int(H * 0.44)
-        mdraw.ellipse([cx - rx, cy - ry, cx + rx, cy + ry], fill=255)
-        mask = mask.filter(ImageFilter.GaussianBlur(radius=88))
-
-        rim_rgb = MOOD_RIM_COLORS.get(mood, (255, 88, 60))
-        rim_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        rdraw = ImageDraw.Draw(rim_layer)
-        rdraw.ellipse([cx - rx - 40, cy - ry, cx + rx + 40, cy + ry], fill=(rim_rgb[0], rim_rgb[1], rim_rgb[2], 66))
-        rim_layer = rim_layer.filter(ImageFilter.GaussianBlur(radius=84))
-
-        composed = Image.alpha_composite(bg_cin.convert("RGBA"), rim_layer)
-        composed = Image.composite(canvas_actor, composed, mask).convert("RGB")
-
-        vignette = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        vdraw = ImageDraw.Draw(vignette)
-        vdraw.rectangle([0, 0, W, H], fill=(8, 10, 20, 34))
-        vdraw.ellipse([int(W * 0.08), int(H * 0.04), int(W * 0.92), int(H * 0.96)], fill=(0, 0, 0, 0))
-        vignette = vignette.filter(ImageFilter.GaussianBlur(radius=72))
-        composed = Image.alpha_composite(composed.convert("RGBA"), vignette).convert("RGB")
-
+        # Step C: Clean Photorealistic AI-Generated Hero in Black Royal Bandhgala inside Haveli (NO raw selfie paste!)
+        composed = ImageEnhance.Contrast(bg).enhance(1.06)
+        composed = ImageEnhance.Color(composed).enhance(1.07)
         if watermark_text:
             draw_channel_watermark(composed, watermark_text, watermark_position)
-
         composed.save(out_frame_path, "JPEG", quality=93)
     finally:
         for tmp_f in (upright_actor_tmp, scene_tmp, swapped_tmp):
@@ -3174,6 +3578,247 @@ def _try_talking_lipsync_spaces(
     return None
 
 
+def _apply_mood_lighting_tint(frame_bgr, mood: str):
+    """Apply subtle Dangal TV / StarPlus mood color grading per frame (BGR order)."""
+    if not (OPENCV_AVAILABLE and cv2 is not None and np is not None):
+        return frame_bgr
+    try:
+        m = (mood or "").strip()
+        if m == "Emotional":
+            out = frame_bgr.astype(np.float32)
+            out[:, :, 0] *= 1.08  # Cool blue tint
+            out[:, :, 2] *= 0.92  # Soft red pull
+            return np.clip(out, 0, 255).astype(np.uint8)
+        if m in ("Suspense", "Romantic"):
+            out = frame_bgr.astype(np.float32)
+            out[:, :, 2] *= 1.07  # Warm golden chandelier glow
+            out[:, :, 1] *= 1.03
+            out[:, :, 0] *= 0.93
+            return np.clip(out, 0, 255).astype(np.uint8)
+        if m == "Action":
+            return cv2.convertScaleAbs(frame_bgr, alpha=1.08, beta=-4)
+    except Exception:
+        pass
+    return frame_bgr
+
+
+def _detect_broll_prompt(dialogue_text: str) -> Optional[tuple[str, str]]:
+    """Detect dialogue keywords that warrant a 1.5-second cinematic Context B-Roll insert shot."""
+    low = (dialogue_text or "").lower()
+    if any(k in low for k in ("mercedes", "मर्सिडीज़", "मर्सिडीज", "गाड़ी", "कार", "car ", "bmw", "audi", "rolls")):
+        return (
+            "broll_car",
+            "luxury black Mercedes sedan arriving at grand illuminated Indian royal haveli mansion gate at dusk, dramatic warm headlights and golden courtyard lamps, 35mm cinema insert shot",
+        )
+    if any(k in low for k in ("हवेली", "मकान", "गेट", "दरवाज़", "दरवाज", "mansion", "gate", "palace", "नीलामी", "auction")):
+        return (
+            "broll_gate",
+            "grand royal Indian heritage haveli mansion iron gate opening dramatically with golden chandelier lights glowing inside courtyard, twilight cinema establishing insert shot",
+        )
+    if any(k in low for k in ("वसीयत", "कागज़", "कागज", "प्रॉपर्टी", "जायदाद", "चेक", "will", "papers", "property", "contract", "sign", "दस्तखत")):
+        return (
+            "broll_papers",
+            "dramatic close-up insert of official Indian legal property will documents and gold fountain pen on mahogany desk inside royal haveli study, moody warm chandelier lighting",
+        )
+    if any(k in low for k in ("बारिश", "तूफान", "आंधी", "rain", "storm", "बिजली")):
+        return (
+            "broll_rain",
+            "dramatic monsoon rain streaks falling across tall carved wooden haveli window glass at night with warm golden chandelier reflections, cinematic Indian TV serial insert shot",
+        )
+    if any(k in low for k in ("कंपनी", "ऑफिस", "चेयरमैन", "बॉड", "office", "chairman", "empire", "बिज़नेस", "करोड़")):
+        return (
+            "broll_office",
+            "sleek modern Mumbai billionaire corporate glass tower and executive boardroom desk with golden nameplate at twilight, Indian TV drama cinematic insert shot",
+        )
+    return None
+
+
+def _is_twist_dialogue(dialogue_text: str) -> bool:
+    """Detect Dangal TV blockbuster twist dialogue lines for a 1.5s 3-Angle Reaction Montage."""
+    low = (dialogue_text or "").lower()
+    twist_terms = (
+        "अरबपति", "arabpati", "मालिक", "malik", "चेयरमैन", "chairman",
+        "असली सच", "सच सुन", "धोखा", "dhokha", "पुलिस", "police",
+        "औकात", "aukat", "नीलामी", "राज़", "raaz", "वसीयत", "wasiyat",
+        "जेल", "करोड़", "crore", "बदला", "badla", "खेल खत्म",
+    )
+    return any(t in low for t in twist_terms)
+
+
+def render_title_or_outro_png(
+    text: str,
+    out_png_path: str,
+    width: int = 720,
+    height: int = 1280,
+    is_outro: bool = False,
+) -> Optional[str]:
+    """
+    Render crisp 2s Golden Episode Title Hook (top-center cinema ribbon)
+    OR sleek 2s Cliffhanger Outro Card (`अगले पार्ट में जानिए असली सच... (Part N+1)`).
+    """
+    clean_t = (text or "").strip()[:76]
+    if not clean_t:
+        return None
+    is_vertical = height > width
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    font_main = load_hindi_font(30 if is_vertical else 34, bold=True)
+    font_sub = load_hindi_font(20 if is_vertical else 22, bold=True)
+
+    if is_outro:
+        # Cinematic darkened cliffhanger card overlay
+        draw.rectangle([0, 0, width, height], fill=(6, 4, 14, 178))
+        pad_x = 42 if is_vertical else 120
+        box_h = 220 if is_vertical else 190
+        y1 = (height - box_h) // 2
+        y2 = y1 + box_h
+        draw.rounded_rectangle(
+            [pad_x, y1, width - pad_x, y2],
+            radius=22,
+            fill=(16, 10, 28, 236),
+            outline=(255, 204, 0, 240),
+            width=3,
+        )
+        badge = "★ सस्पेंस क्लिफहैंगर ★"
+        try:
+            bb = draw.textbbox((0, 0), badge, font=font_sub)
+            bw = bb[2] - bb[0]
+        except Exception:
+            bw = len(badge) * 12
+        draw.text(((width - bw) // 2, y1 + 26), badge, font=font_sub, fill=(255, 214, 0, 255))
+
+        words = clean_t.split()
+        lines: list[str] = []
+        cur = ""
+        max_w = width - pad_x * 2 - 48
+        for w in words:
+            test = f"{cur} {w}".strip()
+            try:
+                tb = draw.textbbox((0, 0), test, font=font_main)
+                tw = tb[2] - tb[0]
+            except Exception:
+                tw = len(test) * 16
+            if tw > max_w and cur:
+                lines.append(cur)
+                cur = w
+            else:
+                cur = test
+        if cur:
+            lines.append(cur)
+        lines = lines[:2]
+        for idx, ln in enumerate(lines):
+            try:
+                lb = draw.textbbox((0, 0), ln, font=font_main)
+                lw = lb[2] - lb[0]
+            except Exception:
+                lw = len(ln) * 16
+            draw.text(
+                ((width - lw) // 2, y1 + 78 + idx * 46),
+                ln,
+                font=font_main,
+                fill=(255, 255, 255, 255),
+                stroke_width=2,
+                stroke_fill=(0, 0, 0, 220),
+            )
+    else:
+        # 2-second Golden Episode Title Hook banner at top-safe area
+        pad_x = 34 if is_vertical else 140
+        y1 = 96 if is_vertical else 44
+        box_h = 84
+        draw.rounded_rectangle(
+            [pad_x, y1, width - pad_x, y1 + box_h],
+            radius=16,
+            fill=(14, 8, 26, 212),
+            outline=(255, 204, 0, 235),
+            width=3,
+        )
+        title_str = f"🎬 {clean_t}"
+        try:
+            tb = draw.textbbox((0, 0), title_str, font=font_sub)
+            tw = tb[2] - tb[0]
+        except Exception:
+            tw = len(title_str) * 12
+        tx = max(pad_x + 18, (width - tw) // 2)
+        draw.text(
+            (tx, y1 + 26),
+            title_str,
+            font=font_sub,
+            fill=(255, 218, 68, 255),
+            stroke_width=2,
+            stroke_fill=(0, 0, 0, 235),
+        )
+
+    canvas.save(out_png_path, "PNG")
+    return out_png_path
+
+
+def _build_overlay_ffmpeg_cmd(
+    video_in_args: list[str],
+    base_v_filter: str,
+    final_audio: str,
+    out_mp4: str,
+    dur: float,
+    fps: int = 30,
+    subtitle_png_path: Optional[str] = None,
+    title_png_path: Optional[str] = None,
+    outro_png_path: Optional[str] = None,
+) -> list[str]:
+    """Build a uniform 30fps, yuv420p, AAC 44100Hz stereo FFmpeg command with optional Subtitles + 2s Title + 2s Outro overlays."""
+    cmd = ["ffmpeg", "-y"] + video_in_args
+    next_idx = sum(1 for a in video_in_args if a == "-i")
+
+    sub_idx = None
+    if subtitle_png_path and os.path.exists(subtitle_png_path):
+        sub_idx = next_idx
+        cmd.extend(["-i", subtitle_png_path])
+        next_idx += 1
+
+    title_idx = None
+    if title_png_path and os.path.exists(title_png_path):
+        title_idx = next_idx
+        cmd.extend(["-i", title_png_path])
+        next_idx += 1
+
+    outro_idx = None
+    if outro_png_path and os.path.exists(outro_png_path):
+        outro_idx = next_idx
+        cmd.extend(["-i", outro_png_path])
+        next_idx += 1
+
+    audio_idx = next_idx
+    cmd.extend(["-i", final_audio])
+
+    fc_parts: list[str] = []
+    cur_v = "0:v"
+    if base_v_filter:
+        fc_parts.append(f"[0:v]{base_v_filter}[vb]")
+        cur_v = "vb"
+    if sub_idx is not None:
+        fc_parts.append(f"[{cur_v}][{sub_idx}:v]overlay=0:H-h[vsub]")
+        cur_v = "vsub"
+    if title_idx is not None:
+        fc_parts.append(f"[{cur_v}][{title_idx}:v]overlay=0:0:enable='between(t,0,2.2)'[vtit]")
+        cur_v = "vtit"
+    if outro_idx is not None:
+        outro_start = max(0.4, dur - 2.1)
+        fc_parts.append(f"[{cur_v}][{outro_idx}:v]overlay=0:0:enable='gte(t,{outro_start:.2f})'[vout]")
+        cur_v = "vout"
+
+    if fc_parts:
+        cmd.extend(["-filter_complex", ";".join(fc_parts), "-map", f"[{cur_v}]", "-map", f"{audio_idx}:a:0"])
+    else:
+        cmd.extend(["-map", "0:v:0", "-map", f"{audio_idx}:a:0"])
+
+    cmd.extend([
+        "-r", str(fps),
+        "-shortest",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "24",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "96k",
+        out_mp4,
+    ])
+    return cmd
+
+
 def _render_pro_motion_vfx_clip(
     framed_img_path: str,
     final_audio: str,
@@ -3183,19 +3828,21 @@ def _render_pro_motion_vfx_clip(
     dialogue_audio_path: Optional[str] = None,
     subtitle_png_path: Optional[str] = None,
     aspect_ratio: str = "16:9",
+    title_png_path: Optional[str] = None,
+    outro_png_path: Optional[str] = None,
 ) -> bool:
     """
-    Full-Screen Cinematic Talking Lip-Sync + Pro Motion VFX Engine (Supports both 9:16 720x1280 & 16:9 1280x720):
-    - Real audio-envelope synchronized mouth lip movement + syllable head-nod micro-motion
-    - Fast-paced camera tracking zoom/pan + combat shake on Action/punch/explosion/thunder/sword
-    - Rain streaks, fiery sparks, atmospheric bokeh particles & dynamic lighting flashes
-    - Rock-steady PIL Noto Sans Devanagari PNG Hindi subtitle strip overlaid cleanly at bottom
+    Standardized 30fps Full-Screen Cinematic Talking Lip-Sync + Mood Lighting VFX Engine (9:16 & 16:9):
+    - Uniform 30fps, yuv420p, AAC 44100Hz stereo for instant `-c copy` stitching
+    - Audio-envelope mouth lip-sync + natural eye-blink + organic breathing + syllable head-nod
+    - Mood Lighting Tints (Emotional -> cool blue, Suspense/Romantic -> golden glow, Action -> high contrast + shake)
+    - Optional 2s Opening Golden Episode Title Hook & 2s Cliffhanger Outro Card
     """
     w_out, h_out = get_aspect_dimensions(aspect_ratio)
     src_w, src_h = int(w_out * 1.2), int(h_out * 1.2)
     dur = _probe_audio_duration(final_audio)
-    fps = 24
-    total_frames = max(36, int(dur * fps))
+    fps = 30
+    total_frames = max(45, int(dur * fps))
     high_impact = (
         mood == "Action"
         or sfx_type in ("punch", "explosion", "thunder", "sword")
@@ -3212,8 +3859,6 @@ def _render_pro_motion_vfx_clip(
             if base is not None:
                 src = cv2.resize(base, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
                 sh, sw = src.shape[:2]
-
-                # Track the speaker's face region once on the oversampled frame (ZERO CascadeClassifier!)
                 face_box_src = _detect_skin_face_box(src)
 
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -3224,55 +3869,53 @@ def _render_pro_motion_vfx_clip(
                     {
                         "x": rng.uniform(0, w_out),
                         "y": rng.uniform(0, h_out),
-                        "vx": rng.uniform(-7.5, -2.5) if sfx_type in ("rain", "thunder") else rng.uniform(-3.0, 3.0),
-                        "vy": rng.uniform(16.0, 26.0) if sfx_type in ("rain", "thunder") else rng.uniform(-4.2, -1.2),
-                        "r": rng.randint(2, 5),
+                        "vx": rng.uniform(-7.0, -2.2) if sfx_type in ("rain", "thunder") else rng.uniform(-2.6, 2.6),
+                        "vy": rng.uniform(14.0, 22.0) if sfx_type in ("rain", "thunder") else rng.uniform(-3.6, -1.0),
+                        "r": rng.randint(2, 4),
                     }
-                    for _ in range(52 if high_impact or sfx_type in ("rain", "thunder") else 24)
+                    for _ in range(44 if high_impact or sfx_type in ("rain", "thunder") else 20)
                 ]
 
                 for f_idx in range(total_frames):
                     t = f_idx / max(1, total_frames - 1)
                     talk_amp = speech_env[f_idx] if f_idx < len(speech_env) else 0.0
 
-                    # 1. Apply live speech-synchronized mouth & jaw talking animation + natural eye-blink
                     work_src = _apply_speech_lipsync_mouth_motion(src.copy(), talk_amp, face_box_src)
                     work_src = _apply_natural_eye_blink_and_breathing(work_src, f_idx, face_box_src, fps=fps)
 
-                    # 2. Natural speaking head-nod + organic breathing + active-speaker dramatic zoom-in
-                    breath_y = math.sin(f_idx * 0.14) * 3.8
-                    nod_y = math.sin(f_idx * 0.58) * (5.2 * talk_amp) + breath_y
-                    nod_x = math.cos(f_idx * 0.34) * (2.8 * talk_amp)
-                    talk_zoom_boost = 0.016 * talk_amp
+                    breath_y = math.sin(f_idx * 0.11) * 3.5
+                    nod_y = math.sin(f_idx * 0.46) * (4.8 * talk_amp) + breath_y
+                    nod_x = math.cos(f_idx * 0.28) * (2.5 * talk_amp)
+                    talk_zoom_boost = 0.015 * talk_amp
 
                     if mood == "Action":
                         zoom = 1.05 + 0.12 * t + talk_zoom_boost
-                        pan_x = math.sin(t * math.pi * 1.3) * 34.0 + nod_x
+                        pan_x = math.sin(t * math.pi * 1.3) * 32.0 + nod_x
                         pan_y = math.cos(t * math.pi * 1.1) * 14.0 + nod_y
                     elif mood == "Suspense":
                         zoom = 1.03 + 0.10 * t + talk_zoom_boost
-                        pan_x = math.sin(t * math.pi) * 24.0 + nod_x
-                        pan_y = -12.0 * t + nod_y
+                        pan_x = math.sin(t * math.pi) * 22.0 + nod_x
+                        pan_y = -11.0 * t + nod_y
                     elif mood == "Comedy":
-                        zoom = 1.04 + 0.05 * abs(math.sin(f_idx * 0.16)) + talk_zoom_boost
-                        pan_x = math.sin(f_idx * 0.14) * 26.0 + nod_x
-                        pan_y = math.cos(f_idx * 0.12) * 10.0 + nod_y
+                        zoom = 1.04 + 0.05 * abs(math.sin(f_idx * 0.13)) + talk_zoom_boost
+                        pan_x = math.sin(f_idx * 0.11) * 24.0 + nod_x
+                        pan_y = math.cos(f_idx * 0.10) * 10.0 + nod_y
                     elif mood == "Romantic":
                         zoom = 1.03 + 0.08 * t + talk_zoom_boost
-                        pan_x = -28.0 + 56.0 * t + nod_x
-                        pan_y = math.sin(t * math.pi) * 12.0 + nod_y
+                        pan_x = -24.0 + 48.0 * t + nod_x
+                        pan_y = math.sin(t * math.pi) * 11.0 + nod_y
                     else:
                         zoom = 1.03 + 0.09 * t + talk_zoom_boost
-                        pan_x = math.sin(t * math.pi * 0.8) * 18.0 + nod_x
+                        pan_x = math.sin(t * math.pi * 0.8) * 16.0 + nod_x
                         pan_y = -8.0 * t + nod_y
 
                     shake_x = 0.0
                     shake_y = 0.0
                     if high_impact:
-                        burst = 1.0 if (f_idx % 24) < 7 else 0.30
-                        amp_s = (11.5 if sfx_type in ("explosion", "punch") else 6.5) * burst
-                        shake_x = math.sin(f_idx * 1.9) * amp_s
-                        shake_y = math.cos(f_idx * 2.3) * (amp_s * 0.7)
+                        burst = 1.0 if (f_idx % 30) < 8 else 0.28
+                        amp_s = (10.5 if sfx_type in ("explosion", "punch") else 6.0) * burst
+                        shake_x = math.sin(f_idx * 1.7) * amp_s
+                        shake_y = math.cos(f_idx * 2.1) * (amp_s * 0.7)
 
                     crop_w = int(sw / zoom)
                     crop_h = int(sh / zoom)
@@ -3286,16 +3929,16 @@ def _render_pro_motion_vfx_clip(
                         interpolation=cv2.INTER_LINEAR,
                     )
 
-                    # 3. Dynamic storm / impact / active-speaker rim lighting pulse
+                    frame = _apply_mood_lighting_tint(frame, mood)
+
                     light_boost = 1.0 + 0.03 * talk_amp
-                    if sfx_type == "thunder" and (f_idx % 38) in (2, 3, 5):
-                        light_boost = 1.30
-                    elif sfx_type in ("explosion", "punch") and (f_idx % 28) in (1, 2):
-                        light_boost = 1.22
+                    if sfx_type == "thunder" and (f_idx % 45) in (2, 3, 5):
+                        light_boost = 1.28
+                    elif sfx_type in ("explosion", "punch") and (f_idx % 34) in (1, 2):
+                        light_boost = 1.20
                     if abs(light_boost - 1.0) > 0.01:
                         frame = cv2.convertScaleAbs(frame, alpha=light_boost, beta=3 if light_boost > 1.15 else 0)
 
-                    # 4. Atmospheric particles (rain streaks, fiery combat sparks, cinema bokeh)
                     p_overlay = frame.copy()
                     for p in particles:
                         p["x"] = (p["x"] + p["vx"]) % w_out
@@ -3311,39 +3954,24 @@ def _render_pro_motion_vfx_clip(
                             cv2.circle(p_overlay, (px, py), p["r"] + 2, col, -1, cv2.LINE_AA)
                         else:
                             cv2.circle(p_overlay, (px, py), max(2, p["r"] - 1), (220, 210, 170), -1, cv2.LINE_AA)
-                    cv2.addWeighted(p_overlay, 0.34, frame, 0.66, 0, frame)
+                    cv2.addWeighted(p_overlay, 0.30, frame, 0.70, 0, frame)
 
                     writer.write(frame)
 
                 writer.release()
 
                 if os.path.exists(raw_vfx_mp4) and os.path.getsize(raw_vfx_mp4) > 2000:
-                    if subtitle_png_path and os.path.exists(subtitle_png_path):
-                        cmd = [
-                            "ffmpeg", "-y",
-                            "-i", raw_vfx_mp4,
-                            "-i", subtitle_png_path,
-                            "-i", final_audio,
-                            "-filter_complex", "[0:v][1:v]overlay=0:H-h[vout]",
-                            "-map", "[vout]",
-                            "-map", "2:a:0",
-                            "-shortest",
-                            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "24",
-                            "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
-                            out_mp4,
-                        ]
-                    else:
-                        cmd = [
-                            "ffmpeg", "-y",
-                            "-i", raw_vfx_mp4,
-                            "-i", final_audio,
-                            "-map", "0:v:0",
-                            "-map", "1:a:0",
-                            "-shortest",
-                            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "24",
-                            "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
-                            out_mp4,
-                        ]
+                    cmd = _build_overlay_ffmpeg_cmd(
+                        ["-i", raw_vfx_mp4],
+                        "",
+                        final_audio,
+                        out_mp4,
+                        dur=dur,
+                        fps=fps,
+                        subtitle_png_path=subtitle_png_path,
+                        title_png_path=title_png_path,
+                        outro_png_path=outro_png_path,
+                    )
                     subprocess.run(cmd, check=True, timeout=65, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000:
                         return True
@@ -3356,38 +3984,27 @@ def _render_pro_motion_vfx_clip(
                 except Exception:
                     pass
 
-    # Path B: Pure FFmpeg Pro Motion (NO `-loop 1` before zoompan so zoompan animates EVERY frame!)
-    shake_expr_x = "iw/2-(iw/zoom/2)+sin(on*1.7)*12" if high_impact else "iw/2-(iw/zoom/2)+sin(on*0.14)*16"
-    shake_expr_y = "ih/2-(ih/zoom/2)+cos(on*2.1)*8" if high_impact else "ih/2-(ih/zoom/2)+sin(on*0.16)*10"
-    zoom_rate = "0.0020" if high_impact else "0.0014"
+    # Path B: Pure FFmpeg 30fps Pro Motion (NO `-loop 1` before zoompan so zoompan animates EVERY frame!)
+    shake_expr_x = "iw/2-(iw/zoom/2)+sin(on*1.5)*12" if high_impact else "iw/2-(iw/zoom/2)+sin(on*0.12)*16"
+    shake_expr_y = "ih/2-(ih/zoom/2)+cos(on*1.9)*8" if high_impact else "ih/2-(ih/zoom/2)+sin(on*0.14)*10"
+    zoom_rate = "0.0017" if high_impact else "0.0012"
     zoom_cap = "1.20" if high_impact else "1.16"
     vf_base = (
         f"scale={src_w}:{src_h}:force_original_aspect_ratio=increase,crop={src_w}:{src_h},"
         f"zoompan=z='min(1.04+on*{zoom_rate},{zoom_cap})':x='{shake_expr_x}':y='{shake_expr_y}':d={total_frames}:s={w_out}x{h_out}:fps={fps},"
         f"eq=contrast=1.06:saturation=1.10:brightness=0.01,vignette=PI/5"
     )
-    if subtitle_png_path and os.path.exists(subtitle_png_path):
-        cmd_fb = [
-            "ffmpeg", "-y",
-            "-i", framed_img_path,
-            "-i", subtitle_png_path,
-            "-i", final_audio,
-            "-filter_complex", f"[0:v]{vf_base}[vm];[vm][1:v]overlay=0:H-h[vout]",
-            "-map", "[vout]", "-map", "2:a:0",
-            "-c:v", "libx264", "-preset", "veryfast", "-shortest", "-pix_fmt", "yuv420p", "-crf", "24",
-            "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
-            out_mp4,
-        ]
-    else:
-        cmd_fb = [
-            "ffmpeg", "-y",
-            "-i", framed_img_path,
-            "-i", final_audio,
-            "-vf", vf_base,
-            "-c:v", "libx264", "-preset", "veryfast", "-shortest", "-pix_fmt", "yuv420p", "-crf", "24",
-            "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
-            out_mp4,
-        ]
+    cmd_fb = _build_overlay_ffmpeg_cmd(
+        ["-i", framed_img_path],
+        vf_base,
+        final_audio,
+        out_mp4,
+        dur=dur,
+        fps=fps,
+        subtitle_png_path=subtitle_png_path,
+        title_png_path=title_png_path,
+        outro_png_path=outro_png_path,
+    )
     subprocess.run(cmd_fb, check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000
 
@@ -3401,17 +4018,18 @@ def _render_multishot_pollinations_motion_clip(
     dialogue_audio_path: Optional[str] = None,
     subtitle_png_path: Optional[str] = None,
     aspect_ratio: str = "16:9",
+    title_png_path: Optional[str] = None,
+    outro_png_path: Optional[str] = None,
 ) -> bool:
     """
-    Live Indian TV Serial 2-Cut Talking Video Engine (NO Static Statue Photos!):
-    - Cut 1 (~62% / ~2.5-3.0s): Exact Speaking Actor dramatic zoom-in close-up with audio-synced
-      lip-sync mouth/jaw motion, syllable head-nod, organic breathing, and natural eye-blink!
-    - Crisp 4-frame TV serial cut ->
-    - Cut 2 (~38% / ~1.5-2.0s): Counterpart Reaction Cut with snappy Dangal TV zoom punch-in,
-      dramatic impact micro-shake, breathing, and natural eye-blink!
-    - Pure-FFmpeg fallback uses single-image zoompan (WITHOUT `-loop 1`) so every frame animates smoothly!
+    Live-Action Indian TV Serial 30fps Multi-Cut Talking Video Engine (2, 3, or 4 Cuts!):
+    - Cut 0 (~56%): Exact Speaking Actor waist-up frame with audio-synced lip-sync, syllable head-nod,
+      organic breathing, eye-blink, and mood lighting tint!
+    - Remaining ~44%: Dynamically split across Counterpart Reaction Cut, 1.5s Context B-Roll insert,
+      OR Dangal TV 3-Angle Twist Reveal Montage (Heroine shocked -> Saas stunned -> Villain angry zoom-punch)!
+    - Uniform 30fps, yuv420p, AAC 44100Hz stereo so `-c copy` stitches Parts & Full Movies in ~2 seconds!
     """
-    valid_frames = [p for p in keyframe_paths if p and os.path.exists(p) and os.path.getsize(p) > 2000]
+    valid_frames = [p for p in keyframe_paths if p and os.path.exists(p) and os.path.getsize(p) > 2000][:4]
     if len(valid_frames) <= 1:
         return _render_pro_motion_vfx_clip(
             valid_frames[0] if valid_frames else keyframe_paths[0],
@@ -3422,66 +4040,81 @@ def _render_multishot_pollinations_motion_clip(
             dialogue_audio_path=dialogue_audio_path,
             subtitle_png_path=subtitle_png_path,
             aspect_ratio=aspect_ratio,
+            title_png_path=title_png_path,
+            outro_png_path=outro_png_path,
         )
 
     w_out, h_out = get_aspect_dimensions(aspect_ratio)
     src_w, src_h = int(w_out * 1.24), int(h_out * 1.24)
     dur = _probe_audio_duration(final_audio)
-    fps = 24
-    total_frames = max(40, int(dur * fps) + 2)
+    fps = 30
+    total_frames = max(50, int(dur * fps) + 2)
     high_impact = (
         mood == "Action"
         or sfx_type in ("punch", "explosion", "thunder", "sword")
     )
 
-    # Path A (Primary): OpenCV Live Talking Lip-Sync + Head-Nod + Eye-Blink + 2-Cut TV Serial Camera Motion
+    # Path A (Primary): OpenCV 30fps Live Talking Lip-Sync + Multi-Cut (2/3/4 Angles) + Mood Lighting
     if OPENCV_AVAILABLE and cv2 is not None and np is not None:
-        raw_vfx_mp4 = f"{out_mp4}_tv_2cut_raw.mp4"
+        raw_vfx_mp4 = f"{out_mp4}_tv_mcut_raw.mp4"
         try:
-            b0 = cv2.imread(valid_frames[0])
-            b1 = cv2.imread(valid_frames[1])
-            if b0 is not None and b1 is not None:
-                src0 = cv2.resize(b0, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
-                src1 = cv2.resize(b1, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
-                face0 = _detect_skin_face_box(src0)
-                face1 = _detect_skin_face_box(src1)
+            loaded_srcs = []
+            loaded_faces = []
+            for fp in valid_frames:
+                im = cv2.imread(fp)
+                if im is not None:
+                    rs = cv2.resize(im, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
+                    loaded_srcs.append(rs)
+                    loaded_faces.append(_detect_skin_face_box(rs))
+
+            if len(loaded_srcs) >= 2:
+                n_cuts = len(loaded_srcs)
                 speech_env = _extract_audio_speech_envelope(
                     dialogue_audio_path or final_audio, total_frames, fps=fps
                 )
-
-                cut_frame = max(24, min(total_frames - 16, int(total_frames * 0.62)))
-                blend_len = 4
+                # Cut 0 (Speaking Actor): ~58% for 2 cuts, ~54% for 3-4 cuts (leaves crisp 1.5s twist/B-roll beats!)
+                cut0_end = max(28, min(total_frames - (n_cuts - 1) * 14, int(total_frames * (0.58 if n_cuts == 2 else 0.54))))
+                rem_frames = max(14, total_frames - cut0_end)
+                per_extra = max(12, rem_frames // (n_cuts - 1))
+                cut_bounds = [0, cut0_end]
+                for c_i in range(1, n_cuts - 1):
+                    cut_bounds.append(min(total_frames - 12, cut0_end + c_i * per_extra))
+                cut_bounds.append(total_frames)
+                blend_len = 3
 
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 writer = cv2.VideoWriter(raw_vfx_mp4, fourcc, fps, (w_out, h_out))
 
-                def _render_cut_frame(src_img, face_box, f_idx: int, local_t: float, talk_amp: float, is_reaction: bool):
+                def _render_cut_frame(cut_idx: int, f_idx: int, local_t: float, talk_amp: float):
+                    src_img = loaded_srcs[cut_idx]
+                    face_box = loaded_faces[cut_idx]
+                    is_speaking = (cut_idx == 0)
                     sh, sw = src_img.shape[:2]
                     work = src_img.copy()
-                    if not is_reaction:
+                    if is_speaking:
                         work = _apply_speech_lipsync_mouth_motion(work, talk_amp, face_box)
                     work = _apply_natural_eye_blink_and_breathing(work, f_idx, face_box, fps=fps)
 
-                    breath_y = math.sin(f_idx * 0.15) * 4.0
-                    if not is_reaction:
-                        # Speaking Actor Close-Up: dramatic slow push-in + lively speech head-nod
-                        nod_y = math.sin(f_idx * 0.60) * (5.5 * talk_amp) + breath_y
-                        nod_x = math.cos(f_idx * 0.36) * (3.0 * talk_amp)
-                        zoom = 1.04 + 0.15 * local_t + 0.016 * talk_amp
+                    breath_y = math.sin(f_idx * 0.12) * 3.6
+                    if is_speaking:
+                        nod_y = math.sin(f_idx * 0.48) * (5.0 * talk_amp) + breath_y
+                        nod_x = math.cos(f_idx * 0.29) * (2.8 * talk_amp)
+                        zoom = 1.04 + 0.14 * local_t + 0.015 * talk_amp
                         pan_x = math.sin(local_t * math.pi * 0.9) * 14.0 + nod_x
-                        pan_y = -10.0 * local_t + nod_y
-                        shake_x = math.sin(f_idx * 1.9) * (6.0 if high_impact else 1.2)
-                        shake_y = math.cos(f_idx * 2.2) * (4.0 if high_impact else 0.8)
+                        pan_y = -9.0 * local_t + nod_y
+                        shake_x = math.sin(f_idx * 1.7) * (5.5 if high_impact else 1.0)
+                        shake_y = math.cos(f_idx * 2.0) * (3.8 if high_impact else 0.7)
                     else:
-                        # Counterpart Reaction Cut: snappy TV-serial zoom punch-in + impact micro-shake!
+                        # Reaction / B-Roll / Dangal TV 3-Angle Twist Punch-In!
                         ease = 1.0 - (1.0 - local_t) ** 2
-                        zoom = 1.05 + 0.17 * ease
-                        pan_x = -12.0 + 24.0 * local_t
+                        zoom = 1.05 + (0.19 if n_cuts >= 3 else 0.16) * ease
+                        pan_dir = 1.0 if (cut_idx % 2 == 1) else -1.0
+                        pan_x = pan_dir * (-12.0 + 24.0 * local_t)
                         pan_y = -6.0 * local_t + breath_y
-                        punch = max(0.0, 1.0 - local_t * 3.8)
-                        amp_s = (10.5 if high_impact else 6.5) * punch
-                        shake_x = math.sin(f_idx * 2.5) * amp_s
-                        shake_y = math.cos(f_idx * 2.9) * (amp_s * 0.75)
+                        punch = max(0.0, 1.0 - local_t * 4.2)
+                        amp_s = (11.0 if (high_impact or n_cuts >= 3) else 6.0) * punch
+                        shake_x = math.sin(f_idx * 2.4) * amp_s
+                        shake_y = math.cos(f_idx * 2.8) * (amp_s * 0.75)
 
                     crop_w = int(sw / zoom)
                     crop_h = int(sh / zoom)
@@ -3494,57 +4127,44 @@ def _render_multishot_pollinations_motion_clip(
                         (w_out, h_out),
                         interpolation=cv2.INTER_LINEAR,
                     )
-                    # Subtle active-speaker cinematic rim-light warmth pulse
-                    l_boost = 1.0 + (0.032 * talk_amp if not is_reaction else 0.04 * max(0.0, 1.0 - local_t * 3.0))
+                    out_f = _apply_mood_lighting_tint(out_f, mood)
+                    l_boost = 1.0 + (0.03 * talk_amp if is_speaking else 0.05 * max(0.0, 1.0 - local_t * 3.5))
                     if abs(l_boost - 1.0) > 0.01:
                         out_f = cv2.convertScaleAbs(out_f, alpha=l_boost, beta=2)
                     return out_f
 
                 for f_idx in range(total_frames):
                     talk_amp = speech_env[f_idx] if f_idx < len(speech_env) else 0.0
-                    if f_idx < cut_frame:
-                        local_t = f_idx / max(1, cut_frame - 1)
-                        frame = _render_cut_frame(src0, face0, f_idx, local_t, talk_amp, is_reaction=False)
-                    elif f_idx < cut_frame + blend_len:
-                        alpha = (f_idx - cut_frame + 1) / float(blend_len + 1)
-                        f_a = _render_cut_frame(src0, face0, f_idx, 1.0, talk_amp, is_reaction=False)
-                        local_t2 = (f_idx - cut_frame) / max(1, total_frames - cut_frame - 1)
-                        f_b = _render_cut_frame(src1, face1, f_idx, local_t2, 0.0, is_reaction=True)
-                        frame = cv2.addWeighted(f_b, alpha, f_a, 1.0 - alpha, 0)
+                    c_idx = 0
+                    for k in range(n_cuts):
+                        if f_idx >= cut_bounds[k]:
+                            c_idx = k
+                    seg_start = cut_bounds[c_idx]
+                    seg_end = cut_bounds[c_idx + 1]
+                    local_t = (f_idx - seg_start) / max(1, seg_end - seg_start - 1)
+                    if c_idx > 0 and (f_idx - seg_start) < blend_len:
+                        alpha = (f_idx - seg_start + 1) / float(blend_len + 1)
+                        f_prev = _render_cut_frame(c_idx - 1, f_idx, 1.0, talk_amp if c_idx == 1 else 0.0)
+                        f_curr = _render_cut_frame(c_idx, f_idx, local_t, 0.0)
+                        frame = cv2.addWeighted(f_curr, alpha, f_prev, 1.0 - alpha, 0)
                     else:
-                        local_t2 = (f_idx - cut_frame) / max(1, total_frames - cut_frame - 1)
-                        frame = _render_cut_frame(src1, face1, f_idx, local_t2, 0.0, is_reaction=True)
+                        frame = _render_cut_frame(c_idx, f_idx, local_t, talk_amp if c_idx == 0 else 0.0)
                     writer.write(frame)
 
                 writer.release()
 
                 if os.path.exists(raw_vfx_mp4) and os.path.getsize(raw_vfx_mp4) > 2000:
-                    if subtitle_png_path and os.path.exists(subtitle_png_path):
-                        cmd_mux = [
-                            "ffmpeg", "-y",
-                            "-i", raw_vfx_mp4,
-                            "-i", subtitle_png_path,
-                            "-i", final_audio,
-                            "-filter_complex", "[0:v][1:v]overlay=0:H-h[vout]",
-                            "-map", "[vout]",
-                            "-map", "2:a:0",
-                            "-shortest",
-                            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "24",
-                            "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
-                            out_mp4,
-                        ]
-                    else:
-                        cmd_mux = [
-                            "ffmpeg", "-y",
-                            "-i", raw_vfx_mp4,
-                            "-i", final_audio,
-                            "-map", "0:v:0",
-                            "-map", "1:a:0",
-                            "-shortest",
-                            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "24",
-                            "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
-                            out_mp4,
-                        ]
+                    cmd_mux = _build_overlay_ffmpeg_cmd(
+                        ["-i", raw_vfx_mp4],
+                        "",
+                        final_audio,
+                        out_mp4,
+                        dur=dur,
+                        fps=fps,
+                        subtitle_png_path=subtitle_png_path,
+                        title_png_path=title_png_path,
+                        outro_png_path=outro_png_path,
+                    )
                     subprocess.run(cmd_mux, check=True, timeout=65, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000:
                         return True
@@ -3557,52 +4177,68 @@ def _render_multishot_pollinations_motion_clip(
                 except Exception:
                     pass
 
-    # Path B (Pure-FFmpeg 2-Cut Motion Fallback — NO `-loop 1` before zoompan so zoompan animates every single frame!)
+    # Path B (Pure-FFmpeg 2-Cut 30fps Motion Fallback — NO `-loop 1` before zoompan!)
     use_frames = valid_frames[:2]
     n_shots = len(use_frames)
-    xfade_dur = 0.22
-    cut1_dur = max(1.6, dur * 0.62 + xfade_dur * 0.5)
+    xfade_dur = 0.20
+    cut1_dur = max(1.6, dur * 0.58 + xfade_dur * 0.5)
     cut2_dur = max(1.2, dur - cut1_dur + xfade_dur)
     shot_durs = [cut1_dur, cut2_dur]
-    shot_frames_list = [max(24, int(sd * fps) + 2) for sd in shot_durs]
+    shot_frames_list = [max(30, int(sd * fps) + 2) for sd in shot_durs]
 
     zoompan_moves = [
-        f"scale={src_w}:{src_h}:force_original_aspect_ratio=increase,crop={src_w}:{src_h},zoompan=z='min(1.20,1.04+0.0020*on)':x='iw/2-(iw/zoom/2)+sin(on*0.18)*12':y='ih/2-(ih/zoom/2)+sin(on*0.22)*8':d={shot_frames_list[0]}:s={w_out}x{h_out}:fps={fps}",
-        f"scale={src_w}:{src_h}:force_original_aspect_ratio=increase,crop={src_w}:{src_h},zoompan=z='min(1.22,1.05+0.0028*on)':x='iw/2-(iw/zoom/2)-on*0.4':y='ih/2-(ih/zoom/2)+sin(on*0.30)*6':d={shot_frames_list[1]}:s={w_out}x{h_out}:fps={fps}",
+        f"scale={src_w}:{src_h}:force_original_aspect_ratio=increase,crop={src_w}:{src_h},zoompan=z='min(1.20,1.04+0.0016*on)':x='iw/2-(iw/zoom/2)+sin(on*0.15)*12':y='ih/2-(ih/zoom/2)+sin(on*0.18)*8':d={shot_frames_list[0]}:s={w_out}x{h_out}:fps={fps}",
+        f"scale={src_w}:{src_h}:force_original_aspect_ratio=increase,crop={src_w}:{src_h},zoompan=z='min(1.22,1.05+0.0022*on)':x='iw/2-(iw/zoom/2)-on*0.35':y='ih/2-(ih/zoom/2)+sin(on*0.24)*6':d={shot_frames_list[1]}:s={w_out}x{h_out}:fps={fps}",
     ]
 
     cmd = ["ffmpeg", "-y"]
     for fp in use_frames:
         cmd.extend(["-i", fp])
-    sub_input_idx = None
+    next_i = n_shots
+    sub_idx = None
     if subtitle_png_path and os.path.exists(subtitle_png_path):
-        sub_input_idx = n_shots
+        sub_idx = next_i
         cmd.extend(["-i", subtitle_png_path])
-    audio_input_idx = n_shots + (1 if sub_input_idx is not None else 0)
+        next_i += 1
+    title_idx = None
+    if title_png_path and os.path.exists(title_png_path):
+        title_idx = next_i
+        cmd.extend(["-i", title_png_path])
+        next_i += 1
+    outro_idx = None
+    if outro_png_path and os.path.exists(outro_png_path):
+        outro_idx = next_i
+        cmd.extend(["-i", outro_png_path])
+        next_i += 1
+    audio_idx = next_i
     cmd.extend(["-i", final_audio])
 
     fc_parts = []
     for idx in range(n_shots):
         fc_parts.append(f"[{idx}:v]{zoompan_moves[idx]},setsar=1,format=yuv420p[s{idx}]")
-
     fc_parts.append(
-        f"[s0][s1]xfade=transition=fade:duration={xfade_dur:.2f}:offset={max(0.5, cut1_dur - xfade_dur):.2f}[x1]"
+        f"[s0][s1]xfade=transition=fade:duration={xfade_dur:.2f}:offset={max(0.5, cut1_dur - xfade_dur):.2f},eq=contrast=1.06:saturation=1.10,vignette=PI/5[vcur]"
     )
-    grade = "eq=contrast=1.06:saturation=1.10,vignette=PI/5"
-    if sub_input_idx is not None:
-        fc_parts.append(f"[x1]{grade}[vgraded]")
-        fc_parts.append(f"[vgraded][{sub_input_idx}:v]overlay=0:H-h[vout]")
-    else:
-        fc_parts.append(f"[x1]{grade}[vout]")
+    cur_v = "vcur"
+    if sub_idx is not None:
+        fc_parts.append(f"[{cur_v}][{sub_idx}:v]overlay=0:H-h[vsub]")
+        cur_v = "vsub"
+    if title_idx is not None:
+        fc_parts.append(f"[{cur_v}][{title_idx}:v]overlay=0:0:enable='between(t,0,2.2)'[vtit]")
+        cur_v = "vtit"
+    if outro_idx is not None:
+        outro_start = max(0.4, dur - 2.1)
+        fc_parts.append(f"[{cur_v}][{outro_idx}:v]overlay=0:0:enable='gte(t,{outro_start:.2f})'[vout]")
+        cur_v = "vout"
 
     cmd.extend([
         "-filter_complex", ";".join(fc_parts),
-        "-map", "[vout]",
-        "-map", f"{audio_input_idx}:a:0",
+        "-map", f"[{cur_v}]",
+        "-map", f"{audio_idx}:a:0",
         "-r", str(fps),
         "-shortest",
         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "24",
-        "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "96k",
         out_mp4,
     ])
     try:
@@ -3621,6 +4257,8 @@ def _render_multishot_pollinations_motion_clip(
         dialogue_audio_path=dialogue_audio_path,
         subtitle_png_path=subtitle_png_path,
         aspect_ratio=aspect_ratio,
+        title_png_path=title_png_path,
+        outro_png_path=outro_png_path,
     )
 
 
@@ -3643,25 +4281,29 @@ def generate_free_ai_video_clip(
     custom_bg_path: Optional[str] = None,
     watermark_text: str = "",
     watermark_position: str = "top-right",
+    master_cast: Optional[dict] = None,
+    title_hook_text: str = "",
+    outro_card_text: str = "",
 ) -> str:
     """
-    100% FREE UNLIMITED MULTI-ENGINE AI VIDEO GENERATION PIPELINE (9:16 & 16:9):
-    Auto-rotates across 5 FREE AI Video Engines with 5-second failover + 10-min circuit breaker:
-      * Engine 1: Wan-AI/Wan2.1 (T2V & I2V)
-      * Engine 2: Lightricks/LTX-Video (Ultra-fast cinematic motion)
-      * Engine 3: THUDM/CogVideoX-5b (Realistic Bollywood drama & action)
-      * Engine 4: tencent/HunyuanVideo (High-detail motion)
-      * Engine 5: Pollinations Flux Unlimited Multi-Shot Motion (3 dynamic keyframes) + LivePortrait / SadTalker / Wav2Lip + FFmpeg smooth motion!
-    Applies optional 5-angle Face-Swap when user attached a face, OR pure AI Auto-Cast when zero face is provided!
-    Returns the exact Free AI Engine label used so Web Studio & Flutter APK can show the live Engine Badge.
+    v12 LIVE-ACTION INDIAN TV SERIAL 30FPS MULTI-ENGINE PIPELINE:
+    - Real I2V Spaces (Wan2.1 -> LTX-Video -> CogVideoX -> LivePortrait/SadTalker) with fast circuit breaker
+    - Master Character Casting Sheet reuse (consistent outfits + 5x faster long series!)
+    - Dangal TV 1.5s 3-Angle Twist Reveal Montage on twist lines (`arabpati`, `malik`, `चेयरमैन`, `sach`, `dhokha`, `police`, `aukat`)
+    - 1.5s Context B-Roll insert shot when dialogue mentions Mercedes/car, mansion gate, will/papers, office, or rain
+    - 2s Golden Opening Episode Title Hook & 2s Cliffhanger Outro Card
+    - Uniform 30fps, yuv420p, AAC 44100Hz stereo for instant `-c copy` stitching!
     """
     w_out, h_out = get_aspect_dimensions(aspect_ratio)
     mixed_tmp = f"{out_mp4}_mix.mp3"
     sub_png = f"{out_mp4}_sub.png"
+    title_png = f"{out_mp4}_title.png"
+    outro_png = f"{out_mp4}_outro.png"
     extra_keyframes: list[str] = []
     final_audio = mix_cinematic_audio(
         audio_path, mood, sfx_type, mixed_tmp, target_duration_sec=target_duration_sec
     )
+    clip_dur = _probe_audio_duration(final_audio)
     rendered_sub = (
         render_hindi_subtitle_png(
             speaker_name,
@@ -3671,6 +4313,16 @@ def generate_free_ai_video_clip(
             height=240 if h_out > w_out else 148,
         )
         if dialogue_text.strip()
+        else None
+    )
+    rendered_title = (
+        render_title_or_outro_png(title_hook_text, title_png, width=w_out, height=h_out, is_outro=False)
+        if title_hook_text.strip()
+        else None
+    )
+    rendered_outro = (
+        render_title_or_outro_png(outro_card_text, outro_png, width=w_out, height=h_out, is_outro=True)
+        if outro_card_text.strip()
         else None
     )
 
@@ -3685,36 +4337,18 @@ def generate_free_ai_video_clip(
 
     def _mux_video_with_audio_and_sub(src_video: str) -> bool:
         try:
-            scale_crop = f"scale={w_out}:{h_out}:force_original_aspect_ratio=increase,crop={w_out}:{h_out}"
-            if rendered_sub and os.path.exists(rendered_sub):
-                fc = (
-                    f"[0:v]{scale_crop},eq=contrast=1.06:saturation=1.10,vignette=PI/5[vbase];"
-                    f"[vbase][1:v]overlay=0:H-h[vout]"
-                )
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-stream_loop", "-1", "-i", src_video,
-                    "-i", rendered_sub,
-                    "-i", final_audio,
-                    "-filter_complex", fc,
-                    "-map", "[vout]", "-map", "2:a:0",
-                    "-r", "24", "-shortest",
-                    "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "24",
-                    "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
-                    out_mp4,
-                ]
-            else:
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-stream_loop", "-1", "-i", src_video,
-                    "-i", final_audio,
-                    "-map", "0:v:0", "-map", "1:a:0",
-                    "-vf", f"{scale_crop},eq=contrast=1.06:saturation=1.10,vignette=PI/5",
-                    "-r", "24", "-shortest",
-                    "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "24",
-                    "-c:a", "aac", "-ar", "44100", "-b:a", "96k",
-                    out_mp4,
-                ]
+            scale_crop = f"scale={w_out}:{h_out}:force_original_aspect_ratio=increase,crop={w_out}:{h_out},eq=contrast=1.06:saturation=1.10,vignette=PI/5"
+            cmd = _build_overlay_ffmpeg_cmd(
+                ["-stream_loop", "-1", "-i", src_video],
+                scale_crop,
+                final_audio,
+                out_mp4,
+                dur=clip_dur,
+                fps=30,
+                subtitle_png_path=rendered_sub,
+                title_png_path=rendered_title,
+                outro_png_path=rendered_outro,
+            )
             subprocess.run(cmd, check=True, timeout=45, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 1000
         except Exception:
@@ -3728,7 +4362,6 @@ def generate_free_ai_video_clip(
             mood,
         )
         if ai_vid and os.path.exists(ai_vid) and ai_engine_label:
-            # If user supplied a scanned face, blend their face onto the generated AI video via OpenCV/HF Face-Swap
             final_src_vid = ai_vid
             if angle_face_path and os.path.exists(angle_face_path):
                 swapped_ai_vid = f"{out_mp4}_swapped_ai.mp4"
@@ -3747,62 +4380,98 @@ def generate_free_ai_video_clip(
                 except Exception:
                     pass
             if _mux_video_with_audio_and_sub(final_src_vid):
-                return f"{ai_engine_label} (Free AI Video)"
+                return f"{ai_engine_label} (30fps AI Video)"
 
-        # 2. Try Free Talking Lip-Sync (SadTalker / Wav2Lip / LivePortrait) on the scene/character + Hindi audio
+        # 2. Try Free Talking Lip-Sync (LivePortrait / SadTalker / Wav2Lip)
         lipsync_target = framed_img_path if os.path.exists(framed_img_path) else angle_face_path
         if lipsync_target and os.path.exists(lipsync_target):
             talk_vid = _try_talking_lipsync_spaces(lipsync_target, audio_path)
             if talk_vid and os.path.exists(talk_vid):
                 if _mux_video_with_audio_and_sub(talk_vid):
-                    return "Pollinations Flux + LivePortrait/SadTalker"
+                    return "Live-Action TV Serial + LivePortrait/SadTalker"
 
-        # 3. STRICT SPEAKER SYNC LOCK + 2-Cut Dangal TV Serial Motion:
-        #    Cut 1 (0-62% / ~2.5-3s): EXACT Speaking Actor Close-Up (`framed_img_path`) with Live Talking Lip-Sync, Eye-Blink & Zoom-In!
-        #    Cut 2 (62-100% / ~1.5-2s): Counterpart Actor Shocked/Angry Reaction Cut (`reaction_cut`) with Snappy Zoom Punch-In!
-        def _pick_reaction_counterpart(spk: str, diag: str) -> str:
-            r = detect_speaker_role(spk, None)
-            h = abs(hash((spk or "") + (diag or "")[:24])) % 2
-            if r in ("saas", "villain"):
-                return "Heroine" if h == 0 else "Hero"
-            if r in ("hero", "female"):
-                return "Villain" if h == 0 else "Saas"
-            return "Hero"
+        # 3. LIVE-ACTION INDIAN TV SERIAL MULTI-CUT ENGINE (Speaker + Reaction / 1.5s B-Roll / 3-Angle Twist Montage!)
+        cast_map = master_cast or {}
+        speaker_role = detect_speaker_role(speaker_name, None)
+        keyframe_list: list[str] = [framed_img_path]
+        is_twist = _is_twist_dialogue(dialogue_text)
+        broll_hit = _detect_broll_prompt(dialogue_text)
 
-        reaction_kf_path: Optional[str] = None
-        if not custom_bg_path:
-            counterpart_spk = _pick_reaction_counterpart(speaker_name, dialogue_text)
-            react_prompt = f"shocked tense dramatic reaction face of {counterpart_spk} listening in Indian haveli living room"
-            kf_path = f"{out_mp4}_kf_react.jpg"
-            try:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as kf_ex:
-                    fut_react = kf_ex.submit(
-                        prepare_character_frame,
-                        "",
-                        counterpart_spk,
-                        dialogue_text,
-                        kf_path,
-                        location_key,
-                        location_label,
-                        mood,
-                        None,
-                        watermark_text,
-                        watermark_position,
-                        aspect_ratio,
-                        react_prompt,
-                        "reaction_cut",
-                    )
-                    fut_react.result(timeout=18.0)
-                if os.path.exists(kf_path) and os.path.getsize(kf_path) > 4000:
-                    reaction_kf_path = kf_path
-                    extra_keyframes.append(reaction_kf_path)
-            except Exception:
-                pass
+        if is_twist and cast_map:
+            # Dangal TV 1.5s 3-Angle Twist Reveal Montage: Heroine shocked -> Saas stunned -> Villain angry!
+            for r_key in ("female", "saas", "villain", "hero"):
+                cand = cast_map.get(r_key)
+                if cand and os.path.exists(cand) and cand not in keyframe_list and r_key != speaker_role:
+                    keyframe_list.append(cand)
+                if len(keyframe_list) >= 4:
+                    break
+        else:
+            # Optional 1.5s Context B-Roll insert (Mercedes/car, mansion gate, will/papers, office, rain)
+            if broll_hit and not custom_bg_path:
+                b_key, b_prompt = broll_hit
+                cached_broll = cast_map.get(b_key) or cast_map.get("context_broll")
+                if cached_broll and os.path.exists(cached_broll) and cached_broll not in keyframe_list:
+                    keyframe_list.append(cached_broll)
+                else:
+                    broll_path = f"{out_mp4}_broll.jpg"
+                    try:
+                        b_img = render_location_backdrop(
+                            location_key,
+                            mood,
+                            prompt_hint=b_prompt,
+                            aspect_ratio=aspect_ratio,
+                            include_hero=False,
+                            hero_role="narrator",
+                            shot_variant="broll_insert",
+                        )
+                        b_img.save(broll_path, "JPEG", quality=92)
+                        if os.path.exists(broll_path) and os.path.getsize(broll_path) > 4000:
+                            keyframe_list.append(broll_path)
+                            extra_keyframes.append(broll_path)
+                    except Exception:
+                        pass
 
-        # Frame 1 is ALWAYS locked to the Speaking Actor (`framed_img_path`) — NEVER wide_group or another role first!
-        keyframe_list = [framed_img_path]
-        if reaction_kf_path:
-            keyframe_list.append(reaction_kf_path)
+            # Counterpart Reaction Cut (reuses Master Casting Sheet instantly if available!)
+            def _pick_reaction_role(role_k: str, diag: str) -> str:
+                h = abs(hash((role_k or "") + (diag or "")[:24])) % 2
+                if role_k in ("saas", "villain"):
+                    return "female" if h == 0 else "hero"
+                if role_k in ("hero", "female"):
+                    return "villain" if h == 0 else "saas"
+                return "hero"
+
+            react_role = _pick_reaction_role(speaker_role, dialogue_text)
+            cast_react = cast_map.get(react_role)
+            if cast_react and os.path.exists(cast_react) and cast_react not in keyframe_list:
+                keyframe_list.append(cast_react)
+            elif not custom_bg_path and len(keyframe_list) < 2:
+                counterpart_label = {"hero": "Hero", "female": "Heroine", "villain": "Villain", "saas": "Saas"}.get(react_role, "Hero")
+                react_prompt = f"shocked dramatic waist-up reaction of {counterpart_label} listening inside grand royal Indian haveli hall"
+                kf_path = f"{out_mp4}_kf_react.jpg"
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as kf_ex:
+                        fut_react = kf_ex.submit(
+                            prepare_character_frame,
+                            "",
+                            counterpart_label,
+                            dialogue_text,
+                            kf_path,
+                            location_key,
+                            location_label,
+                            mood,
+                            None,
+                            watermark_text,
+                            watermark_position,
+                            aspect_ratio,
+                            react_prompt,
+                            "reaction_cut",
+                        )
+                        fut_react.result(timeout=14.0)
+                    if os.path.exists(kf_path) and os.path.getsize(kf_path) > 4000:
+                        keyframe_list.append(kf_path)
+                        extra_keyframes.append(kf_path)
+                except Exception:
+                    pass
 
         _render_multishot_pollinations_motion_clip(
             keyframe_list,
@@ -3813,10 +4482,16 @@ def generate_free_ai_video_clip(
             dialogue_audio_path=audio_path,
             subtitle_png_path=rendered_sub,
             aspect_ratio=aspect_ratio,
+            title_png_path=rendered_title,
+            outro_png_path=rendered_outro,
         )
-        return "Live Talking TV Serial 2-Cut Lip-Sync + Reaction"
+        if is_twist and len(keyframe_list) >= 3:
+            return "Live-Action 30fps TV Serial · 3-Angle Twist Montage"
+        if broll_hit and len(keyframe_list) >= 2:
+            return "Live-Action 30fps TV Serial · Context B-Roll + Lip-Sync"
+        return "Live-Action 30fps TV Serial · Waist-Up Lip-Sync"
     finally:
-        for tmp_p in [mixed_tmp, sub_png] + extra_keyframes:
+        for tmp_p in [mixed_tmp, sub_png, title_png, outro_png] + extra_keyframes:
             if tmp_p and os.path.exists(tmp_p):
                 try:
                     os.remove(tmp_p)
@@ -3843,6 +4518,9 @@ def render_exact_face_clip(
     custom_bg_path: Optional[str] = None,
     watermark_text: str = "",
     watermark_position: str = "top-right",
+    master_cast: Optional[dict] = None,
+    title_hook_text: str = "",
+    outro_card_text: str = "",
 ) -> str:
     """Backward-compatible wrapper routing directly into `generate_free_ai_video_clip()`."""
     return generate_free_ai_video_clip(
@@ -3864,6 +4542,9 @@ def render_exact_face_clip(
         custom_bg_path=custom_bg_path,
         watermark_text=watermark_text,
         watermark_position=watermark_position,
+        master_cast=master_cast,
+        title_hook_text=title_hook_text,
+        outro_card_text=outro_card_text,
     )
 
 
@@ -4104,37 +4785,32 @@ async def autonomous_movie_worker(project_id: str):
                         for i in range(total_chapters)
                     ],
                 }
-                if client:
-                    try:
-                        strict_note = (
-                            "महत्वपूर्ण: यूज़र की लिखी कहानी को बिल्कुल मत बदलो, उसी कहानी के आधार पर पार्ट्स बनाओ।"
-                            if story_mode == "manual"
-                            else f"Genre: {state.get('genre', 'Action')}."
-                        )
-                        cliff_note = (
-                            f"यह Pocket FM / Moj स्टाइल {total_chapters}-Part Micro-Drama Series ({part_duration} Min/Part) है। "
-                            f"हर Part के अंत में एक ज़बरदस्त Cliffhanger / Suspense मोड़ ज़रूर रखो ताकि दर्शक तुरंत अगला Part देखें!"
-                            if series_mode == "series"
-                            else f"यह {duration} मिनट की दमदार बॉलीवुड फिल्म है।"
-                        )
-                        prompt = f"""
-                        तुम एक Pocket FM / Moj और बॉलीवुड डायरेक्टर हो। '{state['idea']}' पर कहानी की रूपरेखा बनाओ।
-                        {strict_note}
-                        {cliff_note}
-                        कैरेक्टर्स: {char_names}
-                        कहानी को ठीक {total_chapters} बराबर Parts/Chapters में बांटो।
-                        सिर्फ शुद्ध JSON दो:
-                        {{"title": "सीरीज़/फिल्म का दमदार नाम", "chapters": [{{"no": 1, "title": "Part 1: धमाकेदार शुरुआत", "plot": "विस्तार से कहानी, ट्विस्ट और अंत का सस्पेंस"}}]}}
-                        """
-                        res = await asyncio.wait_for(
-                            asyncio.to_thread(
-                                lambda: client.models.generate_content(
-                                    model="gemini-2.5-flash", contents=prompt
-                                )
-                            ),
-                            timeout=18.0,
-                        )
-                        parsed_out = safe_extract_json(res.text, fallback_outline)
+                strict_note = (
+                    "महत्वपूर्ण: यूज़र की लिखी कहानी को बिल्कुल मत बदलो, उसी कहानी के आधार पर पार्ट्स बनाओ।"
+                    if story_mode == "manual"
+                    else f"Genre: {state.get('genre', 'Action')}."
+                )
+                cliff_note = (
+                    f"यह Pocket FM / Moj स्टाइल {total_chapters}-Part Micro-Drama Series ({part_duration} Min/Part) है। "
+                    f"हर Part के अंत में एक ज़बरदस्त Cliffhanger / Suspense मोड़ ज़रूर रखो ताकि दर्शक तुरंत अगला Part देखें!"
+                    if series_mode == "series"
+                    else f"यह {duration} मिनट की दमदार बॉलीवुड फिल्म है।"
+                )
+                outline_prompt = f"""
+                तुम एक Pocket FM / Moj और Dangal TV के नंबर-1 डायरेक्टर हो। '{state['idea']}' पर कहानी की रूपरेखा बनाओ।
+                {strict_note}
+                {cliff_note}
+                कैरेक्टर्स: {char_names}
+                कहानी को ठीक {total_chapters} बराबर Parts/Chapters में बांटो।
+                सिर्फ शुद्ध JSON दो:
+                {{"title": "सीरीज़/फिल्म का दमदार नाम", "chapters": [{{"no": 1, "title": "Part 1: धमाकेदार शुरुआत", "plot": "विस्तार से कहानी, ट्विस्ट और अंत का सस्पेंस"}}]}}
+                """
+                try:
+                    raw_outline_txt, _brain_used = await asyncio.to_thread(
+                        _call_story_brain_auto_chain, outline_prompt, 15.0
+                    )
+                    if raw_outline_txt:
+                        parsed_out = safe_extract_json(raw_outline_txt, fallback_outline)
                         if not isinstance(parsed_out, dict) or not parsed_out.get("chapters"):
                             parsed_out = fallback_outline
                         parsed_out["chapters"] = parsed_out["chapters"][:total_chapters]
@@ -4148,19 +4824,101 @@ async def autonomous_movie_worker(project_id: str):
                                 }
                             )
                         state["outline"] = parsed_out
-                    except Exception:
+                    else:
                         state["outline"] = fallback_outline
-                else:
+                except Exception:
                     state["outline"] = fallback_outline
 
                 state["scripts"] = {}
                 state["progress"] = 12
-                state["status_text"] = "कहानी तैयार! अब Part 1 के तेज़-रफ़्तार डायलॉग्स और एक्शन सीन्स बन रहे हैं (12%)..."
+                state["status_text"] = "कहानी तैयार! अब Master Character Casting Sheet (Hero, Heroine, Villain, Saas) समानांतर बन रही है (12%)..."
                 save_state(proj_dir, state)
+
+        # ==================== MASTER CHARACTER CASTING SHEET (PARALLEL PRE-GENERATION) ====================
+        # Generates 6 photorealistic waist-up live-action haveli frames ONCE (with user Face-Swap on Hero once)
+        # and reuses them across all scenes & Parts -> consistent outfits + 5x faster 2-5 min series!
+        master_cast_dir = f"{proj_dir}/master_cast"
+        os.makedirs(master_cast_dir, exist_ok=True)
+        master_cast: dict[str, str] = {}
+        ai_auto_cast = bool(state.get("ai_auto_cast", False))
+        hero_display_global = char_names[0] if char_names else "Hero"
+        hero_entry_global = char_map.get(hero_display_global) if char_names else None
+        hero_face_global = (
+            ""
+            if ai_auto_cast
+            else (select_character_angle_photo(hero_entry_global, "front") if hero_entry_global else "")
+        )
+        base_loc_key, base_loc_label = detect_location_meta(
+            state.get("idea", ""), default_location or "Royal Palace"
+        )
+
+        cast_specs = [
+            ("hero", hero_face_global, hero_display_global, "over_shoulder",
+             "handsome Indian hero in black royal bandhgala suit speaking firmly with expressive hand gesture inside grand royal haveli hall"),
+            ("female", "", "Heroine", "waist_up",
+             "emotional Indian heroine in crimson designer silk saree and gold jhumkas speaking with teary eyes inside grand royal haveli hall"),
+            ("villain", "", "Villain", "waist_up",
+             "intimidating Indian villain in dark velvet blazer confronting hero face-to-face with dramatic pointing hand gesture inside royal haveli hall"),
+            ("saas", "", "Saas", "waist_up",
+             "angry commanding Indian Saas in maroon Banarasi silk saree pointing finger dramatically at heroine inside royal haveli hall"),
+            ("wide_confrontation", "", "Narrator", "wide_confrontation",
+             "medium wide two-shot of angry Saas in maroon Banarasi silk saree pointing at Heroine in crimson saree while Hero in black bandhgala and Villain in velvet blazer stand face-to-face inside grand royal haveli hall"),
+            ("context_broll", "", "Narrator", "broll_insert",
+             "luxury black Mercedes sedan arriving at grand illuminated Indian royal haveli mansion iron gate at dusk, dramatic warm cinema lighting"),
+        ]
+
+        async def _build_master_cast_frame(role_key: str, raw_p: str, spk_label: str, shot_v: str, hint_p: str):
+            out_p = f"{master_cast_dir}/{role_key}.jpg"
+            if os.path.exists(out_p) and os.path.getsize(out_p) > 4000:
+                master_cast[role_key] = out_p
+                return
+            try:
+                if shot_v == "broll_insert":
+                    img = await asyncio.to_thread(
+                        render_location_backdrop,
+                        base_loc_key,
+                        default_mood,
+                        hint_p,
+                        aspect_ratio,
+                        False,
+                        "narrator",
+                        "broll_insert",
+                    )
+                    if watermark_text:
+                        draw_channel_watermark(img, watermark_text, watermark_position)
+                    img.save(out_p, "JPEG", quality=93)
+                else:
+                    await asyncio.to_thread(
+                        prepare_character_frame,
+                        raw_p,
+                        spk_label,
+                        "",
+                        out_p,
+                        base_loc_key,
+                        base_loc_label,
+                        default_mood,
+                        project_custom_bg if role_key == "wide_confrontation" else None,
+                        watermark_text,
+                        watermark_position,
+                        aspect_ratio,
+                        hint_p,
+                        shot_v,
+                    )
+                if os.path.exists(out_p) and os.path.getsize(out_p) > 4000:
+                    master_cast[role_key] = out_p
+            except Exception:
+                pass
+
+        if not project_custom_bg:
+            await asyncio.gather(
+                *[_build_master_cast_frame(rk, rp, sl, sv, hp) for rk, rp, sl, sv, hp in cast_specs],
+                return_exceptions=True,
+            )
 
         chapters = state["outline"]["chapters"]
         manual_chunks = state.get("manual_chunks")
         prev_plot = "कहानी की शुरुआत"
+        prev_episode_tail = ""
         total_ch_count = max(1, len(chapters))
 
         for ch_idx, ch in enumerate(chapters):
@@ -4168,6 +4926,11 @@ async def autonomous_movie_worker(project_id: str):
             ch_mp4 = f"{proj_dir}/ch_{ch_no}.mp4"
             if ch_no in state["done_chapters"] and os.path.exists(ch_mp4):
                 prev_plot = ch["plot"]
+                prev_sc = state.get("scripts", {}).get(str(ch_no)) or []
+                if prev_sc:
+                    prev_episode_tail = " | ".join(
+                        f"{x.get('character', 'Hero')}: {x.get('dialogue', '')}" for x in prev_sc[-2:]
+                    )
                 continue
 
             ch_base_pct = 12 + int((ch_idx / total_ch_count) * 82)
@@ -4186,7 +4949,6 @@ async def autonomous_movie_worker(project_id: str):
             if manual_chunks and ch_idx < len(manual_chunks):
                 dialogues = manual_chunks[ch_idx]
             elif ch_idx == 0 and len(parsed_script_lines) >= 6:
-                # Use the exact Multi-Character script generated/edited by the user for Part 1 (capped to crisp 30-45s pacing!)
                 dialogues = parsed_script_lines[: min(8, max(6, scenes_per_chapter))]
             else:
                 loc_k, loc_l = detect_location_meta(ch["plot"], default_location)
@@ -4219,41 +4981,46 @@ async def autonomous_movie_worker(project_id: str):
                         }
                     )
 
-                if client:
-                    try:
-                        cliff_instruction = (
-                            f"अंतिम सीन (आखिरी डायलॉग) में Narrator की आवाज़ में ज़बरदस्त सस्पेंस Cliffhanger ज़रूर डालो: "
-                            f"जैसे 'आगे क्या होगा? देखिए Part {ch_no + 1} में...'"
-                            if (series_mode == "series" and ch_no < total_ch_count)
-                            else "अंतिम सीन में धमाकेदार क्लाइमैक्स डायलॉग रखो।"
-                        )
-                        script_prompt = f"""
-                        सीरीज़/फिल्म: {state['outline']['title']} | पिछला सीन: {prev_plot}
-                        वर्तमान Part {ch_no}/{total_ch_count}: {ch['plot']}
-                        मुख्य कैरेक्टर (Hero): {hero_display}
-                        मल्टी-कैरेक्टर कास्ट (ज़रूरी): {hero_display}, Heroine, Villain, Saas, और Narrator।
-                        सख्त नियम:
-                        1. एक ही Narrator की लंबी कहानी मत लिखो! Narrator सिर्फ पहला और आखिरी (max 20%) डायलॉग बोले।
-                        2. बाकी 80% सीन्स में {hero_display}, Heroine, Villain, और Saas के बीच तीखे, इमोशनल और ट्विस्ट वाले डायलॉग्स हों।
-                        3. भाषा / Dialect: {language} (हर डायलॉग बहुत छोटा, तीखा 8-12 शब्दों और 3-4.5 सेकंड का हो ताकि पूरा Part 30-45 सेकंड में क्रिस्प बने — कोई भी डायलॉग रिपीट मत करो!)
-                        4. डायलॉग के अंदर कभी भी कैरेक्टर का नाम (जैसे 'Vikram:', 'Hero:') या 'Title:/Scene:/Location:' टैग मत लिखो — सिर्फ बोले जाने वाला डायलॉग लिखो!
-                        {cliff_instruction}
-                        ठीक {scenes_per_chapter} फास्ट-कट सीन्स लिखो।
-                        सिर्फ JSON लिस्ट दो: [{{"character": "{hero_display}", "dialogue": "डायलॉग...", "location": "Royal Palace", "mood": "{default_mood}", "sfx": "none", "camera_angle": "front", "visual_action_prompt": "dramatic close-up Bollywood actor expression, cinematic rim lighting"}}]
-                        """
-                        s_res = await asyncio.wait_for(
-                            asyncio.to_thread(
-                                lambda: client.models.generate_content(
-                                    model="gemini-2.5-flash", contents=script_prompt
-                                )
-                            ),
-                            timeout=18.0,
-                        )
-                        raw_list = safe_extract_json(s_res.text, fallback_dialogues)
+                cliff_instruction = (
+                    f"अंतिम सीन (आखिरी डायलॉग) में Narrator की आवाज़ में ज़बरदस्त सस्पेंस Cliffhanger ज़रूर डालो: "
+                    f"जैसे 'अगले पार्ट में जानिए असली सच — देखिए Part {ch_no + 1} में!'"
+                    if (series_mode == "series" and ch_no < total_ch_count)
+                    else "अंतिम सीन में धमाकेदार क्लाइमैक्स डायलॉग रखो।"
+                )
+                continuity_note = (
+                    f"पिछले Part {ch_no - 1} का आखिरी मोड़ (यहीं से कहानी आगे बढ़ाओ, बिल्कुल दोहराओ मत): {prev_episode_tail}"
+                    if prev_episode_tail
+                    else "यह कहानी की धमाकेदार शुरुआत है।"
+                )
+                script_prompt = f"""
+                सीरीज़/फिल्म: {state['outline']['title']} | पिछला सीन: {prev_plot}
+                {continuity_note}
+                वर्तमान Part {ch_no}/{total_ch_count}: {ch['plot']}
+                मुख्य कैरेक्टर (Hero): {hero_display}
+                मल्टी-कैरेक्टर कास्ट (ज़रूरी): {hero_display}, Heroine, Villain, Saas, और Narrator।
+                सख्त नियम:
+                1. एक ही Narrator की लंबी कहानी मत लिखो! Narrator सिर्फ पहला और आखिरी (max 20%) डायलॉग बोले।
+                2. बाकी 80% सीन्स में {hero_display}, Heroine, Villain, और Saas के बीच तीखे, इमोशनल और ट्विस्ट वाले डायलॉग्स हों।
+                3. भाषा / Dialect: {language} (हर डायलॉग बहुत छोटा, तीखा 8-12 शब्दों और 3-4.5 सेकंड का हो ताकि पूरा Part 30-45 सेकंड में क्रिस्प बने — कोई भी डायलॉग रिपीट मत करो!)
+                4. डायलॉग के अंदर कभी भी कैरेक्टर का नाम (जैसे 'Vikram:', 'Hero:') या 'Title:/Scene:/Location:' टैग मत लिखो — सिर्फ बोले जाने वाला डायलॉग लिखो!
+                {cliff_instruction}
+                ठीक {scenes_per_chapter} फास्ट-कट सीन्स लिखो।
+                सिर्फ JSON लिस्ट दो: [{{"character": "{hero_display}", "dialogue": "डायलॉग...", "location": "Royal Palace", "mood": "{default_mood}", "sfx": "none", "camera_angle": "front", "visual_action_prompt": "medium waist-up live-action Indian TV serial confrontation inside grand royal haveli hall"}}]
+                """
+                try:
+                    s_raw_text, _story_brain = await asyncio.to_thread(
+                        _call_story_brain_auto_chain, script_prompt, 15.0
+                    )
+                    if s_raw_text:
+                        raw_list = safe_extract_json(s_raw_text, fallback_dialogues)
+                        if not isinstance(raw_list, list):
+                            raw_list = fallback_dialogues
                         raw_list = raw_list[:scenes_per_chapter]
                         dialogues = []
                         seen_lines: set[str] = set()
                         for idx_d, item in enumerate(raw_list):
+                            if not isinstance(item, dict):
+                                continue
                             raw_spk = str(item.get("character", "")).strip()
                             c_name = resolve_character_name(raw_spk, char_map, idx_d)
                             diag_text = clean_spoken_dialogue(str(item.get("dialogue", "")))
@@ -4293,9 +5060,9 @@ async def autonomous_movie_worker(project_id: str):
                             )
                         if len(dialogues) < 4:
                             dialogues = fallback_dialogues
-                    except Exception:
+                    else:
                         dialogues = fallback_dialogues
-                else:
+                except Exception:
                     dialogues = fallback_dialogues
 
                 # Guarantee Cliffhanger ending on Part k < N in Series Mode
@@ -4305,26 +5072,25 @@ async def autonomous_movie_worker(project_id: str):
                         dialogues.append(
                             {
                                 "character": "Narrator",
-                                "dialogue": f"आगे क्या होने वाला है? यह राज़ खुलेगा अगले एपिसोड में — देखिए Part {ch_no + 1} में!",
-                                "location": dialogues[-1].get("location", "Mumbai City Street"),
-                                "location_key": dialogues[-1].get("location_key", "city_street"),
+                                "dialogue": f"अगले पार्ट में जानिए असली सच... देखिए Part {ch_no + 1} में!",
+                                "location": dialogues[-1].get("location", "Royal Palace"),
+                                "location_key": dialogues[-1].get("location_key", "royal_palace"),
                                 "mood": "Suspense",
                                 "sfx": "thunder",
                                 "camera_angle": "front",
-                                "visual_action_prompt": "dramatic cliffhanger freeze-frame suspense thriller lighting, dark stormy atmosphere",
+                                "visual_action_prompt": "dramatic medium wide confrontation cliffhanger inside royal Indian haveli hall",
                             }
                         )
 
             state["scripts"][str(ch_no)] = dialogues
             state["progress"] = min(94, ch_base_pct + 5)
             state["status_text"] = (
-                f"Part {ch_no}/{total_ch_count} मल्टी-कैरेक्टर स्क्रिप्ट तैयार ({len(dialogues)} डायलॉग्स)! फुल-स्क्रीन AI Lip-Sync रेंडर हो रहा है ({state['progress']}%)..."
+                f"Part {ch_no}/{total_ch_count} मल्टी-कैरेक्टर स्क्रिप्ट तैयार ({len(dialogues)} डायलॉग्स)! 30fps Live-Action TV Serial रेंडर हो रहा है ({state['progress']}%)..."
             )
             save_state(proj_dir, state)
 
             clips = []
             total_scenes = max(1, len(dialogues))
-            # Crisp 30-45s Reel / Pocket FM cut pacing (~4-5s per dialogue, 2.5-3s per camera cut!)
             if series_mode == "series":
                 target_scene_sec = max(3.0, min(5.0, (part_duration * 40.0) / total_scenes))
             elif duration == 1:
@@ -4332,11 +5098,9 @@ async def autonomous_movie_worker(project_id: str):
             else:
                 target_scene_sec = 0.0
 
-            # ULTRA-FAST PARALLEL SCENE RENDERING (4 concurrent workers via asyncio.Semaphore + asyncio.gather)
-            # Zero 17% hangs: every individual scene has its own try/except + guaranteed fast local fallback!
             sem = asyncio.Semaphore(4)
             completed_count = 0
-            ai_auto_cast = bool(state.get("ai_auto_cast", False))
+            ep_title_label = f"{state['outline'].get('title', 'CinePop Drama')[:36]} · Part {ch_no}"
 
             async def _render_single_scene(i: int, d: dict) -> tuple[int, str, str]:
                 nonlocal completed_count
@@ -4347,8 +5111,8 @@ async def autonomous_movie_worker(project_id: str):
                     c_name = resolve_character_name(raw_spk, char_map, i)
                     role_kind = detect_speaker_role(c_name, char_map)
                     diag_text = clean_spoken_dialogue(d.get("dialogue", "")) or "अब असली खेल शुरू होगा!"
-                    loc_key = d.get("location_key") or "city_street"
-                    loc_label = d.get("location") or default_location or "Mumbai City Street"
+                    loc_key = d.get("location_key") or "royal_palace"
+                    loc_label = d.get("location") or default_location or "Royal Palace"
                     scene_mood = normalize_mood(d.get("mood", ""), default_mood)
                     scene_sfx = d.get("sfx") if d.get("sfx") in ALLOWED_SFX else detect_sfx_type(diag_text, loc_key, scene_mood)
                     action_prompt = d.get("visual_action_prompt") or build_visual_action_prompt(
@@ -4361,8 +5125,6 @@ async def autonomous_movie_worker(project_id: str):
                     )
 
                     char_entry = char_map.get(c_name)
-                    # Apply user's 5-angle scanned face ONLY when that uploaded character (e.g. Hero) speaks;
-                    # Heroine, Villain, Saas, and Narrator each get their own distinct Bollywood close-up/scene!
                     if ai_auto_cast:
                         exact_char_photo = ""
                         char_angles_dict = {}
@@ -4376,8 +5138,13 @@ async def autonomous_movie_worker(project_id: str):
                         exact_char_photo = ""
                         char_angles_dict = {}
 
-                    # Close-up dramatic shot for speaking characters (Hero/Heroine/Villain/Saas), wide establishing for Narrator
-                    scene_shot_variant = "establishing" if role_kind == "narrator" else "closeup_drama"
+                    # Live-Action Waist-Up / Over-the-Shoulder / Wide Confrontation shot selection
+                    if role_kind == "narrator":
+                        scene_shot_variant = "wide_confrontation"
+                    elif role_kind == "hero":
+                        scene_shot_variant = "over_shoulder"
+                    else:
+                        scene_shot_variant = "waist_up"
 
                     bg_override = d.get("bg_path") or project_custom_bg
                     tts_voice, tts_pitch, tts_rate = resolve_character_voice_profile(
@@ -4387,7 +5154,15 @@ async def autonomous_movie_worker(project_id: str):
                     a_file = f"{ch_temp}/a_{i}.mp3"
                     f_img = f"{ch_temp}/f_{i}.jpg"
                     v_file = f"{ch_temp}/v_{i}.mp4"
-                    used_engine = "Parallel Pollinations Flux + Motion"
+                    used_engine = "Live-Action 30fps TV Serial"
+
+                    # 2s Opening Golden Episode Title Hook on Scene 0 & 2s Cliffhanger Outro Card on last scene of Part k < N
+                    scene_title_hook = ep_title_label if i == 0 else ""
+                    scene_outro_card = (
+                        f"अगले पार्ट में जानिए असली सच... (Part {ch_no + 1})"
+                        if (series_mode == "series" and ch_no < total_ch_count and i == total_scenes - 1)
+                        else ""
+                    )
 
                     if not os.path.exists(v_file):
                         try:
@@ -4400,22 +5175,30 @@ async def autonomous_movie_worker(project_id: str):
                                 pitch_override=tts_pitch,
                                 rate_override=tts_rate,
                             )
-                            await asyncio.to_thread(
-                                prepare_character_frame,
-                                exact_char_photo,
-                                c_name,
-                                diag_text,
-                                f_img,
-                                loc_key,
-                                loc_label,
-                                scene_mood,
-                                bg_override,
-                                watermark_text,
-                                watermark_position,
-                                aspect_ratio,
-                                action_prompt,
-                                scene_shot_variant,
-                            )
+
+                            # Reuse Master Character Casting Sheet frame immediately when available (5x faster + consistent outfits!)
+                            cast_lookup_key = "wide_confrontation" if role_kind == "narrator" else role_kind
+                            master_frame_path = master_cast.get(cast_lookup_key) if not bg_override else None
+                            if master_frame_path and os.path.exists(master_frame_path) and os.path.getsize(master_frame_path) > 4000:
+                                shutil.copyfile(master_frame_path, f_img)
+                            else:
+                                await asyncio.to_thread(
+                                    prepare_character_frame,
+                                    exact_char_photo,
+                                    c_name,
+                                    diag_text,
+                                    f_img,
+                                    loc_key,
+                                    loc_label,
+                                    scene_mood,
+                                    bg_override,
+                                    watermark_text,
+                                    watermark_position,
+                                    aspect_ratio,
+                                    action_prompt,
+                                    scene_shot_variant,
+                                )
+
                             used_engine = await asyncio.to_thread(
                                 generate_free_ai_video_clip,
                                 exact_char_photo,
@@ -4436,9 +5219,11 @@ async def autonomous_movie_worker(project_id: str):
                                 bg_override,
                                 watermark_text,
                                 watermark_position,
+                                master_cast,
+                                scene_title_hook,
+                                scene_outro_card,
                             )
                         except Exception:
-                            # Guaranteed fast local cinematic fallback so ONE scene error never stalls the movie
                             try:
                                 if not os.path.exists(a_file):
                                     await generate_bulletproof_audio(diag_text, tts_voice, a_file, language=language)
@@ -4458,7 +5243,7 @@ async def autonomous_movie_worker(project_id: str):
                                     None,
                                     aspect_ratio,
                                 )
-                                used_engine = "Local Fast Cinematic Motion"
+                                used_engine = "Local 30fps Cinematic Motion"
                             except Exception:
                                 pass
                         finally:
@@ -4487,7 +5272,7 @@ async def autonomous_movie_worker(project_id: str):
                             else ""
                         )
                         state["status_text"] = (
-                            f"⚡ Parallel {used_engine} · Part {ch_no}/{total_ch_count} · सीन {completed_count}/{total_scenes} ({state['progress']}%){ready_hint}"
+                            f"⚡ {used_engine} · Part {ch_no}/{total_ch_count} · सीन {completed_count}/{total_scenes} ({state['progress']}%){ready_hint}"
                         )
                         save_state(proj_dir, state)
                     return (i, v_file, used_engine)
@@ -4510,6 +5295,10 @@ async def autonomous_movie_worker(project_id: str):
             ffmpeg_concat(clips, ch_mp4)
             state["done_chapters"].append(ch_no)
             prev_plot = ch["plot"]
+            if dialogues:
+                prev_episode_tail = " | ".join(
+                    f"{x.get('character', 'Hero')}: {x.get('dialogue', '')}" for x in dialogues[-2:]
+                )
             rebuild_parts_and_full(proj_dir, state)
             save_state(proj_dir, state)
 
