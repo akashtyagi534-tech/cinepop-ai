@@ -19,6 +19,7 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Union
 import requests
+import httpx
 import edge_tts
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps, ImageEnhance
@@ -313,22 +314,60 @@ def clean_spoken_dialogue(raw_text: str) -> str:
 
 
 def detect_speaker_role(speaker_name: str, char_map: Optional[dict] = None) -> str:
-    """Classify speaker as 'narrator', 'hero', 'villain', 'saas', 'female', or 'crowd' for distinct voices & visuals."""
+    """
+    Classify speaker into strict Male/Female role buckets so Male speakers NEVER get a Female voice/photo
+    and Female speakers NEVER get a Male voice/photo:
+    - Male roles: 'hero' (Hero, Raja, Rajkumar, Inspector, Officer, Beta, Pati),
+                  'villain' (Villain, Bhoot, Tantrik, Mantri, Senapati, Don, Boss, Gunda, Rakshas, Shaitan,chor),
+                  'narrator' (Narrator, Sutradhar)
+    - Female roles: 'female' (Heroine, Rani, Rajkumari, Nayika, Ladki, Patni, Bahu, Priya, Kavya),
+                    'saas' (Saas, Chudail, Dayan, Maharani,Rajmata, Maa, Bua, Aunty)
+    """
     low = (speaker_name or "").lower().strip()
     char_map = char_map or {}
     char_names = list(char_map.keys())
     if any(k in low for k in ("narrator", "sutradhar", "voiceover", "storyteller", "सूत्रधार", "कथावाचक", "नैरेटर")):
         return "narrator"
-    if any(k in low for k in ("log", "crowd", "public", "villager", "people", "लोग", "भीड़", "जनता", "गाँव वाले", "गांव वाले", "police", "पुलिस")):
-        return "crowd"
-    if any(k in low for k in ("saas", "mother-in-law", "stepmother", "aunty", "chachi", "maa", "mother", "सास", "सौतेली", "बुआ", "माँ", "मम्मी")):
+    if any(
+        k in low
+        for k in (
+            "saas", "mother-in-law", "stepmother", "aunty", "chachi", "maa", "mother", "bua",
+            "chudail", "dayan", "daayan", "witch", "rajmata", "maharani", "malkin", "dadi", "nani",
+            "सास", "सौतेली", "बुआ", "माँ", "मम्मी", "चुड़ैल", "डायन", "राजमाता", "महारानी", "मालकिन", "दादी", "चाची",
+        )
+    ):
         return "saas"
-    if any(k in low for k in ("villain", "rival", "don", "kaal", "boss", "gunda", "evil", "enemy", "rakshas", "shaitan", "विलेन", "डॉन", "गुंडा", "दुश्मन", "काल", "साला", "दामाद")):
-        return "villain"
-    if any(k in low for k in ("heroine", "नायिका", "priya", "kavya", "काव्या", "pooja", "anjali", "meera", "rani", "wife", "bahu", "girl", "woman", "ladki", "lady", "लड़की", "रानी", "बहन", "पत्नी", "बहू")):
+    if any(
+        k in low
+        for k in (
+            "heroine", "nayika", "नायिका", "priya", "kavya", "काव्या", "pooja", "anjali", "meera",
+            "rani", "rajkumari", "princess", "queen", "wife", "bahu", "girl", "woman", "ladki", "lady",
+            "sister", "behen", "beti", "dost_f", "लड़की", "रानी", "राजकुमारी", "बहन", "पत्नी", "बहू", "प्रिया", "मीरा", "बेटी",
+        )
+    ):
         return "female"
-    if any(k in low for k in ("hero", "नायक", "हीरो")):
+    if any(
+        k in low
+        for k in (
+            "villain", "rival", "don", "kaal", "boss", "gunda", "evil", "enemy", "rakshas", "shaitan",
+            "bhoot", "ghost", "tantrik", "mantri", "senapati", "mahamantri", "chor", "daku", "smuggler",
+            "sarpanch", "zamindar", "thakur", "criminal", "killer", "monster",
+            "विलेन", "डॉन", "गुंडा", "दुश्मन", "काल", "साला", "दामाद", "भूत", "तांत्रिक", "मंत्री", "महामंत्री",
+            "सेनापति", "राक्षस", "शैतान", "चोर", "डाकू", "ठाकुर", "ज़मींदार", "जमींदार", "अघोरी",
+        )
+    ):
+        return "villain"
+    if any(
+        k in low
+        for k in (
+            "hero", "raja", "king", "rajkumar", "prince", "inspector", "police", "officer", "captain",
+            "sipahi", "detective", "beta", "pati", "bhai", "dost", "vaidya", "pandit",
+            "नायक", "हीरो", "राजा", "महाराज", "राजकुमार", "इंस्पेक्टर", "पुलिस", "अफसर", "सिपाही", "बेटा", "पति", "भाई",
+        )
+    ):
         return "hero"
+    if any(k in low for k in ("log", "crowd", "public", "villager", "people", "लोग", "भीड़", "जनता", "गाँव वाले", "गांव वाले", "दरबारी")):
+        return "crowd"
     if char_names and speaker_name == char_names[0]:
         return "hero"
     if len(char_names) >= 2 and speaker_name == char_names[1]:
@@ -342,6 +381,16 @@ def detect_speaker_role(speaker_name: str, char_map: Optional[dict] = None) -> s
     return "hero"
 
 
+def is_female_speaker_role(role: str, speaker_name: str = "") -> bool:
+    """Strict gender check: True ONLY for female roles ('female', 'saas')."""
+    r = (role or "").lower().strip()
+    if r in ("female", "saas"):
+        return True
+    if r in ("hero", "villain", "narrator", "crowd"):
+        return False
+    return detect_speaker_role(speaker_name, None) in ("female", "saas")
+
+
 def resolve_character_voice_profile(
     speaker_name: str,
     char_entry: Optional[dict],
@@ -350,79 +399,66 @@ def resolve_character_voice_profile(
     scene_idx: int = 0,
 ) -> tuple[str, str, str]:
     """
-    Return distinct (edge_tts_voice, pitch_hz, rate_pct) per Pocket FM / Bollywood drama role:
-    - Hero: hi-IN-MadhurNeural, bold heroic pitch="+3Hz", rate="+2%"
-    - Heroine / Ladki: hi-IN-SwaraNeural, expressive female pitch="+4Hz", rate="+2%"
-    - Villain / Boss: hi-IN-MadhurNeural, deep heavy pitch="-12Hz", rate="-6%"
-    - Saas / Maa: hi-IN-SwaraNeural, sharp dramatic pitch="+6Hz", rate="+4%"
-    - Narrator: hi-IN-MadhurNeural, cinematic storyteller pitch="-4Hz", rate="+3%"
-    - Crowd / Log: dynamic alternating pitch variants
+    STRICT GENDER-LOCKED VOICE PROFILE (Aadmi Ki Aawaz Me Aadmi, Aurat Ki Aawaz Me Aurat!):
+    - Male roles (`hero`, `villain`, `narrator`, `crowd` / Hero, Raja, Villain, Mantri, Bhoot, Inspector, Narrator)
+      -> STRICTLY Male Voice (`hi-IN-MadhurNeural` / `en-IN-PrabhatNeural`)
+    - Female roles (`female`, `saas` / Heroine, Rani, Saas, Nayika, Chudail, Rajkumari)
+      -> STRICTLY Female Voice (`hi-IN-SwaraNeural` / `en-IN-NeerjaNeural`)
     """
     lang = normalize_language(language)
     role = detect_speaker_role(speaker_name, char_map)
-    raw_pitch_key = normalize_pitch((char_entry or {}).get("pitch", "normal"))
-    explicit_voice = str((char_entry or {}).get("voice", "") or "").strip()
+    is_female = is_female_speaker_role(role, speaker_name)
 
     if lang == "English":
+        if is_female:
+            if role == "saas":
+                return ("en-IN-NeerjaNeural", "+6Hz", "+4%")
+            return ("en-IN-NeerjaNeural", "+4Hz", "+2%")
         if role == "narrator":
             return ("en-IN-PrabhatNeural", "-4Hz", "+3%")
-        if role == "saas":
-            return ("en-IN-NeerjaNeural", "+6Hz", "+4%")
-        if role in ("female", "crowd") or "Swara" in explicit_voice or "Neerja" in explicit_voice:
-            return ("en-IN-NeerjaNeural", "+4Hz" if role == "female" else "+8Hz", "+2%")
         if role == "villain":
             return ("en-IN-PrabhatNeural", "-12Hz", "-6%")
         return ("en-IN-PrabhatNeural", "+3Hz", "+2%")
 
-    if raw_pitch_key != "normal" and raw_pitch_key in PITCH_PRESETS:
-        p = PITCH_PRESETS[raw_pitch_key]
-        v = explicit_voice if explicit_voice else ("hi-IN-SwaraNeural" if role in ("female", "saas", "crowd") else "hi-IN-MadhurNeural")
-        if v == "en-IN-PrabhatNeural":
-            v = "hi-IN-MadhurNeural"
-        return (v, p["pitch"], p["rate"])
+    # Hindi strict gender lock: Female -> hi-IN-SwaraNeural ONLY, Male -> hi-IN-MadhurNeural ONLY
+    if is_female:
+        if role == "saas":
+            return ("hi-IN-SwaraNeural", "+6Hz", "+4%")
+        return ("hi-IN-SwaraNeural", "+4Hz", "+2%")
 
     if role == "narrator":
         return ("hi-IN-MadhurNeural", "-4Hz", "+3%")
     if role == "villain":
         return ("hi-IN-MadhurNeural", "-12Hz", "-6%")
-    if role == "saas":
-        return ("hi-IN-SwaraNeural", "+6Hz", "+4%")
     if role == "crowd":
-        crowd_variants = [
-            ("hi-IN-SwaraNeural", "+6Hz", "+6%"),
-            ("hi-IN-MadhurNeural", "+8Hz", "+8%"),
-            ("hi-IN-SwaraNeural", "-4Hz", "+4%"),
-        ]
-        return crowd_variants[scene_idx % len(crowd_variants)]
-    if role == "female" or "Swara" in explicit_voice:
-        return ("hi-IN-SwaraNeural", "+4Hz", "+2%")
+        return ("hi-IN-MadhurNeural", "+6Hz", "+5%")
     return ("hi-IN-MadhurNeural", "+3Hz", "+2%")
 
 
 def _get_or_create_role_portrait(role_kind: str, proj_dir: str) -> Optional[str]:
     """
-    Generate and cache a realistic Bollywood character close-up portrait when
+    Generate and cache a realistic Bollywood character portrait when
     the script introduces Heroine, Villain, Saas, or Crowd speakers that the user did not upload a photo for.
     """
     role_map = {
         "villain": (
             "villain",
-            "Close-up cinematic portrait of dramatic Indian Bollywood villain man with intense eyes, dark beard, sharp tailored coat, moody rim lighting, 4K film still, photorealistic, looking at camera",
+            "Medium waist-up cinematic portrait of dramatic Indian Bollywood villain man with intense eyes, dark beard, sharp tailored coat, moody rim lighting, 4K film still, photorealistic, male actor only",
             42,
         ),
         "saas": (
             "saas",
-            "Close-up cinematic portrait of wealthy dramatic Indian matriarch saas woman in rich silk saree and gold jewelry, sharp intimidating expression, Bollywood mansion rim lighting, 4K film still, photorealistic",
+            "Medium waist-up cinematic portrait of wealthy dramatic Indian matriarch woman in rich silk saree and gold jewelry, sharp intimidating expression, Bollywood palace rim lighting, 4K film still, photorealistic, female actress only",
             63,
         ),
         "female": (
             "heroine",
-            "Close-up cinematic portrait of expressive young Indian Bollywood heroine actress in stylish ethnic attire, emotional eyes, warm dramatic rim lighting, 4K film still, photorealistic, looking at camera",
+            "Medium waist-up cinematic portrait of expressive young Indian Bollywood heroine actress in royal ethnic attire, emotional eyes, warm dramatic rim lighting, 4K film still, photorealistic, female actress only",
             77,
         ),
         "crowd": (
             "crowd",
-            "Cinematic Bollywood movie shot of expressive Indian street crowd people reacting excitedly in dramatic city night lighting, photorealistic 4K film still, clear faces",
+            "Cinematic Bollywood movie shot of expressive Indian royal court people reacting in dramatic palace lighting, photorealistic 4K film still, clear faces",
             99,
         ),
     }
@@ -452,7 +488,7 @@ def _get_or_create_role_portrait(role_kind: str, proj_dir: str) -> Optional[str]
 
 
 def resolve_character_name(raw_name: object, char_map: dict, fallback_idx: int = 0) -> str:
-    """Resolve dialogue speaker accurately: preserves Heroine/Villain/Saas/Narrator/Crowd distinctly, and locks Hero to user's primary character."""
+    """Resolve dialogue speaker accurately: preserves topic-specific roles (Raja/Rani/Bhoot/Tantrik/Mantri/Heroine/Villain/Saas/Narrator) with strict gender separation."""
     char_names = list(char_map.keys())
     raw = str(raw_name or "").strip().strip(":：").strip()
     if not char_names:
@@ -464,30 +500,40 @@ def resolve_character_name(raw_name: object, char_map: dict, fallback_idx: int =
         for cn in char_names:
             if cn.lower() == raw_low:
                 return cn
-        for cn in char_names:
-            cn_low = cn.lower()
-            if cn_low in raw_low or raw_low in cn_low:
-                return cn
-            cn_first = cn_low.split()[0]
-            raw_first = raw_low.split()[0]
-            if len(cn_first) >= 2 and cn_first == raw_first:
-                return cn
-        if raw_low in ("hero", "हीरो", "नायक"):
-            return char_names[0]
-        if any(k in raw_low for k in ("narrator", "sutradhar", "सूत्रधार", "नैरेटर")):
+        if any(k in raw_low for k in ("narrator", "sutradhar", "सूत्रधार", "नैरेटर", "कथावाचक")):
             return "Narrator"
+        if any(k in raw_low for k in ("chudail", "dayan", "daayan", "witch", "चुड़ैल", "डायन")):
+            return "Chudail"
+        if any(k in raw_low for k in ("rajmata", "राजमाता")):
+            return "Rajmata"
         if any(k in raw_low for k in ("saas", "सास", "माँ", "mother-in-law")):
             return "Saas"
-        if any(k in raw_low for k in ("heroine", "नायिका", "पत्नी", "बहू", "ladki", "लड़की", "priya", "kavya", "meera")):
+        if any(k in raw_low for k in ("rani", "रानी", "महारानी", "maharani", "queen")):
+            return "Rani"
+        if any(k in raw_low for k in ("rajkumari", "राजकुमारी", "princess")):
+            return "Rajkumari"
+        if any(k in raw_low for k in ("heroine", "nayika", "नायिका", "पत्नी", "बहू", "ladki", "लड़की", "priya", "kavya", "meera")):
             for cn in char_names:
                 if detect_speaker_role(cn, char_map) == "female":
                     return cn
             return "Heroine"
-        if any(k in raw_low for k in ("villain", "rival", "don", "kaal", "boss", "विलेन", "डॉन", "दुश्मन", "काल")):
+        if any(k in raw_low for k in ("bhoot", "ghost", "भूत", "प्रेत")):
+            return "Bhoot"
+        if any(k in raw_low for k in ("tantrik", "तांत्रिक", "अघोरी")):
+            return "Tantrik"
+        if any(k in raw_low for k in ("mantri", "मंत्री", "महामंत्री", "senapati", "सेनापति")):
+            return "Mantri"
+        if any(k in raw_low for k in ("villain", "rival", "don", "kaal", "boss", "विलेन", "डॉन", "दुश्मन", "काल", "गद्दार")):
             return "Villain"
+        if any(k in raw_low for k in ("hero", "हीरो", "नायक", "raja", "राजा", "महाराज", "rajkumar", "राजकुमार", "inspector", "इंस्पेक्टर")):
+            return char_names[0]
         if any(k in raw_low for k in ("log", "crowd", "public", "people", "लोग", "भीड़", "जनता", "गाँव वाले")):
             return "Crowd"
-    return char_names[fallback_idx % len(char_names)]
+        for cn in char_names:
+            cn_low = cn.lower()
+            if cn_low in raw_low or raw_low in cn_low:
+                return cn
+    return raw or char_names[fallback_idx % len(char_names)]
 
 PITCH_PRESETS = {
     "normal": {"pitch": "+2Hz", "rate": "+0%", "label": "Hero Clear"},
@@ -745,6 +791,650 @@ def get_runtime_ai_config() -> dict:
         return normalize_ai_config(db.get("ai_config"))
     except Exception:
         return dict(DEFAULT_AI_CONFIG)
+
+
+# ==============================================================================
+# CINEPOP AI - SMART AI FILM DIRECTOR & AUTO-FAILOVER ENGINE (v12 MASTER)
+# ==============================================================================
+
+# 1. ADMIN PANEL DYNAMIC API VAULT (Auto-Switch Priority Chain)
+RUNTIME_API_VAULT = {
+    "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", ""),
+    "GROQ_API_KEY": os.getenv("GROQ_API_KEY", ""),
+    "CF_ACCOUNT_ID": os.getenv("CF_ACCOUNT_ID", ""),
+    "CF_API_TOKEN": os.getenv("CF_API_TOKEN", ""),
+    "TOGETHER_API_KEY": os.getenv("TOGETHER_API_KEY", ""),
+    "HF_TOKEN": os.getenv("HF_TOKEN", ""),
+    "CUSTOM_HF_SPACE": os.getenv("CUSTOM_HF_SPACE", "black-forest-labs/FLUX.1-schnell"),
+}
+
+API_HEALTH_STATUS = {
+    "gemini": "standby",
+    "groq": "standby",
+    "cloudflare": "standby",
+    "together": "standby",
+    "huggingface": "standby",
+    "pollinations": "active",
+}
+
+_VAULT_TO_AI_CONFIG_KEY = {
+    "GEMINI_API_KEY": "gemini_api_key",
+    "GROQ_API_KEY": "groq_api_key",
+    "CF_ACCOUNT_ID": "cf_account_id",
+    "CF_API_TOKEN": "cf_api_token",
+    "TOGETHER_API_KEY": "together_api_key",
+    "HF_TOKEN": "hf_token",
+    "CUSTOM_HF_SPACE": "custom_video_space",
+}
+
+
+def _sync_runtime_api_vault_from_config(cfg: Optional[dict] = None) -> dict:
+    """Keep RUNTIME_API_VAULT hydrated from persistent Admin ai_config + env fallback."""
+    active_cfg = cfg if isinstance(cfg, dict) else get_runtime_ai_config()
+    for vault_k, cfg_k in _VAULT_TO_AI_CONFIG_KEY.items():
+        val = str(active_cfg.get(cfg_k) or "").strip()
+        if val:
+            RUNTIME_API_VAULT[vault_k] = val
+        elif not RUNTIME_API_VAULT.get(vault_k):
+            default_v = "black-forest-labs/FLUX.1-schnell" if vault_k == "CUSTOM_HF_SPACE" else ""
+            RUNTIME_API_VAULT[vault_k] = os.getenv(vault_k, default_v).strip()
+    return RUNTIME_API_VAULT
+
+
+# 2. DYNAMIC TOPIC-AWARE CHARACTER & SCENE PROMPTS (Waist-Up Only & Strict Male/Female Visual Lock!)
+TV_SERIAL_SET_BASE = (
+    "Live-action Indian Hindi TV drama frame, warm cinematic lighting, 35mm DSLR camera, "
+    "medium waist-up framing showing full upper body and expressive hand gestures, realistic skin texture, no cartoon, no extreme close-up."
+)
+
+CHARACTER_PROMPTS = {
+    "Wide_Confrontation": (
+        f"Medium wide two-shot confrontation inside a grand royal Indian palace hall with chandeliers and carved arches, {TV_SERIAL_SET_BASE} "
+        "Handsome Indian male hero in royal embroidered bandhgala sherwani standing face-to-face confronting menacing Indian male antagonist in dark royal cloak, "
+        "while young Indian female heroine in crimson silk lehenga-saree stands nearby."
+    ),
+    "Hero": (
+        f"Medium over-the-shoulder waist-up shot of ONE handsome young Indian MALE actor only (man with short hair and trimmed beard), {TV_SERIAL_SET_BASE} "
+        "wearing tailored black-and-gold royal bandhgala suit standing firmly and speaking with confident hand gesture inside grand Indian palace hall, no woman in foreground."
+    ),
+    "Heroine": (
+        f"Medium waist-up shot of ONE young Indian FEMALE actress only (woman), {TV_SERIAL_SET_BASE} "
+        "wearing crimson Banarasi silk saree and traditional gold jhumkas speaking with expressive emotional eyes inside grand Indian palace hall, no man in foreground."
+    ),
+    "Villain": (
+        f"Medium waist-up shot of ONE menacing Indian MALE villain actor only (man with sharp beard and intense eyes), {TV_SERIAL_SET_BASE} "
+        "wearing dark royal velvet coat standing face-to-face and speaking with angry smirk and pointing finger inside grand Indian hall, strictly male actor."
+    ),
+    "Saas": (
+        f"Medium waist-up shot of ONE commanding older Indian FEMALE matriarch actress only (woman), {TV_SERIAL_SET_BASE} "
+        "wearing heavy maroon Banarasi silk saree, gold necklace and big bindi speaking dramatically with hand gesture inside grand Indian hall, strictly female actress."
+    ),
+    "Context_BRoll": (
+        "Cinematic insert B-Roll shot from an Indian live-action drama, grand illuminated royal Indian palace fortress gate at night with glowing torches, "
+        "dramatic mist, 8k DSLR live-action."
+    ),
+}
+
+
+def _detect_topic_story_archetype(topic: str) -> str:
+    """Classify user's topic so fallback stories & visual prompts match the EXACT topic (Raja/Bhoot, Jungle, Police, Comedy, or Drama)."""
+    low = (topic or "").lower()
+    has_ghost = any(
+        k in low
+        for k in (
+            "bhoot", "ghost", "pret", "atma", "aatma", "chudail", "dayan", "haunted", "horror", "tantrik", "shaitan", "kंकाल",
+            "भूत", "प्रेत", "आत्मा", "चुड़ैल", "डायन", "भुतहा", "हवेली का रहस्य", "तांत्रिक", "डरावनी", "श्राप", "काली शक्ति",
+        )
+    )
+    has_royal = any(
+        k in low
+        for k in (
+            "raja", "rani", "king", "queen", "mahal", "palace", "rajkumar", "rajkumari", "empire", "fort", "singhasan", "mantri", "senapati",
+            "राजा", "रानी", "महल", "राजकुमार", "राजकुमारी", "सिंहासन", "दरबार", "किला", "मंत्री", "सेनापति", "महाराज", "साम्राज्य",
+        )
+    )
+    if has_ghost and has_royal:
+        return "royal_ghost"
+    if has_ghost:
+        return "horror_ghost"
+    if has_royal:
+        return "royal_kingdom"
+    if any(k in low for k in ("jungle", "forest", "sher", "tiger", "lion", "janwar", "island", "cave", "जंगल", "शेर", "बाघ", "गुफा", "शिकार", "खज़ाना", "खजाना")):
+        return "jungle_adventure"
+    if any(k in low for k in ("police", "crime", "murder", "chor", "chori", "inspector", "jail", "court", "cbi", "detective", "don", "mafia", "पुलिस", "चोर", "चोरी", "इंस्पेक्टर", "जेल", "हत्या", "जुर्म", "गैंगस्टर")):
+        return "police_thriller"
+    if any(k in low for k in ("comedy", "funny", "mazaak", "hasna", "jugaad", "padosi", "kanjoos", "कॉमेडी", "मज़ाक", "मजाक", "हंसी", "जुगाड़", "पड़ोसी", "कंजूस")):
+        return "comedy_drama"
+    return "custom_topic"
+
+
+def get_dynamic_character_prompts(topic: str = "") -> dict[str, str]:
+    """
+    Build topic-accurate waist-up live-action prompts with STRICT gender locking:
+    - Hero & Villain are ALWAYS explicitly MALE actors.
+    - Heroine & Saas/Elder-Female are ALWAYS explicitly FEMALE actresses.
+    - When topic is Raja/Mahal/Bhoot, generates Indian King in royal sherwani & crown, Queen, Ghost/Tantrik, haunted palace!
+    """
+    archetype = _detect_topic_story_archetype(topic)
+    clean_t = re.sub(r"[^a-zA-Z0-9 ,.-]", " ", (topic or "")).strip()[:80]
+    topic_hint = f"Theme context: {clean_t}. " if clean_t else ""
+
+    if archetype in ("royal_ghost", "horror_ghost"):
+        set_base = (
+            f"Live-action Indian supernatural royal thriller drama frame, {topic_hint}"
+            "inside an ancient candle-lit haunted Indian royal palace darbar hall with mysterious blue-golden mist, "
+            "carved stone pillars, flickering मशाल torches, 35mm DSLR camera, medium waist-up framing showing full upper body and hand gestures, no cartoon, no extreme close-up."
+        )
+        return {
+            "Wide_Confrontation": (
+                f"Medium wide two-shot confrontation, {set_base} "
+                "Brave Indian King (Raja) in royal gold-embroidered sherwani, jeweled crown and sword hilt standing face-to-face confronting "
+                "a terrifying supernatural dark Tantrik Ghost (Bhoot) in tattered black-ash robes with glowing eerie eyes inside the haunted royal mahal."
+            ),
+            "Hero": (
+                f"Medium over-the-shoulder waist-up shot of ONE handsome Indian MALE King (Raja) only, {set_base} "
+                "man with royal beard wearing regal maroon-and-gold embroidered sherwani, royal crown (mukut) and pearl necklace, holding sword hilt and speaking bravely, strictly male actor."
+            ),
+            "Heroine": (
+                f"Medium waist-up shot of ONE beautiful Indian FEMALE Queen (Rani) only, {set_base} "
+                "woman wearing royal crimson-and-gold silk lehenga saree, royal crown jewelry and jhumkas speaking with worried emotional eyes inside haunted palace, strictly female actress."
+            ),
+            "Villain": (
+                f"Medium waist-up shot of ONE menacing supernatural Indian MALE Ghost / Tantrik (Bhoot) only, {set_base} "
+                "fierce man with ash-covered face, dark mystical robes, rudraksha beads and glowing supernatural aura confronting the King with dramatic hand gesture, strictly male actor."
+            ),
+            "Saas": (
+                f"Medium waist-up shot of ONE mysterious Indian FEMALE Rajmata / Royal Priestess only, {set_base} "
+                "older woman in dark maroon royal silk saree and heavy gold temple jewelry warning the royal court with dramatic hand gesture, strictly female actress."
+            ),
+            "Context_BRoll": (
+                "Cinematic insert B-Roll shot from an Indian supernatural royal drama, ancient haunted Indian maharaja fort palace under full moon night sky with lightning, "
+                "glowing torches, swirling fog at grand palace gates, 8k DSLR live-action."
+            ),
+        }
+
+    if archetype == "royal_kingdom":
+        set_base = (
+            f"Live-action Indian historical royal palace drama frame, {topic_hint}"
+            "inside a grand Rajputana royal darbar hall with golden throne, chandeliers, carved sandstone arches and royal guards in background, "
+            "35mm DSLR camera, medium waist-up framing showing full upper body and hand gestures, no cartoon, no extreme close-up."
+        )
+        return {
+            "Wide_Confrontation": (
+                f"Medium wide two-shot confrontation, {set_base} "
+                "Noble Indian King (Raja) in royal gold sherwani and jeweled turban standing face-to-face confronting "
+                "scheming royal minister (Mantri) in dark brocade robe inside the grand royal darbar."
+            ),
+            "Hero": (
+                f"Medium over-the-shoulder waist-up shot of ONE handsome Indian MALE King (Raja) only, {set_base} "
+                "man with royal mustache and beard wearing gold-embroidered royal sherwani, jeweled turban crown and pearl necklace speaking with commanding hand gesture, strictly male actor."
+            ),
+            "Heroine": (
+                f"Medium waist-up shot of ONE graceful Indian FEMALE Queen (Rani) only, {set_base} "
+                "woman wearing royal crimson silk Rajputi poshak lehenga, heavy gold kundan jewelry and maang-tikka speaking with expressive eyes, strictly female actress."
+            ),
+            "Villain": (
+                f"Medium waist-up shot of ONE cunning Indian MALE royal antagonist (Senapati / Mantri) only, {set_base} "
+                "bearded man in black-and-silver royal armor tunic speaking with arrogant smirk and pointing finger, strictly male actor."
+            ),
+            "Saas": (
+                f"Medium waist-up shot of ONE commanding Indian FEMALE Rajmata (Queen Mother) only, {set_base} "
+                "older royal woman in maroon Banarasi silk saree and heavy gold heritage jewelry speaking authoritatively in darbar, strictly female actress."
+            ),
+            "Context_BRoll": (
+                "Cinematic insert B-Roll shot of a grand illuminated Indian royal fort palace at dusk with flapping royal flags, "
+                "armored horses and glowing golden torches, 8k DSLR live-action."
+            ),
+        }
+
+    if archetype == "jungle_adventure":
+        set_base = (
+            f"Live-action Indian jungle adventure thriller frame, {topic_hint}"
+            "inside a misty ancient Indian forest temple ruin with golden sunbeams, torches and dense jungle foliage, "
+            "35mm DSLR camera, medium waist-up framing showing full upper body and hand gestures, no cartoon, no extreme close-up."
+        )
+        return {
+            "Wide_Confrontation": (
+                f"Medium wide two-shot confrontation, {set_base} "
+                "Brave Indian male adventurer hero in rugged jacket confronting dangerous male jungle poacher boss face-to-face near ancient forest temple."
+            ),
+            "Hero": (
+                f"Medium over-the-shoulder waist-up shot of ONE handsome young Indian MALE adventurer hero only, {set_base} "
+                "man with short beard in dark olive expedition jacket holding torch and speaking firmly, strictly male actor."
+            ),
+            "Heroine": (
+                f"Medium waist-up shot of ONE young Indian FEMALE explorer heroine only, {set_base} "
+                "woman in practical adventure kurti-jacket speaking urgently with expressive gesture in misty jungle, strictly female actress."
+            ),
+            "Villain": (
+                f"Medium waist-up shot of ONE ruthless Indian MALE jungle villain only, {set_base} "
+                "man with rugged beard and dark tactical vest confronting the hero with menacing gesture, strictly male actor."
+            ),
+            "Saas": (
+                f"Medium waist-up shot of ONE wise elder Indian FEMALE tribal guardian only, {set_base} "
+                "older woman in traditional forest shawl and silver jewelry warning about the jungle secret, strictly female actress."
+            ),
+            "Context_BRoll": (
+                "Cinematic insert B-Roll shot of a mystical ancient Indian jungle temple ruin at twilight with glowing torches, mist and roaring waterfall, 8k DSLR live-action."
+            ),
+        }
+
+    if archetype == "police_thriller":
+        set_base = (
+            f"Live-action Indian crime thriller TV drama frame, {topic_hint}"
+            "inside a dramatic Indian police investigation headquarters and city mansion hall with moody cinema lighting, "
+            "35mm DSLR camera, medium waist-up framing showing full upper body and hand gestures, no cartoon, no extreme close-up."
+        )
+        return {
+            "Wide_Confrontation": (
+                f"Medium wide two-shot confrontation, {set_base} "
+                "Sharp Indian male Police Officer in khaki uniform confronting powerful male crime boss in dark suit face-to-face."
+            ),
+            "Hero": (
+                f"Medium over-the-shoulder waist-up shot of ONE handsome Indian MALE Police Inspector hero only, {set_base} "
+                "man with trimmed mustache in crisp khaki IPS officer uniform speaking with commanding hand gesture, strictly male actor."
+            ),
+            "Heroine": (
+                f"Medium waist-up shot of ONE young Indian FEMALE investigative journalist / lawyer heroine only, {set_base} "
+                "woman in smart crimson ethnic blazer-saree holding evidence file and speaking boldly, strictly female actress."
+            ),
+            "Villain": (
+                f"Medium waist-up shot of ONE intimidating Indian MALE mafia don villain only, {set_base} "
+                "bearded man in black velvet blazer and sunglasses smirking and pointing finger, strictly male actor."
+            ),
+            "Saas": (
+                f"Medium waist-up shot of ONE senior Indian FEMALE judge / matriarch only, {set_base} "
+                "older woman in dignified maroon silk saree speaking sternly with hand gesture, strictly female actress."
+            ),
+            "Context_BRoll": (
+                "Cinematic insert B-Roll shot of Indian police beacon cars with flashing red-blue lights arriving outside a grand mansion gate at rainy night, 8k DSLR live-action."
+            ),
+        }
+
+    return dict(CHARACTER_PROMPTS)
+
+
+def _build_topic_aware_director_fallback(topic: str, part_num: int = 1, prev_cliffhanger: str = "") -> list[dict]:
+    """
+    100% TOPIC-AWARE HINDI MULTI-CHARACTER FALLBACK STORY:
+    Reads the user's exact topic (Raja/Bhoot, Jungle, Police, Comedy, or Custom Topic)
+    and builds an authentic 7-dialogue script with topic-accurate characters.
+    ZERO hardcoded 'ghar jamai / sasural' lines!
+    """
+    clean_t = re.sub(r"\(\s*Genre:.*?\)", "", (topic or "")).strip()
+    clean_t = re.sub(r"\s+", " ", clean_t).strip() or "रहस्यमयी महल का राज़"
+    short_t = clean_t[:48]
+    archetype = _detect_topic_story_archetype(clean_t)
+
+    if archetype == "royal_ghost":
+        if part_num == 1:
+            return [
+                {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"अमावस्या की आधी रात और {short_t} का खौफनाक राज़ आज खुलने वाला था!"},
+                {"speaker": "Rani", "emotion": "shocked", "broll": False, "dialogue": "महाराज रुक जाइए! उस बंद तहखाने से भयानक भूत की आवाज़ें आ रही हैं!"},
+                {"speaker": "Mantri", "emotion": "angry", "broll": False, "dialogue": "महाराज, जो भी उस शापित सिंहासन के पास गया, वह कभी ज़िंदा नहीं लौटा!"},
+                {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "एक राजा अपने राज्य और प्रजा की रक्षा के लिए किसी भूत से नहीं डरता!"},
+                {"speaker": "Bhoot", "emotion": "angry", "broll": False, "dialogue": "हाहाहा! राजा, इस महल और तेरे सिंहासन पर सदियों से मेरा कब्ज़ा है!"},
+                {"speaker": "Rajmata", "emotion": "shocked", "broll": False, "dialogue": "सावधान पुत्र! इस भूत की असली शक्ति उस काले ताबीज़ में छुपी है!"},
+                {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": "तभी राजा की तलवार चमकी और तहखाने का दरवाज़ा टूटा — आगे क्या हुआ?"},
+            ]
+        return [
+            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"Part {part_num} में राजा और महल के भूत का आमना-सामना चरम पर पहुँच गया!"},
+            {"speaker": "Bhoot", "emotion": "angry", "broll": False, "dialogue": "मेरी मायावी शक्ति के आगे तेरी तलवार कुछ नहीं कर सकती राजा!"},
+            {"speaker": "Rani", "emotion": "sad", "broll": False, "dialogue": "महाराज, राजमाता के बताए उस प्राचीन मंत्र और अग्नि-बाण का प्रयोग कीजिए!"},
+            {"speaker": "Mantri", "emotion": "shocked", "broll": False, "dialogue": "असंभव! महल के सारे स्तंभ हिल रहे हैं, यह भूत तो और शक्तिशाली हो रहा है!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "सत्य और धर्म की अग्नि के सामने तेरा हर काला जादू आज भस्म हो जाएगा!"},
+            {"speaker": "Bhoot", "emotion": "shocked", "broll": False, "dialogue": "नहीं! मेरा काला ताबीज़ कैसे टूट गया? मेरी शक्तियाँ खत्म हो रही हैं!"},
+            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": "राजा के एक प्रहार से शाप मिट गया और पूरे राज्य में फिर से उजाला छा गया!"},
+        ]
+
+    if archetype == "horror_ghost":
+        return [
+            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"काली रात के सन्नाटे में {short_t} का खौफनाक खेल शुरू हो चुका था!"},
+            {"speaker": "Heroine", "emotion": "shocked", "broll": False, "dialogue": "देखो! हवेली के आईने में कोई साया दिखाई दे रहा है, यहाँ से बाहर चलो!"},
+            {"speaker": "Bhoot", "emotion": "angry", "broll": False, "dialogue": "इस चौखट के अंदर आने वाला कोई भी इंसान आज रात बचकर नहीं जाएगा!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "डरो मत! मैं तुम्हें कुछ नहीं होने दूँगा, इसके पीछे ज़रूर कोई गहरा राज़ है!"},
+            {"speaker": "Saas", "emotion": "shocked", "broll": False, "dialogue": "यह कोई साधारण साया नहीं, पचास साल पुराना अधूरा इंतकाम जाग उठा है!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "आज इस रहस्य से पर्दा उठेगा और इस खौफ का हमेशा के लिए अंत होगा!"},
+            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": "तभी अचानक बिजली कड़की और बंद दरवाज़े के पीछे का असली सच सामने आ गया!"},
+        ]
+
+    if archetype == "royal_kingdom":
+        return [
+            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"शाही दरबार में {short_t} को लेकर सबसे बड़ा टकराव शुरू हो गया!"},
+            {"speaker": "Mantri", "emotion": "angry", "broll": False, "dialogue": "महाराज, पड़ोसी राज्य की सेना हमारी सीमा पर खड़ी है और खज़ाना खतरे में है!"},
+            {"speaker": "Rani", "emotion": "sad", "broll": False, "dialogue": "महाराज, हमारे ही दरबार में कोई गद्दार दुश्मनों को गुप्त संदेश भेज रहा है!"},
+            {"speaker": "Rajmata", "emotion": "angry", "broll": False, "dialogue": "इस सिंहासन के साथ गद्दारी करने वाले को किसी भी कीमत पर बख्शा नहीं जाएगा!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "मैं जानता हूँ गद्दार कौन है — आज भरे दरबार में उसका नकाब उतरेगा!"},
+            {"speaker": "Mantri", "emotion": "shocked", "broll": False, "dialogue": "महाराज... यह गुप्त पत्र आपके हाथ कैसे लगा? मुझे क्षमा कर दीजिए!"},
+            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": "राजा के न्याय और पराक्रम ने पूरे साम्राज्य को एक बड़ी साज़िश से बचा लिया!"},
+        ]
+
+    if archetype == "jungle_adventure":
+        return [
+            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"घने जंगल के बीच {short_t} का सबसे खतरनाक सफर शुरू हो चुका था!"},
+            {"speaker": "Heroine", "emotion": "shocked", "broll": False, "dialogue": "सावधान! आगे गुफा के रास्ते पर खूंखार शिकारियों और जंगली जानवरों का पहरा है!"},
+            {"speaker": "Villain", "emotion": "angry", "broll": False, "dialogue": "इस जंगल के खज़ाने और राज़ पर सिर्फ मेरा हक है, पीछे हट जाओ!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "यह जंगल और इसकी धरोहर किसी अपराधी की जागीर नहीं, हम पीछे नहीं हटेंगे!"},
+            {"speaker": "Saas", "emotion": "shocked", "broll": False, "dialogue": "प्राचीन मंदिर का द्वार केवल वही खोल सकता है जिसके दिल में सच्चाई हो!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "तेरा हर जाल टूट चुका है, अब इस जंगल से तेरा खेल खत्म!"},
+            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": "तभी प्राचीन गुफा का रहस्यमयी दरवाज़ा खुला और सबकी आँखें फटी रह गईं!"},
+        ]
+
+    if archetype == "police_thriller":
+        return [
+            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"शहर में {short_t} के केस ने पूरे पुलिस महकमे को हिला कर रख दिया!"},
+            {"speaker": "Villain", "emotion": "angry", "broll": False, "dialogue": "इंस्पेक्टर, मेरे खिलाफ सबूत ढूँढने की कोशिश मत कर, वरना अंजाम बुरा होगा!"},
+            {"speaker": "Heroine", "emotion": "confident", "broll": False, "dialogue": "मेरे पास इस पूरे घोटाले और साज़िश की असली रिकॉर्डिंग मौजूद है!"},
+            {"speaker": "Saas", "emotion": "shocked", "broll": False, "dialogue": "इतने बड़े अपराध को अब कानून की नज़र से कोई नहीं छुपा सकता!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "कानून के हाथ बहुत लंबे होते हैं — तेरे हर जुर्म की फाइल अब कोर्ट में है!"},
+            {"speaker": "Villain", "emotion": "shocked", "broll": False, "dialogue": "यह कैसे हो सकता है? मेरा सबसे खास गवाह पुलिस के साथ कैसे मिल गया!"},
+            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": "तभी पुलिस सायरन गूँजा और अपराधी के सारे राज़ दुनिया के सामने आ गए!"},
+        ]
+
+    # Dynamic custom topic script directly built around user's exact topic words
+    return [
+        {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"आज की इस धमाकेदार कहानी का केंद्र है — {short_t}!"},
+        {"speaker": "Heroine", "emotion": "shocked", "broll": False, "dialogue": f"{short_t} का यह सच अगर बाहर आ गया तो सब कुछ बदल जाएगा!"},
+        {"speaker": "Villain", "emotion": "angry", "broll": False, "dialogue": "जब तक मैं यहाँ खड़ा हूँ, मेरी योजना को कोई नहीं रोक सकता!"},
+        {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": f"तेरी हर चाल नाकाम होगी, क्योंकि {short_t} का असली फैसला आज मैं करूँगा!"},
+        {"speaker": "Saas", "emotion": "shocked", "broll": False, "dialogue": "सच्चाई और हिम्मत के आगे बड़े-बड़े षड्यंत्र भी टिक नहीं पाते!"},
+        {"speaker": "Villain", "emotion": "shocked", "broll": False, "dialogue": "नहीं! मेरी सारी बाज़ी एक ही पल में कैसे पलट गई?"},
+        {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"और इस तरह {short_t} के सबसे बड़े रहस्य से आखिरकार पर्दा उठ गया!"},
+    ]
+
+
+# 3. AUTO-FAILOVER STORY DIRECTOR (Gemini -> Groq -> Topic-Aware Dynamic Hindi Story)
+async def director_generate_story(topic: str, part_num: int = 1, prev_cliffhanger: str = "") -> list[dict]:
+    _sync_runtime_api_vault_from_config()
+    archetype = _detect_topic_story_archetype(topic)
+    role_guide = (
+        'Allowed speaker names for this topic: "Narrator", "Hero" (or "Raja"), "Heroine" (or "Rani"), "Villain" (or "Bhoot" / "Mantri"), "Saas" (or "Rajmata").'
+        if archetype in ("royal_ghost", "horror_ghost", "royal_kingdom")
+        else 'Allowed speaker names: "Narrator", "Hero", "Heroine", "Villain", "Saas".'
+    )
+    system_prompt = (
+        "You are an expert Indian Hindi TV Serial & Film Showrunner. "
+        "Write a crisp, high-drama 7-dialogue scene in natural Hindi (Devanagari) strictly based on the user's exact Topic with zero incomplete sentences. "
+        "NEVER insert unrelated 'ghar jamai' or 'sasural' plots unless the user's topic explicitly asks for it! "
+        f"{role_guide} "
+        "Narrator speaks ONLY line 1 (hook) and line 7 (cliffhanger). "
+        "Return ONLY valid JSON array of 7 objects: "
+        '[{"speaker":"Narrator|Hero|Heroine|Villain|Saas","emotion":"angry|shocked|sad|confident|twist","broll":false,"dialogue":"..."}]'
+    )
+    user_prompt = f"Exact Story Topic: {topic}. Episode Part: {part_num}. Previous Cliffhanger: {prev_cliffhanger or 'Start of story'}."
+
+    # Priority 1: Gemini 2.5 Flash
+    gemini_key = RUNTIME_API_VAULT.get("GEMINI_API_KEY", "").strip()
+    if gemini_key:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+            payload = {
+                "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.8},
+            }
+            async with httpx.AsyncClient(timeout=8.0) as client_http:
+                r = await client_http.post(url, json=payload)
+                if r.status_code == 200:
+                    txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    data = json.loads(txt)
+                    if isinstance(data, list) and len(data) >= 5:
+                        API_HEALTH_STATUS["gemini"] = "active"
+                        return data[:8]
+            API_HEALTH_STATUS["gemini"] = "quota_full"
+        except Exception:
+            API_HEALTH_STATUS["gemini"] = "error"
+
+    # Priority 2: Groq Llama 3.3 70B (0.4s Ultra-Fast Auto-Switch)
+    groq_key = RUNTIME_API_VAULT.get("GROQ_API_KEY", "").strip()
+    if groq_key:
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as client_http:
+                r = await client_http.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {groq_key}"},
+                    json={
+                        "model": "llama-3.3-70b-versatile",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "temperature": 0.7,
+                    },
+                )
+                if r.status_code == 200:
+                    raw = r.json()["choices"][0]["message"]["content"]
+                    start, end = raw.find("["), raw.rfind("]") + 1
+                    data = json.loads(raw[start:end])
+                    if isinstance(data, list) and len(data) >= 5:
+                        API_HEALTH_STATUS["groq"] = "active"
+                        return data[:8]
+            API_HEALTH_STATUS["groq"] = "quota_full"
+        except Exception:
+            API_HEALTH_STATUS["groq"] = "error"
+
+    # Priority 3: Topic-Aware Multi-Character Hindi Story Fallback (Matches Raja/Bhoot, Jungle, Police, or Custom Topic!)
+    return _build_topic_aware_director_fallback(topic=topic, part_num=part_num, prev_cliffhanger=prev_cliffhanger)
+
+
+# 4. AUTO-FAILOVER IMAGE ENGINE (Cloudflare -> Together -> HF -> Pollinations)
+async def fetch_single_master_frame(role: str, prompt: str, out_path: str, width: int = 720, height: int = 1280) -> str:
+    _sync_runtime_api_vault_from_config()
+    # Priority 1: Cloudflare Workers AI (@cf/black-forest-labs/flux-1-schnell)
+    cf_id = RUNTIME_API_VAULT.get("CF_ACCOUNT_ID", "").strip()
+    cf_tok = RUNTIME_API_VAULT.get("CF_API_TOKEN", "").strip()
+    if cf_id and cf_tok:
+        try:
+            url = f"https://api.cloudflare.com/client/v4/accounts/{cf_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+            async with httpx.AsyncClient(timeout=10.0) as client_http:
+                r = await client_http.post(url, headers={"Authorization": f"Bearer {cf_tok}"}, json={"prompt": prompt, "num_steps": 4})
+                if r.status_code == 200:
+                    res_json = r.json()
+                    img_b64 = res_json.get("result", {}).get("image")
+                    if img_b64:
+                        with open(out_path, "wb") as f:
+                            f.write(base64.b64decode(img_b64))
+                        API_HEALTH_STATUS["cloudflare"] = "active"
+                        return out_path
+            API_HEALTH_STATUS["cloudflare"] = "quota_full"
+        except Exception:
+            API_HEALTH_STATUS["cloudflare"] = "error"
+
+    # Priority 2: Together AI (FLUX.1-schnell-Free)
+    tog_key = RUNTIME_API_VAULT.get("TOGETHER_API_KEY", "").strip()
+    if tog_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client_http:
+                r = await client_http.post(
+                    "https://api.together.xyz/v1/images/generations",
+                    headers={"Authorization": f"Bearer {tog_key}"},
+                    json={
+                        "model": "black-forest-labs/FLUX.1-schnell-Free",
+                        "prompt": prompt,
+                        "width": 768,
+                        "height": 1024,
+                        "steps": 4,
+                        "response_format": "b64_json",
+                    },
+                )
+                if r.status_code == 200:
+                    img_b64 = r.json()["data"][0]["b64_json"]
+                    with open(out_path, "wb") as f:
+                        f.write(base64.b64decode(img_b64))
+                    API_HEALTH_STATUS["together"] = "active"
+                    return out_path
+            API_HEALTH_STATUS["together"] = "quota_full"
+        except Exception:
+            API_HEALTH_STATUS["together"] = "error"
+
+    # Priority 3: HuggingFace Direct Inference API
+    hf_tok = RUNTIME_API_VAULT.get("HF_TOKEN", "").strip()
+    if hf_tok:
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client_http:
+                r = await client_http.post(
+                    "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
+                    headers={"Authorization": f"Bearer {hf_tok}"},
+                    json={"inputs": prompt},
+                )
+                if r.status_code == 200 and len(r.content) > 5000:
+                    with open(out_path, "wb") as f:
+                        f.write(r.content)
+                    API_HEALTH_STATUS["huggingface"] = "active"
+                    return out_path
+            API_HEALTH_STATUS["huggingface"] = "quota_full"
+        except Exception:
+            API_HEALTH_STATUS["huggingface"] = "error"
+
+    # Priority 4: Pollinations AI (Free No-Key Unlimited — Flux + Turbo Retry so images never fail!)
+    for model_name in ("flux", "turbo"):
+        try:
+            enc = urllib.parse.quote(prompt[:420])
+            seed = random.randint(1000, 999999)
+            url = f"https://image.pollinations.ai/prompt/{enc}?width={width}&height={height}&model={model_name}&nologo=true&seed={seed}"
+            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client_http:
+                r = await client_http.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code == 200 and len(r.content) > 5000:
+                    with open(out_path, "wb") as f:
+                        f.write(r.content)
+                    API_HEALTH_STATUS["pollinations"] = "active"
+                    return out_path
+        except Exception:
+            continue
+
+    return ""
+
+
+def _create_mirrored_zoomed_variant(
+    src_img_path: str,
+    out_img_path: str,
+    width: int,
+    height: int,
+    mirror: bool = True,
+    zoom_ratio: float = 0.08,
+) -> bool:
+    """
+    Create a visually distinct mirrored + cinematic zoomed frame from an already downloaded master image
+    so a failed image fetch NEVER shows a blank brown screen!
+    """
+    try:
+        if not src_img_path or not os.path.exists(src_img_path) or os.path.getsize(src_img_path) < 4000:
+            return False
+        img = open_upright_image(src_img_path).resize((width, height), Image.Resampling.LANCZOS)
+        if mirror:
+            img = ImageOps.mirror(img)
+        mx = max(10, int(width * zoom_ratio))
+        my = max(10, int(height * zoom_ratio))
+        if width - 2 * mx > 100 and height - 2 * my > 100:
+            img = img.crop((mx, my, width - mx, height - my)).resize((width, height), Image.Resampling.LANCZOS)
+        img = ImageEnhance.Contrast(img).enhance(1.05)
+        img.save(out_img_path, "JPEG", quality=93)
+        return os.path.exists(out_img_path) and os.path.getsize(out_img_path) > 4000
+    except Exception:
+        return False
+
+
+# 5. PARALLEL MASTER CASTING SHEET (Generates All 6 Topic-Aware Characters Once + Zero Blank Screen Guarantee!)
+async def build_master_casting_sheet(
+    work_dir: str,
+    width: int = 720,
+    height: int = 1280,
+    topic: str = "",
+) -> dict[str, str]:
+    os.makedirs(work_dir, exist_ok=True)
+    dynamic_prompts = get_dynamic_character_prompts(topic)
+    tasks = {}
+    for role, prompt in dynamic_prompts.items():
+        out_file = os.path.join(work_dir, f"master_{role.lower()}.jpg")
+        if os.path.exists(out_file) and os.path.getsize(out_file) > 5000:
+            async def _existing(p=out_file):
+                return p
+            tasks[role] = _existing()
+        else:
+            tasks[role] = fetch_single_master_frame(role, prompt, out_file, width, height)
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    casting: dict[str, str] = {}
+    for role, res in zip(tasks.keys(), results):
+        if isinstance(res, str) and res and os.path.exists(res) and os.path.getsize(res) > 4000:
+            casting[role] = res
+
+    # Strict Gender-Aware & Wide-Scene Mirror/Zoom Recovery so NO character slot is ever missing or blank!
+    fallback_preference = {
+        "Hero": ("Hero", "Villain", "Wide_Confrontation", "Context_BRoll"),
+        "Villain": ("Villain", "Hero", "Wide_Confrontation", "Context_BRoll"),
+        "Heroine": ("Heroine", "Saas", "Wide_Confrontation", "Context_BRoll"),
+        "Saas": ("Saas", "Heroine", "Wide_Confrontation", "Context_BRoll"),
+        "Wide_Confrontation": ("Wide_Confrontation", "Hero", "Villain", "Heroine", "Context_BRoll"),
+        "Context_BRoll": ("Context_BRoll", "Wide_Confrontation", "Hero", "Villain"),
+    }
+    for idx_r, role in enumerate(dynamic_prompts.keys()):
+        if role in casting and os.path.exists(casting[role]):
+            continue
+        out_file = os.path.join(work_dir, f"master_{role.lower()}.jpg")
+        prefs = list(fallback_preference.get(role, ())) + list(casting.keys())
+        for donor_role in prefs:
+            donor_path = casting.get(donor_role)
+            if donor_path and os.path.exists(donor_path):
+                if _create_mirrored_zoomed_variant(
+                    donor_path,
+                    out_file,
+                    width,
+                    height,
+                    mirror=(idx_r % 2 == 0),
+                    zoom_ratio=0.06 + (idx_r % 3) * 0.03,
+                ):
+                    casting[role] = out_file
+                    break
+    return casting
+
+
+def _apply_hero_faceswap_to_master_frame(
+    hero_master_path: str,
+    user_selfie_path: str,
+    out_path: str,
+    width: int,
+    height: int,
+    watermark_text: str = "",
+    watermark_position: str = "top-right",
+) -> str:
+    """
+    Strictly face-swap user's selfie onto the AI-generated Hero inside the haveli.
+    NEVER displays the raw bedroom selfie directly on screen!
+    Chain: HF AI Face-Swap -> OpenCV seamlessClone face-only blend -> Clean AI Hero fallback.
+    """
+    bg = open_upright_image(hero_master_path).resize((width, height), Image.Resampling.LANCZOS)
+    has_user = bool(user_selfie_path and os.path.exists(user_selfie_path) and os.path.getsize(user_selfie_path) > 512)
+    upright_tmp = f"{out_path}_upright_user.jpg"
+    scene_tmp = f"{out_path}_hero_scene.jpg"
+    swapped_tmp = f"{out_path}_hero_swapped.jpg"
+    try:
+        if has_user:
+            actor = open_upright_image(user_selfie_path)
+            actor.save(upright_tmp, "JPEG", quality=92)
+            bg.save(scene_tmp, "JPEG", quality=92)
+            # Step A: HuggingFace AI Face-Swap (`tonyassi/face-swap` / `ezioruan/inswapper`)
+            swapped_p = _try_hf_scene_faceswap(scene_tmp, upright_tmp, swapped_tmp)
+            if swapped_p and os.path.exists(swapped_p):
+                composed = open_upright_image(swapped_p).resize((width, height), Image.Resampling.LANCZOS)
+            else:
+                # Step B: OpenCV face-only seamlessClone onto AI Hero's face (never raw selfie background!)
+                cv_swapped = _try_opencv_face_only_swap(bg, actor)
+                composed = cv_swapped if cv_swapped is not None else bg
+        else:
+            composed = bg
+
+        composed = ImageEnhance.Contrast(composed).enhance(1.06)
+        composed = ImageEnhance.Color(composed).enhance(1.06)
+        if watermark_text:
+            draw_channel_watermark(composed, watermark_text, watermark_position)
+        composed.save(out_path, "JPEG", quality=93)
+        return out_path
+    finally:
+        for tmp_f in (upright_tmp, scene_tmp, swapped_tmp):
+            if os.path.exists(tmp_f):
+                try:
+                    os.remove(tmp_f)
+                except Exception:
+                    pass
 
 
 def _get_runtime_gemini_client():
@@ -1614,6 +2304,7 @@ async def save_admin_ai_config(request: Request):
 
     db["ai_config"] = normalize_ai_config(current)
     save_db(db)
+    _sync_runtime_api_vault_from_config(db["ai_config"])
     _HF_SPACE_COOLDOWN.clear()
     _API_VAULT_COOLDOWN.clear()
     _GEMINI_IMG_MODEL_COOLDOWN.clear()
@@ -1621,6 +2312,45 @@ async def save_admin_ai_config(request: Request):
         "message": "✅ API Vault, Auto-Failover & Business सेटिंग्स सेव हो गईं!",
         "ai_config": db["ai_config"],
     }
+
+
+@app.get("/admin/api-vault")
+@app.get("/admin/api-vault/")
+async def get_admin_api_vault(request: Request, admin_email: str = "", admin_pin: str = ""):
+    email_v = (admin_email or request.headers.get("x-admin-email") or "").strip()
+    pin_v = (admin_pin or request.headers.get("x-admin-pin") or "").strip()
+    verify_admin(email_v, pin_v)
+    _sync_runtime_api_vault_from_config()
+    masked = {
+        k: (v[:6] + "****" + v[-4:] if len(v) > 10 else ("SET" if v else ""))
+        for k, v in RUNTIME_API_VAULT.items()
+    }
+    return {"keys": masked, "health": API_HEALTH_STATUS}
+
+
+@app.post("/admin/api-vault")
+@app.post("/admin/api-vault/")
+async def update_admin_api_vault(request: Request, payload: dict):
+    email_v = _safe_payload_str(payload, "admin_email", "email", default="") or (request.headers.get("x-admin-email") or "")
+    pin_v = _safe_payload_str(payload, "admin_pin", "pin", default="") or (request.headers.get("x-admin-pin") or "")
+    verify_admin(email_v, pin_v)
+
+    db = load_db()
+    current_cfg = normalize_ai_config(db.get("ai_config"))
+    for k in RUNTIME_API_VAULT.keys():
+        if k in payload and isinstance(payload[k], str) and payload[k].strip():
+            clean_val = payload[k].strip()
+            RUNTIME_API_VAULT[k] = clean_val
+            cfg_key = _VAULT_TO_AI_CONFIG_KEY.get(k)
+            if cfg_key:
+                current_cfg[cfg_key] = clean_val
+
+    db["ai_config"] = normalize_ai_config(current_cfg)
+    save_db(db)
+    _HF_SPACE_COOLDOWN.clear()
+    _API_VAULT_COOLDOWN.clear()
+    _GEMINI_IMG_MODEL_COOLDOWN.clear()
+    return {"status": "saved", "health": API_HEALTH_STATUS}
 
 
 @app.post("/admin/test-ai-servers/")
@@ -1922,61 +2652,37 @@ def _build_multi_character_drama_lines(
     total_parts: int = 1,
 ) -> list[tuple[str, str, str]]:
     """
-    Build 7 crisp, punchy Dangal TV / Pocket FM multi-character drama exchanges (~30-45s per Part).
-    Narrator speaks only 1 short opening hook + 1 short ending cliffhanger; 5 lines are fiery Hero/Heroine/Villain/Saas clashes.
-    Unique dialogue packs per part_no so NO line ever repeats!
+    Build 7 crisp, topic-accurate Hindi multi-character drama exchanges (~30-45s per Part).
+    Uses _build_topic_aware_director_fallback() so Raja/Bhoot, Jungle, Police, Comedy, or any user topic
+    gets its own real characters and story — ZERO hardcoded 'ghar jamai / sasural' lines!
     """
-    topic_short = re.sub(r"\s+", " ", (clean_topic or "ससुराल का अपमान और अरबपति का सच")).strip()[:64]
     hero = (hero_label or "Hero").strip() or "Hero"
-
-    if part_no == 1:
-        pack = [
-            ("Narrator", f"ससुराल के तानों से शुरू हुआ सबसे बड़ा तूफ़ान — {topic_short}!", "Suspense"),
-            ("Saas", "गरीब घर जमाई की इतनी हिम्मत कि हमारी बराबरी करे?", "Emotional"),
-            ("Villain", "माँ, इसकी औकात नौकर की भी नहीं, इसे अभी बाहर निकालो!", "Action"),
-            ("Heroine", "बस कीजिए! आप लोग बार-बार इनका अपमान क्यों कर रहे हैं?", "Emotional"),
-            (hero, "बोल लेने दो प्रिया... आज रात इनकी घमंड की नींव हिलेगी!", "Action"),
-            ("Villain", "शहर के सबसे बड़े अरबपति आ रहे हैं, तू गेट से बाहर खड़ा रह!", "Action"),
-            (
-                "Narrator",
-                f"तभी दस काली मर्सिडीज़ रुकती हैं — कौन है असली मालिक? देखिए Part {part_no + 1} में!"
-                if total_parts > 1
-                else "तभी दस काली मर्सिडीज़ रुकती हैं — और सबके होश उड़ जाते हैं!",
-                "Suspense",
-            ),
-        ]
-    elif part_no == 2:
-        pack = [
-            ("Narrator", "ब्लैक सूट में बॉडीगार्ड्स ने झुककर सलाम किया तो सन्नाटा छा गया!", "Suspense"),
-            ("Saas", "ये क्या हो रहा है? अरबपति के गार्ड्स इसके आगे क्यों झुक रहे हैं?", "Suspense"),
-            ("Villain", "अरे सिक्योरिटी, ये तो हमारे घर का बेरोज़गार जमाई है!", "Action"),
-            (hero, "जिस कंपनी के लिए तुम गिड़गिड़ा रहे थे, उसका मालिक मैं हूँ!", "Action"),
-            ("Heroine", "आप इतने साल खामोश रहे सिर्फ इस परिवार की इज़्ज़त के लिए?", "Emotional"),
-            ("Saas", "हे भगवान! बेटा, हमें माफ़ कर दो, हमसे बहुत बड़ी भूल हुई!", "Emotional"),
-            (
-                "Narrator",
-                f"तभी विलेन ने एक छुपा हुआ राज़ खोला — क्या पलटेगी बाज़ी? देखिए Part {part_no + 1} में!"
-                if part_no < total_parts
-                else "आखिरकार सच्चाई की जीत हुई, और घमंड चकनाचूर हो गया!",
-                "Suspense",
-            ),
-        ]
-    else:
-        pack = [
-            ("Narrator", f"Part {part_no} में खुलेगा इस हवेली का सबसे बड़ा राज़!", "Suspense"),
-            ("Villain", "दौलत छीन ली, पर अब आखिरी चाल मैं चलूँगा!", "Action"),
-            ("Saas", "रुक जाओ! अब इस घर को और बर्बाद मत करो!", "Emotional"),
-            (hero, "तेरी हर साज़िश का सबूत मेरे पास है, अब तू नहीं बचेगा!", "Action"),
-            ("Heroine", "सच की ताक़त के आगे अब तुम्हारी कोई चाल नहीं चलेगी!", "Emotional"),
-            (hero, "आज सबके सामने तेरे हर गुनाह का हिसाब बराबर होगा!", "Action"),
-            (
-                "Narrator",
-                f"क्या यही है अंत, या आएगा नया तूफ़ान? देखिए Part {part_no + 1} में!"
-                if part_no < total_parts
-                else "सच्चाई और आत्मसम्मान की इस जंग में हीरो की शानदार जीत हुई!",
-                "Action",
-            ),
-        ]
+    emotion_to_mood = {
+        "angry": "Action",
+        "confident": "Action",
+        "shocked": "Suspense",
+        "twist": "Suspense",
+        "sad": "Emotional",
+        "romantic": "Romantic",
+    }
+    raw_items = _build_topic_aware_director_fallback(
+        topic=clean_topic or "रहस्यमयी महल का राज़",
+        part_no_or_num=part_no,
+    ) if False else _build_topic_aware_director_fallback(
+        topic=clean_topic or "रहस्यमयी महल का राज़",
+        part_num=part_no,
+        prev_cliffhanger="",
+    )
+    pack: list[tuple[str, str, str]] = []
+    for idx_i, item in enumerate(raw_items):
+        spk = str(item.get("speaker") or "Hero").strip()
+        if spk.lower() in ("hero", "raja"):
+            spk = hero
+        dlg = str(item.get("dialogue") or "").strip()
+        if idx_i == len(raw_items) - 1 and total_parts > 1 and part_no < total_parts and f"Part {part_no + 1}" not in dlg:
+            dlg = f"{dlg} देखिए Part {part_no + 1} में!"
+        emo = str(item.get("emotion") or "twist").lower()
+        pack.append((spk, dlg, emotion_to_mood.get(emo, "Suspense")))
     return pack
 
 
@@ -1985,7 +2691,7 @@ def _format_drama_script_text(lines: list[tuple[str, str, str]]) -> str:
 
 
 @app.post("/ai/generate-story/")
-def ai_generate_story(
+async def ai_generate_story(
     topic: str = Form(...),
     genre: str = Form("Action"),
     char_names: str = Form("Hero"),
@@ -1998,51 +2704,51 @@ def ai_generate_story(
     names = [n.strip() for n in char_names.split(",") if n.strip()]
     hero_label = names[0] if names and names[0].lower() not in ("vikram", "kaal") else "Hero"
 
-    fallback_lines = _build_multi_character_drama_lines(
-        clean_topic=clean_topic,
-        hero_label=hero_label,
-        genre=genre,
-        part_no=1,
-        total_parts=1,
+    director_scenes = await director_generate_story(
+        topic=f"{clean_topic} (Genre: {genre})",
+        part_num=1,
+        prev_cliffhanger="",
     )
-    fallback_story = _format_drama_script_text(fallback_lines)
 
-    prompt = f"""तुम Dangal TV, StarPlus और Pocket FM के नंबर-1 AI Showrunner & Dialogue Writer हो।
-Genre: {genre}
-Topic: "{clean_topic}"
-Fixed Consistent Characters: Narrator, {hero_label}, Heroine, Villain, Saas
-
-सख्त नियम (100% पालन करो):
-1. एक ही Narrator की लंबी कहानी/मोनोलॉग बिल्कुल मत लिखो!
-2. ठीक 8 छोटे, तीखे, कंप्लीट और ड्रामैटिक हिंदी डायलॉग्स लिखो (हर डायलॉग 8-13 शब्द, कोई अधूरा वाक्य या टॉपिक से भटकी हुई लाइन नहीं!)।
-3. Narrator सिर्फ पहली 1 छोटी हुक लाइन और आखिरी 1 सस्पेंस क्लिफहैंगर लाइन बोले (अधिकतम 20%) — बाकी 80% में {hero_label}, Heroine, Villain और Saas आपस में आमने-सामने भिड़ें!
-4. हर लाइन का सख्त फॉर्मेट यही हो (कोई Title:, Scene:, [Location:], markdown, या डबल नाम मत लिखो):
-Narrator: "छोटी हुक लाइन..."
-Saas: "तीखा ताना..."
-Villain: "धमकी या साज़िश..."
-Heroine: "इमोशनल या करारा जवाब..."
-{hero_label}: "मासी या ट्विस्ट वाला डायलॉग..."
-
-सीधे 8 लाइन की मल्टी-कैरेक्टर टीवी सीरियल डायलॉग स्क्रिप्ट लिखो।"""
-
-    raw_out, story_engine = _call_story_brain_auto_chain(prompt, timeout_s=10.0)
-    if not raw_out:
-        return {"story": fallback_story, "genre": genre, "story_engine": story_engine}
-
-    cleaned_lines: list[str] = []
-    for ln in raw_out.replace("```", "").splitlines():
-        ln_s = ln.strip().lstrip("*-•0123456789.) ").strip()
-        m = re.match(r"^([^:：]{1,26})[:：]\s*(.+)$", ln_s)
-        if not m:
+    formatted_lines: list[str] = []
+    for item in director_scenes:
+        if not isinstance(item, dict):
             continue
-        spk = re.sub(r"[\*\#\_\"'“”]", "", m.group(1)).strip()
-        if spk.lower() in ("title", "शीर्षक", "scene", "सीन", "location", "लोकेशन", "mood", "action"):
-            continue
-        dlg = clean_spoken_dialogue(m.group(2))
-        if len(dlg) >= 4:
-            cleaned_lines.append(f'{spk}: "{dlg}"')
-    story = "\n".join(cleaned_lines[:8]) if len(cleaned_lines) >= 6 else fallback_story
-    return {"story": story, "genre": genre, "story_engine": story_engine}
+        spk = str(item.get("speaker") or "Hero").strip()
+        if spk.lower() == "hero":
+            spk = hero_label
+        dlg = clean_spoken_dialogue(str(item.get("dialogue") or ""))
+        if len(dlg) >= 3:
+            formatted_lines.append(f'{spk}: "{dlg}"')
+
+    if len(formatted_lines) < 5:
+        fallback_lines = _build_multi_character_drama_lines(
+            clean_topic=clean_topic,
+            hero_label=hero_label,
+            genre=genre,
+            part_no=1,
+            total_parts=1,
+        )
+        story = _format_drama_script_text(fallback_lines)
+    else:
+        story = "\n".join(formatted_lines[:8])
+
+    active_story_engine = (
+        "Gemini 2.5 Flash"
+        if API_HEALTH_STATUS.get("gemini") == "active"
+        else (
+            "Groq Llama 3.3 70B"
+            if API_HEALTH_STATUS.get("groq") == "active"
+            else "Built-in Hindi Drama"
+        )
+    )
+    return {
+        "story": story,
+        "genre": genre,
+        "story_engine": active_story_engine,
+        "scenes": director_scenes,
+        "health": API_HEALTH_STATUS,
+    }
 
 
 def _resolve_tts_voice(voice: str, language: str = "Hindi") -> str:
@@ -2620,35 +3326,56 @@ def _try_hf_fast_image_spaces(prompt: str, W: int, H: int, seed_val: int, cfg: d
 
 def _reuse_cached_photorealistic_scene(W: int, H: int, hero_role: str, seed_val: int) -> Optional[Image.Image]:
     """
-    STRICT SPEAKER SYNC LOCK:
-    Reuse ONLY a cached photorealistic frame matching the EXACT speaking `hero_role`
-    (NEVER return Saas's photo when Villain speaks, and NEVER return wide_group for a close-up!).
+    STRICT GENDER & SPEAKER SYNC + ZERO BLANK BROWN SCREEN:
+    1. First try cached frame matching exact `hero_role`.
+    2. Next try same-gender cached frame (male: hero/villain, female: female/saas) mirrored + zoomed.
+    3. Next try any successfully downloaded master/cached scene frame mirrored + zoomed so a blank brown screen NEVER appears!
     """
     try:
         candidates = [
-            f for f in os.listdir("/tmp")
-            if f.startswith("cinepop_tv_") and f.endswith(".jpg") and f"_{W}x{H}_" in f
+            os.path.join("/tmp", f)
+            for f in os.listdir("/tmp")
+            if f.startswith("cinepop_tv_") and f.endswith(".jpg")
         ]
-        if not candidates:
+        # Also include any downloaded master_cast images from active projects
+        if os.path.isdir("all_projects"):
+            for p_id in os.listdir("all_projects")[:15]:
+                mc_dir = os.path.join("all_projects", p_id, "master_cast")
+                if os.path.isdir(mc_dir):
+                    for mf in os.listdir(mc_dir):
+                        if mf.endswith(".jpg"):
+                            candidates.append(os.path.join(mc_dir, mf))
+        valid_files = [p for p in candidates if os.path.exists(p) and os.path.getsize(p) > 6000]
+        if not valid_files:
             return None
-        role_matches = [
-            f for f in candidates
-            if f"_hero_{hero_role}_" in f and "_wide_group_" not in f
+
+        # Tier 1: Exact role match
+        exact_matches = [
+            p for p in valid_files
+            if f"_hero_{hero_role}_" in os.path.basename(p) or os.path.basename(p) in (f"{hero_role}.jpg", f"master_{hero_role}.jpg")
         ]
-        if not role_matches:
-            return None
-        chosen = os.path.join("/tmp", role_matches[seed_val % len(role_matches)])
-        if os.path.exists(chosen) and os.path.getsize(chosen) > 8000:
-            img = open_upright_image(chosen).resize((W, H), Image.Resampling.LANCZOS)
-            # Subtle cinematic crop variation so consecutive shots stay dynamic
-            if seed_val % 2 == 1:
-                margin_x = max(8, int(W * 0.04))
-                margin_y = max(8, int(H * 0.04))
-                img = img.crop((margin_x, margin_y, W - margin_x, H - margin_y)).resize((W, H), Image.Resampling.LANCZOS)
-            return img
+        # Tier 2: Same gender match (never put female on male role or male on female role!)
+        same_gender_roles = ("female", "saas", "heroine") if hero_role in ("female", "saas") else ("hero", "villain", "wide_confrontation")
+        gender_matches = [
+            p for p in valid_files
+            if any(
+                f"_hero_{gr}_" in os.path.basename(p) or os.path.basename(p) in (f"{gr}.jpg", f"master_{gr}.jpg")
+                for gr in same_gender_roles
+            )
+        ]
+
+        pool = exact_matches or gender_matches or valid_files
+        chosen = pool[seed_val % len(pool)]
+        img = open_upright_image(chosen).resize((W, H), Image.Resampling.LANCZOS)
+        # Apply mirror + subtle cinematic zoom when reusing across cuts so every frame looks dynamic
+        if not exact_matches or (seed_val % 2 == 1):
+            img = ImageOps.mirror(img)
+        margin_x = max(10, int(W * 0.06))
+        margin_y = max(10, int(H * 0.06))
+        img = img.crop((margin_x, margin_y, W - margin_x, H - margin_y)).resize((W, H), Image.Resampling.LANCZOS)
+        return img
     except Exception:
-        pass
-    return None
+        return None
 
 
 def render_location_backdrop(
@@ -2661,34 +3388,30 @@ def render_location_backdrop(
     shot_variant: str = "main",
 ) -> Image.Image:
     """
-    Generate a 100% PHOTOREALISTIC Indian TV Serial (Dangal TV / StarPlus Live-Action Drama) frame
-    at exact 9:16 (720x1280) or 16:9 (1280x720) — STRICT SPEAKER SYNC LOCK & ZERO 2D cartoons!
-      Priority 1: Google GenAI SDK (`imagen-3.0-generate-002` / `gemini-2.5-flash-image`) when GEMINI_API_KEY is set.
-      Priority 2: Working Pollinations Real Photo API (`https://image.pollinations.ai/prompt/...`, `flux` & `turbo`, timeout=15s).
-      Priority 3: Free HuggingFace Photorealistic Spaces (`FLUX.1-schnell`, `SDXL-Lightning`, `SDXL-Turbo`, `Playground v2.5`).
-      Priority 4: Concise fast `turbo` role-locked retry + SAME-ROLE cached photo ONLY (NEVER cross-role swap!).
+    Generate a 100% PHOTOREALISTIC Indian TV Serial / Film Live-Action Drama frame
+    at exact 9:16 (720x1280) or 16:9 (1280x720) — STRICT MALE/FEMALE SPEAKER SYNC LOCK & ZERO BLANK SCREENS!
     """
     W, H = get_aspect_dimensions(aspect_ratio)
     loc_descriptions = {
-        "royal_palace": "luxurious Indian royal haveli living room hall with crystal golden chandelier, carved marble pillars, velvet sofas, warm Dangal TV StarPlus serial lighting",
+        "royal_palace": "luxurious Indian royal palace darbar hall with crystal golden chandelier, carved marble pillars, royal throne, warm cinematic lighting",
         "city_street": "luxurious Indian family mansion living hall with grand chandelier, teak staircase and warm golden sconces, Indian Hindi TV serial set",
-        "haunted_mansion": "grand heritage Indian haveli mansion hall at night with moody chandelier glow and carved wooden arches, Indian Hindi TV thriller drama set",
+        "haunted_mansion": "ancient candle-lit haunted Indian royal palace hall at night with eerie mist, flickering torches and carved stone arches, Indian supernatural thriller drama set",
         "mumbai_rain": "upscale Mumbai bungalow living room with rain-streaked French windows and warm interior drama lighting, Indian Hindi TV serial set",
         "village_field": "traditional wealthy Indian rural haveli courtyard at golden sunset with warm cinematic sunlight, Indian Hindi TV drama serial set",
-        "deep_jungle": "misty Indian estate forest road at twilight with dramatic cinematic headlights, Indian live-action thriller TV drama",
-        "police_station": "realistic Indian police station interior with wooden desk and dramatic overhead lights, Indian Hindi crime TV serial set",
+        "deep_jungle": "misty ancient Indian forest temple ruin at twilight with glowing torches and dramatic sunbeams, Indian live-action adventure thriller drama",
+        "police_station": "realistic Indian police station headquarters interior with wooden desk and dramatic overhead lights, Indian Hindi crime TV serial set",
         "outer_space": "luxurious modern Indian billionaire penthouse hall overlooking night city skyline, Indian Hindi TV drama set",
-        "mountains": "luxury Himalayan resort villa living room with fireplace and mountain view window, Indian Hindi TV drama set",
-        "desert_fort": "grand Rajasthani heritage haveli palace courtyard at golden hour with sandstone arches, Indian Hindi TV serial set",
+        "mountains": "luxury Himalayan fort palace hall with fireplace and mountain view window, Indian Hindi TV drama set",
+        "desert_fort": "grand Rajasthani heritage fort palace darbar courtyard at golden hour with sandstone arches, Indian Hindi TV serial set",
         "courtroom": "realistic Indian wood-paneled courtroom interior with dramatic sunlight shafts, Indian Hindi TV drama serial set",
         "cyber_lab": "modern Indian corporate billionaire boardroom office with glass walls and city skyline, Indian Hindi TV drama set",
     }
     desc = loc_descriptions.get(location_key, loc_descriptions["royal_palace"])
-    hint_clean = re.sub(r"[^a-zA-Z0-9 ,.-]", "", (prompt_hint or "")).strip()[:64]
+    hint_clean = re.sub(r"[^a-zA-Z0-9 ,.-]", "", (prompt_hint or "")).strip()[:96]
     shot_clean = re.sub(r"[^a-zA-Z0-9_]", "", shot_variant or "main")[:18] or "main"
     hero_tag = "hero_group" if shot_clean == "wide_group" else (f"hero_{hero_role}" if include_hero else "bgonly")
 
-    hint_sig = str(abs(hash(hint_clean[:32])) % 11) if hint_clean else "0"
+    hint_sig = str(abs(hash(hint_clean[:40])) % 17) if hint_clean else "0"
     cache_seed_str = f"tv_{location_key}_{mood}_{W}x{H}_{hero_tag}_{shot_clean}_{hint_sig}"
     cache_key = re.sub(r"[^a-zA-Z0-9_]", "_", cache_seed_str)[:84]
     cache_path = f"/tmp/cinepop_{cache_key}.jpg"
@@ -2699,26 +3422,27 @@ def render_location_backdrop(
             pass
 
     shot_framing_map = {
-        "wide_confrontation": "medium wide live-action Indian TV serial two-shot confrontation inside a grand royal Indian haveli hall with crystal chandeliers, carved arched wooden doors, and family members standing in background, 35mm cinema lens, full waist-up actors face-to-face",
-        "wide_group": "medium wide live-action Indian TV serial two-shot confrontation inside a grand royal Indian haveli hall with crystal chandeliers, carved arched wooden doors, and family members in background, 35mm cinema lens",
-        "establishing": "medium wide live-action Indian TV serial establishing shot inside a grand royal Indian haveli living hall with crystal chandeliers, arched wooden doors, and real actors confronting face-to-face, 35mm cinema lens",
-        "over_shoulder": "medium over-the-shoulder waist-up live-action Indian TV serial shot inside a grand royal Indian haveli hall with chandeliers and arched wooden doors, expressive speaking hand gesture, natural upper body visible, 50mm cinema lens",
-        "waist_up": "medium waist-up live-action Indian TV serial two-shot inside a grand royal Indian haveli hall with chandeliers, arched wooden doors, and family softly blurred in background, expressive hand gesture and body language, 50mm cinema lens",
-        "closeup_drama": "medium waist-up live-action Indian TV serial dialogue shot inside a grand royal Indian haveli hall with chandeliers and arched wooden doors, full shoulders, torso and expressive hand gesture visible, 50mm cinema lens",
-        "reaction_cut": "medium waist-up live-action Indian TV serial dramatic reaction two-shot inside a grand royal Indian haveli hall, intense emotional posture and hand gesture, warm chandelier backlighting, 50mm cinema lens",
-        "action_mid": "dynamic medium waist-up live-action Indian TV serial confrontation two-shot face-to-face inside grand royal haveli hall, intense pointing hand gesture and body language, 50mm cinema lens",
-        "broll_insert": "cinematic 1.5-second live-action Indian TV serial insert B-roll shot, moody dramatic golden lighting, 35mm cinema lens, ultra sharp photorealism, no human close-up",
-        "main": "medium waist-up live-action Indian TV serial two-shot inside grand royal Indian haveli hall with chandeliers and carved arched wooden doors, natural upper body and expressive hand gesture, 50mm cinema lens",
+        "wide_confrontation": "medium wide live-action Indian drama two-shot confrontation inside grand royal hall with chandeliers and carved arches, 35mm cinema lens, full waist-up actors face-to-face",
+        "wide_group": "medium wide live-action Indian drama two-shot confrontation inside grand royal hall with chandeliers and carved arches, 35mm cinema lens",
+        "establishing": "medium wide live-action Indian drama establishing shot inside grand royal hall with chandeliers and real actors confronting face-to-face, 35mm cinema lens",
+        "over_shoulder": "medium over-the-shoulder waist-up live-action Indian drama shot, expressive speaking hand gesture, natural upper body visible, 50mm cinema lens",
+        "waist_up": "medium waist-up live-action Indian drama shot, expressive hand gesture and body language, 50mm cinema lens",
+        "closeup_drama": "medium waist-up live-action Indian drama dialogue shot, full shoulders, torso and expressive hand gesture visible, 50mm cinema lens",
+        "reaction_cut": "medium waist-up live-action Indian drama reaction shot, intense emotional posture and hand gesture, warm backlighting, 50mm cinema lens",
+        "action_mid": "dynamic medium waist-up live-action Indian drama confrontation shot face-to-face, intense pointing hand gesture and body language, 50mm cinema lens",
+        "broll_insert": "cinematic 1.5-second live-action Indian drama insert B-roll shot, moody dramatic golden lighting, 35mm cinema lens, ultra sharp photorealism, no human close-up",
+        "main": "medium waist-up live-action Indian drama shot with natural upper body and expressive hand gesture, 50mm cinema lens",
     }
     shot_desc = shot_framing_map.get(shot_clean, shot_framing_map["waist_up"])
 
+    dynamic_cast_prompts = get_dynamic_character_prompts(f"{location_key} {prompt_hint}")
     role_subject_map = {
-        "hero": "handsome 30-year-old Indian TV serial lead hero in tailored black royal bandhgala suit speaking firmly with expressive hand gesture, medium over-the-shoulder waist-up framing inside grand royal haveli hall",
-        "female": "emotional 26-year-old Indian TV serial lead heroine in rich crimson designer silk saree, gold jhumka earrings and red bindi speaking with teary eyes and expressive hand gesture, medium waist-up shot inside grand royal haveli hall",
-        "villain": "intimidating 36-year-old Indian TV serial villain in dark velvet blazer over black shirt confronting the hero face-to-face with dramatic pointing hand gesture, medium waist-up two-shot inside grand royal haveli hall",
-        "saas": "angry commanding 52-year-old Indian Saas in heavy maroon Banarasi silk saree, gold jewelry and red bindi pointing finger sharply at heroine in crimson saree while hero stands nearby, medium waist-up two-shot inside grand royal haveli hall",
-        "narrator": "angry Saas in maroon Banarasi silk saree pointing finger at emotional Heroine in crimson designer saree while handsome Hero in black royal bandhgala suit and Villain in dark velvet blazer stand face-to-face inside grand royal haveli hall with family in background",
-        "crowd": "shocked Indian family members in traditional silk sarees and kurtas reacting together inside grand royal haveli hall with crystal chandeliers",
+        "hero": f"ONE handsome 30-year-old Indian MALE lead actor only (man with beard/mustache, strictly male, no woman in foreground), {dynamic_cast_prompts.get('Hero', '')}",
+        "female": f"ONE expressive 25-year-old Indian FEMALE lead actress only (woman in royal silk saree/lehenga and gold jhumkas, strictly female, no man in foreground), {dynamic_cast_prompts.get('Heroine', '')}",
+        "villain": f"ONE menacing 35-year-old Indian MALE antagonist actor only (bearded man with intense eyes, strictly male, no woman in foreground), {dynamic_cast_prompts.get('Villain', '')}",
+        "saas": f"ONE commanding 50-year-old Indian FEMALE matriarch actress only (older woman in maroon Banarasi silk saree and gold jewelry, strictly female, no man in foreground), {dynamic_cast_prompts.get('Saas', '')}",
+        "narrator": dynamic_cast_prompts.get("Wide_Confrontation", ""),
+        "crowd": "shocked Indian royal court and family people in traditional attire reacting together inside grand hall with chandeliers",
     }
     if shot_clean == "broll_insert":
         subject_prefix = f"{shot_desc}, "
@@ -2731,8 +3455,8 @@ def render_location_backdrop(
 
     scene_detail = f"{hint_clean}, " if hint_clean else ""
     full_prompt = (
-        f"photorealistic live-action still frame from an Indian Hindi TV serial drama on Dangal TV and StarPlus, "
-        f"{subject_prefix}{scene_detail}{desc}, {mood} dramatic warm chandelier cinema lighting, "
+        f"photorealistic live-action still frame from an Indian Hindi TV drama, "
+        f"{subject_prefix}{scene_detail}{desc}, {mood} dramatic cinema lighting, "
         f"8k DSLR live-action film photography, real Indian actors waist-up with natural body language and hand gestures, "
         f"no passport photo, no extreme macro face close-up, no cartoon, no illustration, no anime, no 3d render, no text, no watermark"
     )
@@ -2741,7 +3465,7 @@ def render_location_backdrop(
     cfg = get_runtime_ai_config()
 
     # Visual Auto-Failover Chain:
-    # P1: Cloudflare Workers AI Flux -> P2: Together AI FLUX -> P3: Gemini Imagen/Flash -> P4: HF Spaces -> P5: Pollinations -> Same-Role Cache
+    # P1: Cloudflare Workers AI Flux -> P2: Together AI FLUX -> P3: Gemini Imagen/Flash -> P4: HF Spaces -> P5: Pollinations -> Same-Gender/Mirrored Cache
     cf_img = _try_cloudflare_flux_image(full_prompt, W, H, cfg)
     if cf_img is not None:
         try:
@@ -2803,18 +3527,12 @@ def render_location_backdrop(
             except Exception:
                 continue
 
-    # Priority 6A: Reuse cached photorealistic frame of the EXACT SAME speaking role ONLY
-    cached_photo = _reuse_cached_photorealistic_scene(W, H, hero_role, seed_val)
-    if cached_photo is not None:
-        return cached_photo
-
-    # Priority 6B: Concise fast `turbo` waist-up retry locked strictly to the speaking role
-    if cfg.get("enable_pollinations", True) and not _is_vault_provider_cooling("pollinations"):
+    # Priority 6A: Concise fast `turbo` waist-up retry locked strictly to the speaking role gender
+    if cfg.get("enable_pollinations", True):
         short_role_prompt = (
-            f"photorealistic Indian Hindi TV serial medium waist-up two-shot of "
-            f"{role_subject_map.get(hero_role, role_subject_map['hero'])}, "
-            f"grand royal Indian haveli living hall with crystal chandeliers and arched wooden doors, "
-            f"warm drama lighting, 8k DSLR real human actor, no passport photo, no cartoon"
+            f"photorealistic Indian live-action drama medium waist-up shot of "
+            f"{role_subject_map.get(hero_role, role_subject_map['hero'])[:180]}, "
+            f"grand royal Indian palace hall with chandeliers, warm drama lighting, 8k DSLR real human actor, no cartoon"
         )
         short_enc = urllib.parse.quote(short_role_prompt, safe="")
         retry_url = f"https://image.pollinations.ai/prompt/{short_enc}?width={W}&height={H}&model=turbo&nologo=true&seed={(seed_val + 503) % 99999}"
@@ -2823,7 +3541,7 @@ def render_location_backdrop(
             ctype = str(resp.headers.get("content-type", "")).lower()
             if (
                 resp.status_code == 200
-                and len(resp.content) > 8000
+                and len(resp.content) > 6000
                 and ("image" in ctype or resp.content[:2] in (b"\xff\xd8", b"\x89P") or resp.content[:4] == b"RIFF")
             ):
                 bg_img = open_upright_image(resp.content).resize((W, H), Image.Resampling.LANCZOS)
@@ -2832,9 +3550,28 @@ def render_location_backdrop(
         except Exception:
             pass
 
-    # Absolute last resort: clean dark warm cinema plate (ZERO cartoon faces, ZERO raw selfies!)
-    plate = Image.new("RGB", (W, H), (18, 12, 16))
-    _draw_vertical_gradient(plate, (38, 18, 20), (14, 10, 18))
+    # Priority 6B: Mirror + Zoom any existing same-gender / wide master scene frame so a blank brown screen NEVER appears!
+    cached_photo = _reuse_cached_photorealistic_scene(W, H, hero_role, seed_val)
+    if cached_photo is not None:
+        return cached_photo
+
+    # Emergency ultra-short Pollinations fetch (no cooldown block) before any fallback
+    try:
+        em_prompt = urllib.parse.quote("Indian royal palace darbar hall live action drama actor waist up 8k dslr", safe="")
+        em_resp = requests.get(
+            f"https://image.pollinations.ai/prompt/{em_prompt}?width={W}&height={H}&model=turbo&nologo=true&seed={(seed_val + 911) % 99999}",
+            headers=headers,
+            timeout=10,
+        )
+        if em_resp.status_code == 200 and len(em_resp.content) > 5000:
+            em_img = open_upright_image(em_resp.content).resize((W, H), Image.Resampling.LANCZOS)
+            em_img.save(cache_path, "JPEG", quality=93)
+            return em_img
+    except Exception:
+        pass
+
+    plate = Image.new("RGB", (W, H), (22, 16, 28))
+    _draw_vertical_gradient(plate, (44, 24, 36), (18, 12, 24))
     return plate
 
 
@@ -4356,11 +5093,15 @@ def generate_free_ai_video_clip(
 
     try:
         # 1. Try Free Multi-Engine AI Video Auto-Rotation (Wan 2.1 -> LTX-Video -> CogVideoX-5B -> HunyuanVideo)
-        ai_vid, ai_engine_label = _try_ai_action_i2v_spaces(
-            framed_img_path if os.path.exists(framed_img_path) else angle_face_path,
-            visual_action_prompt,
-            mood,
-        )
+        # Strictly pass framed_img_path (AI haveli frame / face-swapped Hero), NEVER raw user bedroom selfie!
+        if os.path.exists(framed_img_path):
+            ai_vid, ai_engine_label = _try_ai_action_i2v_spaces(
+                framed_img_path,
+                visual_action_prompt,
+                mood,
+            )
+        else:
+            ai_vid, ai_engine_label = (None, "")
         if ai_vid and os.path.exists(ai_vid) and ai_engine_label:
             final_src_vid = ai_vid
             if angle_face_path and os.path.exists(angle_face_path):
@@ -4382,10 +5123,9 @@ def generate_free_ai_video_clip(
             if _mux_video_with_audio_and_sub(final_src_vid):
                 return f"{ai_engine_label} (30fps AI Video)"
 
-        # 2. Try Free Talking Lip-Sync (LivePortrait / SadTalker / Wav2Lip)
-        lipsync_target = framed_img_path if os.path.exists(framed_img_path) else angle_face_path
-        if lipsync_target and os.path.exists(lipsync_target):
-            talk_vid = _try_talking_lipsync_spaces(lipsync_target, audio_path)
+        # 2. Try Free Talking Lip-Sync (LivePortrait / SadTalker / Wav2Lip) strictly on framed haveli image
+        if os.path.exists(framed_img_path):
+            talk_vid = _try_talking_lipsync_spaces(framed_img_path, audio_path)
             if talk_vid and os.path.exists(talk_vid):
                 if _mux_video_with_audio_and_sub(talk_vid):
                     return "Live-Action TV Serial + LivePortrait/SadTalker"
@@ -4834,9 +5574,9 @@ async def autonomous_movie_worker(project_id: str):
                 state["status_text"] = "कहानी तैयार! अब Master Character Casting Sheet (Hero, Heroine, Villain, Saas) समानांतर बन रही है (12%)..."
                 save_state(proj_dir, state)
 
-        # ==================== MASTER CHARACTER CASTING SHEET (PARALLEL PRE-GENERATION) ====================
-        # Generates 6 photorealistic waist-up live-action haveli frames ONCE (with user Face-Swap on Hero once)
-        # and reuses them across all scenes & Parts -> consistent outfits + 5x faster 2-5 min series!
+        # ==================== MASTER CHARACTER CASTING SHEET (v12 MASTER PARALLEL PRE-GENERATION) ====================
+        # Calls build_master_casting_sheet() once (~4s parallel Cloudflare -> Together -> HF -> Pollinations)
+        # User's raw bedroom selfie NEVER appears directly on screen — ONLY Face-Swapped onto the AI Hero frame!
         master_cast_dir = f"{proj_dir}/master_cast"
         os.makedirs(master_cast_dir, exist_ok=True)
         master_cast: dict[str, str] = {}
@@ -4851,23 +5591,20 @@ async def autonomous_movie_worker(project_id: str):
         base_loc_key, base_loc_label = detect_location_meta(
             state.get("idea", ""), default_location or "Royal Palace"
         )
+        cast_w, cast_h = get_aspect_dimensions(aspect_ratio)
 
+        story_topic_text = str(state.get("idea") or "")
+        dynamic_topic_prompts = get_dynamic_character_prompts(story_topic_text)
         cast_specs = [
-            ("hero", hero_face_global, hero_display_global, "over_shoulder",
-             "handsome Indian hero in black royal bandhgala suit speaking firmly with expressive hand gesture inside grand royal haveli hall"),
-            ("female", "", "Heroine", "waist_up",
-             "emotional Indian heroine in crimson designer silk saree and gold jhumkas speaking with teary eyes inside grand royal haveli hall"),
-            ("villain", "", "Villain", "waist_up",
-             "intimidating Indian villain in dark velvet blazer confronting hero face-to-face with dramatic pointing hand gesture inside royal haveli hall"),
-            ("saas", "", "Saas", "waist_up",
-             "angry commanding Indian Saas in maroon Banarasi silk saree pointing finger dramatically at heroine inside royal haveli hall"),
-            ("wide_confrontation", "", "Narrator", "wide_confrontation",
-             "medium wide two-shot of angry Saas in maroon Banarasi silk saree pointing at Heroine in crimson saree while Hero in black bandhgala and Villain in velvet blazer stand face-to-face inside grand royal haveli hall"),
-            ("context_broll", "", "Narrator", "broll_insert",
-             "luxury black Mercedes sedan arriving at grand illuminated Indian royal haveli mansion iron gate at dusk, dramatic warm cinema lighting"),
+            ("hero", hero_face_global, hero_display_global, "over_shoulder", dynamic_topic_prompts["Hero"]),
+            ("female", "", "Heroine", "waist_up", dynamic_topic_prompts["Heroine"]),
+            ("villain", "", "Villain", "waist_up", dynamic_topic_prompts["Villain"]),
+            ("saas", "", "Saas", "waist_up", dynamic_topic_prompts["Saas"]),
+            ("wide_confrontation", "", "Narrator", "wide_confrontation", dynamic_topic_prompts["Wide_Confrontation"]),
+            ("context_broll", "", "Narrator", "broll_insert", dynamic_topic_prompts["Context_BRoll"]),
         ]
 
-        async def _build_master_cast_frame(role_key: str, raw_p: str, spk_label: str, shot_v: str, hint_p: str):
+        async def _build_master_cast_frame_fallback(role_key: str, raw_p: str, spk_label: str, shot_v: str, hint_p: str):
             out_p = f"{master_cast_dir}/{role_key}.jpg"
             if os.path.exists(out_p) and os.path.getsize(out_p) > 4000:
                 master_cast[role_key] = out_p
@@ -4890,7 +5627,7 @@ async def autonomous_movie_worker(project_id: str):
                 else:
                     await asyncio.to_thread(
                         prepare_character_frame,
-                        raw_p,
+                        raw_p if role_key == "hero" else "",
                         spk_label,
                         "",
                         out_p,
@@ -4910,10 +5647,87 @@ async def autonomous_movie_worker(project_id: str):
                 pass
 
         if not project_custom_bg:
-            await asyncio.gather(
-                *[_build_master_cast_frame(rk, rp, sl, sv, hp) for rk, rp, sl, sv, hp in cast_specs],
-                return_exceptions=True,
+            raw_casting = await build_master_casting_sheet(
+                master_cast_dir,
+                width=cast_w,
+                height=cast_h,
+                topic=story_topic_text,
             )
+            role_to_cast_key = {
+                "Hero": "hero",
+                "Heroine": "female",
+                "Villain": "villain",
+                "Saas": "saas",
+                "Wide_Confrontation": "wide_confrontation",
+                "Context_BRoll": "context_broll",
+            }
+            for sheet_role, cast_key in role_to_cast_key.items():
+                src_p = raw_casting.get(sheet_role)
+                if not src_p or not os.path.exists(src_p):
+                    continue
+                final_p = f"{master_cast_dir}/{cast_key}.jpg"
+                try:
+                    if cast_key == "hero":
+                        # Strictly Face-Swap user's selfie onto the AI Hero frame ONLY (NEVER raw bedroom selfie!)
+                        await asyncio.to_thread(
+                            _apply_hero_faceswap_to_master_frame,
+                            src_p,
+                            hero_face_global,
+                            final_p,
+                            cast_w,
+                            cast_h,
+                            watermark_text,
+                            watermark_position,
+                        )
+                    else:
+                        def _finalize_role_frame(in_path=src_p, out_path=final_p):
+                            im = open_upright_image(in_path).resize((cast_w, cast_h), Image.Resampling.LANCZOS)
+                            im = ImageEnhance.Contrast(im).enhance(1.06)
+                            im = ImageEnhance.Color(im).enhance(1.06)
+                            if watermark_text:
+                                draw_channel_watermark(im, watermark_text, watermark_position)
+                            im.save(out_path, "JPEG", quality=93)
+
+                        await asyncio.to_thread(_finalize_role_frame)
+                    if os.path.exists(final_p) and os.path.getsize(final_p) > 4000:
+                        master_cast[cast_key] = final_p
+                except Exception:
+                    pass
+
+            # Fallback for any missing character frame if a cloud API timed out
+            missing_specs = [spec for spec in cast_specs if spec[0] not in master_cast]
+            if missing_specs:
+                await asyncio.gather(
+                    *[_build_master_cast_frame_fallback(rk, rp, sl, sv, hp) for rk, rp, sl, sv, hp in missing_specs],
+                    return_exceptions=True,
+                )
+
+            # Final Zero-Blank-Screen Guarantee: fill any still-missing role from same-gender / wide master frame via mirror+zoom
+            cast_donor_prefs = {
+                "hero": ("hero", "villain", "wide_confrontation", "context_broll"),
+                "villain": ("villain", "hero", "wide_confrontation", "context_broll"),
+                "female": ("female", "saas", "wide_confrontation", "context_broll"),
+                "saas": ("saas", "female", "wide_confrontation", "context_broll"),
+                "wide_confrontation": ("wide_confrontation", "hero", "villain", "female", "context_broll"),
+                "context_broll": ("context_broll", "wide_confrontation", "hero", "villain"),
+            }
+            for idx_ck, (ck, _, _, _, _) in enumerate(cast_specs):
+                if ck in master_cast and os.path.exists(master_cast[ck]):
+                    continue
+                target_p = f"{master_cast_dir}/{ck}.jpg"
+                for donor_k in list(cast_donor_prefs.get(ck, ())) + list(master_cast.keys()):
+                    donor_p = master_cast.get(donor_k)
+                    if donor_p and os.path.exists(donor_p):
+                        if _create_mirrored_zoomed_variant(
+                            donor_p,
+                            target_p,
+                            cast_w,
+                            cast_h,
+                            mirror=(idx_ck % 2 == 1),
+                            zoom_ratio=0.07 + (idx_ck % 3) * 0.02,
+                        ):
+                            master_cast[ck] = target_p
+                            break
 
         chapters = state["outline"]["chapters"]
         manual_chunks = state.get("manual_chunks")
@@ -4978,89 +5792,61 @@ async def autonomous_movie_worker(project_id: str):
                             "visual_action_prompt": build_visual_action_prompt(
                                 spk_resolved, diag_clean, ll_i, line_mood, sfx_i
                             ),
+                            "broll": False,
                         }
                     )
 
-                cliff_instruction = (
-                    f"अंतिम सीन (आखिरी डायलॉग) में Narrator की आवाज़ में ज़बरदस्त सस्पेंस Cliffhanger ज़रूर डालो: "
-                    f"जैसे 'अगले पार्ट में जानिए असली सच — देखिए Part {ch_no + 1} में!'"
-                    if (series_mode == "series" and ch_no < total_ch_count)
-                    else "अंतिम सीन में धमाकेदार क्लाइमैक्स डायलॉग रखो।"
-                )
-                continuity_note = (
-                    f"पिछले Part {ch_no - 1} का आखिरी मोड़ (यहीं से कहानी आगे बढ़ाओ, बिल्कुल दोहराओ मत): {prev_episode_tail}"
-                    if prev_episode_tail
-                    else "यह कहानी की धमाकेदार शुरुआत है।"
-                )
-                script_prompt = f"""
-                सीरीज़/फिल्म: {state['outline']['title']} | पिछला सीन: {prev_plot}
-                {continuity_note}
-                वर्तमान Part {ch_no}/{total_ch_count}: {ch['plot']}
-                मुख्य कैरेक्टर (Hero): {hero_display}
-                मल्टी-कैरेक्टर कास्ट (ज़रूरी): {hero_display}, Heroine, Villain, Saas, और Narrator।
-                सख्त नियम:
-                1. एक ही Narrator की लंबी कहानी मत लिखो! Narrator सिर्फ पहला और आखिरी (max 20%) डायलॉग बोले।
-                2. बाकी 80% सीन्स में {hero_display}, Heroine, Villain, और Saas के बीच तीखे, इमोशनल और ट्विस्ट वाले डायलॉग्स हों।
-                3. भाषा / Dialect: {language} (हर डायलॉग बहुत छोटा, तीखा 8-12 शब्दों और 3-4.5 सेकंड का हो ताकि पूरा Part 30-45 सेकंड में क्रिस्प बने — कोई भी डायलॉग रिपीट मत करो!)
-                4. डायलॉग के अंदर कभी भी कैरेक्टर का नाम (जैसे 'Vikram:', 'Hero:') या 'Title:/Scene:/Location:' टैग मत लिखो — सिर्फ बोले जाने वाला डायलॉग लिखो!
-                {cliff_instruction}
-                ठीक {scenes_per_chapter} फास्ट-कट सीन्स लिखो।
-                सिर्फ JSON लिस्ट दो: [{{"character": "{hero_display}", "dialogue": "डायलॉग...", "location": "Royal Palace", "mood": "{default_mood}", "sfx": "none", "camera_angle": "front", "visual_action_prompt": "medium waist-up live-action Indian TV serial confrontation inside grand royal haveli hall"}}]
-                """
+                emotion_to_mood = {
+                    "angry": "Action",
+                    "confident": "Action",
+                    "shocked": "Suspense",
+                    "twist": "Suspense",
+                    "sad": "Emotional",
+                    "romantic": "Romantic",
+                }
                 try:
-                    s_raw_text, _story_brain = await asyncio.to_thread(
-                        _call_story_brain_auto_chain, script_prompt, 15.0
+                    director_topic = f"{state.get('idea', ch['plot'])} — {ch['plot']}"
+                    director_items = await director_generate_story(
+                        topic=director_topic,
+                        part_num=ch_no,
+                        prev_cliffhanger=prev_episode_tail or prev_plot,
                     )
-                    if s_raw_text:
-                        raw_list = safe_extract_json(s_raw_text, fallback_dialogues)
-                        if not isinstance(raw_list, list):
-                            raw_list = fallback_dialogues
-                        raw_list = raw_list[:scenes_per_chapter]
-                        dialogues = []
-                        seen_lines: set[str] = set()
-                        for idx_d, item in enumerate(raw_list):
-                            if not isinstance(item, dict):
-                                continue
-                            raw_spk = str(item.get("character", "")).strip()
-                            c_name = resolve_character_name(raw_spk, char_map, idx_d)
-                            diag_text = clean_spoken_dialogue(str(item.get("dialogue", "")))
-                            if len(diag_text) < 2:
-                                continue
-                            norm_k = re.sub(r"\s+", " ", diag_text.lower()).strip()
-                            if norm_k in seen_lines:
-                                continue
-                            seen_lines.add(norm_k)
-                            lk, ll = detect_location_meta(
-                                f"{item.get('location', '')} {diag_text}",
-                                item.get("location") or default_location,
-                            )
-                            mood_val = normalize_mood(item.get("mood", ""), default_mood)
-                            raw_sfx = str(item.get("sfx", "")).lower().strip()
-                            sfx_val = raw_sfx if raw_sfx in ALLOWED_SFX else detect_sfx_type(diag_text, lk, mood_val)
-                            vap = str(item.get("visual_action_prompt", "")).strip() or build_visual_action_prompt(
-                                c_name, diag_text, ll, mood_val, sfx_val
-                            )
-                            raw_ang = str(item.get("camera_angle", "")).lower().strip()
-                            cam_angle = (
-                                raw_ang
-                                if raw_ang in ALLOWED_FACE_ANGLES
-                                else detect_scene_angle(vap, diag_text, mood_val, sfx_val, idx_d)
-                            )
-                            dialogues.append(
-                                {
-                                    "character": c_name,
-                                    "dialogue": diag_text,
-                                    "location": ll,
-                                    "location_key": lk,
-                                    "mood": mood_val,
-                                    "sfx": sfx_val,
-                                    "camera_angle": cam_angle,
-                                    "visual_action_prompt": vap,
-                                }
-                            )
-                        if len(dialogues) < 4:
-                            dialogues = fallback_dialogues
-                    else:
+                    dialogues = []
+                    seen_lines: set[str] = set()
+                    for idx_d, item in enumerate((director_items or [])[:scenes_per_chapter]):
+                        if not isinstance(item, dict):
+                            continue
+                        raw_spk = str(item.get("speaker") or item.get("character") or "").strip()
+                        if raw_spk.lower() == "hero":
+                            raw_spk = hero_display
+                        c_name = resolve_character_name(raw_spk, char_map, idx_d)
+                        diag_text = clean_spoken_dialogue(str(item.get("dialogue", "")))
+                        if len(diag_text) < 2:
+                            continue
+                        norm_k = re.sub(r"\s+", " ", diag_text.lower()).strip()
+                        if norm_k in seen_lines:
+                            continue
+                        seen_lines.add(norm_k)
+                        lk, ll = detect_location_meta(diag_text, default_location or "Royal Palace")
+                        emo_raw = str(item.get("emotion", "")).lower().strip()
+                        mood_val = normalize_mood(emotion_to_mood.get(emo_raw, emo_raw), default_mood)
+                        sfx_val = detect_sfx_type(diag_text, lk, mood_val)
+                        vap = build_visual_action_prompt(c_name, diag_text, ll, mood_val, sfx_val)
+                        cam_angle = detect_scene_angle(vap, diag_text, mood_val, sfx_val, idx_d)
+                        dialogues.append(
+                            {
+                                "character": c_name,
+                                "dialogue": diag_text,
+                                "location": ll,
+                                "location_key": lk,
+                                "mood": mood_val,
+                                "sfx": sfx_val,
+                                "camera_angle": cam_angle,
+                                "visual_action_prompt": vap,
+                                "broll": bool(item.get("broll", False)),
+                            }
+                        )
+                    if len(dialogues) < 4:
                         dialogues = fallback_dialogues
                 except Exception:
                     dialogues = fallback_dialogues
@@ -5079,6 +5865,7 @@ async def autonomous_movie_worker(project_id: str):
                                 "sfx": "thunder",
                                 "camera_angle": "front",
                                 "visual_action_prompt": "dramatic medium wide confrontation cliffhanger inside royal Indian haveli hall",
+                                "broll": True,
                             }
                         )
 
@@ -5125,21 +5912,21 @@ async def autonomous_movie_worker(project_id: str):
                     )
 
                     char_entry = char_map.get(c_name)
-                    if ai_auto_cast:
+                    # User's raw selfie is STRICTLY for Hero face-swap only — never passed for non-Hero roles!
+                    if ai_auto_cast or role_kind != "hero":
                         exact_char_photo = ""
                         char_angles_dict = {}
-                    elif char_entry and role_kind not in ("narrator", "villain", "saas", "crowd"):
-                        exact_char_photo = select_character_angle_photo(char_entry, scene_angle)
-                        char_angles_dict = char_entry.get("angles") or {}
-                    elif char_entry and c_name in char_map:
+                    elif char_entry:
                         exact_char_photo = select_character_angle_photo(char_entry, scene_angle)
                         char_angles_dict = char_entry.get("angles") or {}
                     else:
                         exact_char_photo = ""
                         char_angles_dict = {}
 
-                    # Live-Action Waist-Up / Over-the-Shoulder / Wide Confrontation shot selection
-                    if role_kind == "narrator":
+                    # Live-Action Waist-Up / Over-the-Shoulder / Wide Confrontation / B-Roll shot selection
+                    if bool(d.get("broll", False)):
+                        scene_shot_variant = "broll_insert"
+                    elif role_kind == "narrator":
                         scene_shot_variant = "wide_confrontation"
                     elif role_kind == "hero":
                         scene_shot_variant = "over_shoulder"
@@ -5176,11 +5963,31 @@ async def autonomous_movie_worker(project_id: str):
                                 rate_override=tts_rate,
                             )
 
-                            # Reuse Master Character Casting Sheet frame immediately when available (5x faster + consistent outfits!)
-                            cast_lookup_key = "wide_confrontation" if role_kind == "narrator" else role_kind
+                            # Reuse Master Character Casting Sheet frame with strict Male/Female photo lock!
+                            if bool(d.get("broll", False)) and master_cast.get("context_broll"):
+                                cast_lookup_key = "context_broll"
+                            elif role_kind == "narrator":
+                                cast_lookup_key = "wide_confrontation"
+                            elif role_kind in ("female", "saas"):
+                                cast_lookup_key = role_kind if master_cast.get(role_kind) else ("female" if master_cast.get("female") else "saas")
+                            else:
+                                cast_lookup_key = role_kind if master_cast.get(role_kind) else ("hero" if master_cast.get("hero") else "villain")
+
                             master_frame_path = master_cast.get(cast_lookup_key) if not bg_override else None
                             if master_frame_path and os.path.exists(master_frame_path) and os.path.getsize(master_frame_path) > 4000:
-                                shutil.copyfile(master_frame_path, f_img)
+                                if cast_lookup_key != role_kind and role_kind not in ("narrator", "crowd"):
+                                    # Same-gender fallback frame: mirror + zoom so it looks distinct and never blank!
+                                    await asyncio.to_thread(
+                                        _create_mirrored_zoomed_variant,
+                                        master_frame_path,
+                                        f_img,
+                                        cast_w,
+                                        cast_h,
+                                        True,
+                                        0.08,
+                                    )
+                                else:
+                                    shutil.copyfile(master_frame_path, f_img)
                             else:
                                 await asyncio.to_thread(
                                     prepare_character_frame,
@@ -5226,12 +6033,38 @@ async def autonomous_movie_worker(project_id: str):
                         except Exception:
                             try:
                                 if not os.path.exists(a_file):
-                                    await generate_bulletproof_audio(diag_text, tts_voice, a_file, language=language)
-                                if not os.path.exists(f_img):
+                                    await generate_bulletproof_audio(
+                                        diag_text,
+                                        tts_voice,
+                                        a_file,
+                                        language=language,
+                                        pitch_override=tts_pitch,
+                                        rate_override=tts_rate,
+                                    )
+                                if not os.path.exists(f_img) or os.path.getsize(f_img) < 4000:
                                     w_fb, h_fb = get_aspect_dimensions(aspect_ratio)
-                                    fb_bg = Image.new("RGB", (w_fb, h_fb), (18, 12, 32))
-                                    _draw_vertical_gradient(fb_bg, (24, 14, 46), (62, 22, 48))
-                                    fb_bg.save(f_img, "JPEG", quality=90)
+                                    # Never show a blank brown frame: mirror + zoom any downloaded master image!
+                                    gender_donors = (
+                                        ("female", "saas", "wide_confrontation", "hero", "context_broll")
+                                        if role_kind in ("female", "saas")
+                                        else ("hero", "villain", "wide_confrontation", "context_broll", "female")
+                                    )
+                                    recovered = False
+                                    for dk in gender_donors:
+                                        dp = master_cast.get(dk)
+                                        if dp and os.path.exists(dp):
+                                            if _create_mirrored_zoomed_variant(dp, f_img, w_fb, h_fb, mirror=(i % 2 == 1), zoom_ratio=0.08):
+                                                recovered = True
+                                                break
+                                    if not recovered:
+                                        cached_fb = _reuse_cached_photorealistic_scene(w_fb, h_fb, role_kind, i + 17)
+                                        if cached_fb is not None:
+                                            cached_fb.save(f_img, "JPEG", quality=92)
+                                            recovered = True
+                                    if not recovered:
+                                        fb_bg = Image.new("RGB", (w_fb, h_fb), (18, 12, 32))
+                                        _draw_vertical_gradient(fb_bg, (24, 14, 46), (62, 22, 48))
+                                        fb_bg.save(f_img, "JPEG", quality=90)
                                 await asyncio.to_thread(
                                     _render_pro_motion_vfx_clip,
                                     f_img,
