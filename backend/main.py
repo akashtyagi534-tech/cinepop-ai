@@ -1216,9 +1216,73 @@ async def director_generate_story(topic: str, part_num: int = 1, prev_cliffhange
     return _build_topic_aware_director_fallback(topic=topic, part_num=part_num, prev_cliffhanger=prev_cliffhanger)
 
 
-# 4. AUTO-FAILOVER IMAGE ENGINE (Cloudflare -> Together -> HF -> Pollinations)
-async def fetch_single_master_frame(role: str, prompt: str, out_path: str, width: int = 720, height: int = 1280) -> str:
+def _is_valid_non_black_image_file(img_path: str, min_bytes: int = 4500) -> bool:
+    """
+    Verify an image file is a valid readable image AND is NOT a dark/black/blank frame
+    (checks mean luminance & standard deviation so rate-limit/black images are immediately rejected!).
+    """
+    try:
+        if not img_path or not os.path.exists(img_path) or os.path.getsize(img_path) < min_bytes:
+            return False
+        im = open_upright_image(img_path).resize((96, 96), Image.Resampling.BILINEAR)
+        if np is not None:
+            arr = np.asarray(im, dtype=np.float32)
+            mean_val = float(arr.mean())
+            std_val = float(arr.std())
+            # Reject black/near-black frames or flat solid-color frames
+            if mean_val < 20.0 or std_val < 10.0:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _render_rich_cinematic_palace_actor_fallback(
+    out_path: str,
+    role: str = "Hero",
+    width: int = 720,
+    height: int = 1280,
+) -> str:
+    """
+    Emergency 100% non-black, richly lit royal Indian palace / atmospheric character silhouette + golden chandelier canvas
+    if every internet provider is offline and zero donor images exist yet.
+    """
+    img = Image.new("RGB", (width, height), (54, 28, 18))
+    _draw_vertical_gradient(img, (98, 48, 24), (36, 18, 28))
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    cx, cy = width // 2, int(height * 0.36)
+    # Warm golden chandelier & royal arch glow
+    for rad, alpha in ((int(width * 0.55), 45), (int(width * 0.38), 75), (int(width * 0.22), 110)):
+        od.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], fill=(255, 195, 75, alpha))
+    # Ornate golden palace pillars
+    pw = max(24, int(width * 0.07))
+    od.rectangle([int(width * 0.06), 0, int(width * 0.06) + pw, height], fill=(165, 110, 42, 120))
+    od.rectangle([int(width * 0.94) - pw, 0, int(width * 0.94), height], fill=(165, 110, 42, 120))
+    # Atmospheric fire/mist embers
+    rng = random.Random(abs(hash(role)) + 77)
+    for _ in range(42):
+        ex = rng.randint(20, width - 20)
+        ey = rng.randint(40, height - 40)
+        er = rng.randint(3, 9)
+        od.ellipse([ex - er, ey - er, ex + er, ey + er], fill=(255, 210, 115, rng.randint(60, 155)))
+    composed = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    composed.save(out_path, "JPEG", quality=93)
+    return out_path
+
+
+# 4. AUTO-FAILOVER IMAGE ENGINE (Cloudflare -> Together -> HF -> Pollinations Flux + Fast Turbo Retry)
+async def fetch_single_master_frame(
+    role: str,
+    prompt: str,
+    out_path: str,
+    width: int = 720,
+    height: int = 1280,
+    role_idx: int = 0,
+) -> str:
     _sync_runtime_api_vault_from_config()
+    role_seed_base = (abs(hash(f"{role}_{prompt[:48]}_{int(time.time()) // 60}")) + role_idx * 7919) % 899999 + 100000
+
     # Priority 1: Cloudflare Workers AI (@cf/black-forest-labs/flux-1-schnell)
     cf_id = RUNTIME_API_VAULT.get("CF_ACCOUNT_ID", "").strip()
     cf_tok = RUNTIME_API_VAULT.get("CF_API_TOKEN", "").strip()
@@ -1233,8 +1297,9 @@ async def fetch_single_master_frame(role: str, prompt: str, out_path: str, width
                     if img_b64:
                         with open(out_path, "wb") as f:
                             f.write(base64.b64decode(img_b64))
-                        API_HEALTH_STATUS["cloudflare"] = "active"
-                        return out_path
+                        if _is_valid_non_black_image_file(out_path):
+                            API_HEALTH_STATUS["cloudflare"] = "active"
+                            return out_path
             API_HEALTH_STATUS["cloudflare"] = "quota_full"
         except Exception:
             API_HEALTH_STATUS["cloudflare"] = "error"
@@ -1253,6 +1318,7 @@ async def fetch_single_master_frame(role: str, prompt: str, out_path: str, width
                         "width": 768,
                         "height": 1024,
                         "steps": 4,
+                        "seed": role_seed_base,
                         "response_format": "b64_json",
                     },
                 )
@@ -1260,8 +1326,9 @@ async def fetch_single_master_frame(role: str, prompt: str, out_path: str, width
                     img_b64 = r.json()["data"][0]["b64_json"]
                     with open(out_path, "wb") as f:
                         f.write(base64.b64decode(img_b64))
-                    API_HEALTH_STATUS["together"] = "active"
-                    return out_path
+                    if _is_valid_non_black_image_file(out_path):
+                        API_HEALTH_STATUS["together"] = "active"
+                        return out_path
             API_HEALTH_STATUS["together"] = "quota_full"
         except Exception:
             API_HEALTH_STATUS["together"] = "error"
@@ -1279,25 +1346,42 @@ async def fetch_single_master_frame(role: str, prompt: str, out_path: str, width
                 if r.status_code == 200 and len(r.content) > 5000:
                     with open(out_path, "wb") as f:
                         f.write(r.content)
-                    API_HEALTH_STATUS["huggingface"] = "active"
-                    return out_path
+                    if _is_valid_non_black_image_file(out_path):
+                        API_HEALTH_STATUS["huggingface"] = "active"
+                        return out_path
             API_HEALTH_STATUS["huggingface"] = "quota_full"
         except Exception:
             API_HEALTH_STATUS["huggingface"] = "error"
 
-    # Priority 4: Pollinations AI (Free No-Key Unlimited — Flux + Turbo Retry so images never fail!)
-    for model_name in ("flux", "turbo"):
+    # Priority 4: Pollinations AI (`model=flux` -> immediate fast `model=turbo` retry with distinct role seed!)
+    pollinations_attempts = [
+        ("flux", prompt[:380], role_seed_base, 11.0),
+        ("turbo", prompt[:260], role_seed_base + 313, 10.0),
+        (
+            "turbo",
+            f"Live-action Indian royal drama medium waist-up shot of {role}, {prompt[:160]}, warm golden palace lighting, 8k DSLR",
+            role_seed_base + 997,
+            9.0,
+        ),
+    ]
+    for model_name, p_text, seed_v, t_out in pollinations_attempts:
         try:
-            enc = urllib.parse.quote(prompt[:420])
-            seed = random.randint(1000, 999999)
-            url = f"https://image.pollinations.ai/prompt/{enc}?width={width}&height={height}&model={model_name}&nologo=true&seed={seed}"
-            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client_http:
-                r = await client_http.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            enc = urllib.parse.quote(p_text)
+            url = f"https://image.pollinations.ai/prompt/{enc}?width={width}&height={height}&model={model_name}&nologo=true&seed={seed_v}"
+            async with httpx.AsyncClient(timeout=t_out, follow_redirects=True) as client_http:
+                r = await client_http.get(
+                    url,
+                    headers={
+                        "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) CinePopStudio/{role_idx + 1}.0",
+                        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    },
+                )
                 if r.status_code == 200 and len(r.content) > 5000:
                     with open(out_path, "wb") as f:
                         f.write(r.content)
-                    API_HEALTH_STATUS["pollinations"] = "active"
-                    return out_path
+                    if _is_valid_non_black_image_file(out_path):
+                        API_HEALTH_STATUS["pollinations"] = "active"
+                        return out_path
         except Exception:
             continue
 
@@ -1310,54 +1394,78 @@ def _create_mirrored_zoomed_variant(
     width: int,
     height: int,
     mirror: bool = True,
-    zoom_ratio: float = 0.08,
+    zoom_ratio: float = 0.11,
+    color_grade: str = "golden",
 ) -> bool:
     """
-    Create a visually distinct mirrored + cinematic zoomed frame from an already downloaded master image
-    so a failed image fetch NEVER shows a blank brown screen!
+    Create a visually distinct horizontal-flipped + warm golden/royal color-graded + strong digital zoomed
+    + atmospheric (warm golden light / royal mist / ember glow) frame from an available character photo
+    so a failed image fetch NEVER shows a black or duplicate frame!
     """
     try:
-        if not src_img_path or not os.path.exists(src_img_path) or os.path.getsize(src_img_path) < 4000:
+        if not _is_valid_non_black_image_file(src_img_path):
             return False
         img = open_upright_image(src_img_path).resize((width, height), Image.Resampling.LANCZOS)
         if mirror:
             img = ImageOps.mirror(img)
-        mx = max(10, int(width * zoom_ratio))
-        my = max(10, int(height * zoom_ratio))
+        mx = max(14, int(width * zoom_ratio))
+        my = max(14, int(height * zoom_ratio))
         if width - 2 * mx > 100 and height - 2 * my > 100:
             img = img.crop((mx, my, width - mx, height - my)).resize((width, height), Image.Resampling.LANCZOS)
-        img = ImageEnhance.Contrast(img).enhance(1.05)
+
+        # Apply warm golden / royal / atmospheric color grade + mist/ember overlay
+        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        if color_grade == "royal":
+            od.rectangle([0, 0, width, height], fill=(215, 140, 45, 34))
+            od.ellipse([-int(width * 0.2), -int(height * 0.15), int(width * 0.8), int(height * 0.45)], fill=(255, 200, 90, 42))
+        elif color_grade == "mist":
+            od.rectangle([0, 0, width, height], fill=(180, 145, 95, 30))
+            od.rectangle([0, int(height * 0.58), width, height], fill=(235, 195, 130, 44))
+        else:
+            # Default warm golden palace grade
+            od.rectangle([0, 0, width, height], fill=(245, 175, 55, 36))
+            od.ellipse([int(width * 0.15), -int(height * 0.1), int(width * 0.85), int(height * 0.5)], fill=(255, 215, 110, 40))
+
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        img = ImageEnhance.Contrast(img).enhance(1.08)
+        img = ImageEnhance.Color(img).enhance(1.12)
+        img = ImageEnhance.Brightness(img).enhance(1.04)
         img.save(out_img_path, "JPEG", quality=93)
-        return os.path.exists(out_img_path) and os.path.getsize(out_img_path) > 4000
+        return _is_valid_non_black_image_file(out_img_path)
     except Exception:
         return False
 
 
-# 5. PARALLEL MASTER CASTING SHEET (Generates All 6 Topic-Aware Characters Once + Zero Blank Screen Guarantee!)
+# 5. STAGGERED 1.2s MASTER CASTING SHEET (Avoids Rate-Limit + 0% Black Screen Guarantee!)
 async def build_master_casting_sheet(
     work_dir: str,
     width: int = 720,
     height: int = 1280,
     topic: str = "",
 ) -> dict[str, str]:
+    """
+    Fetch all 6 topic-aware roles (`Wide_Confrontation`, `Hero/Raja`, `Heroine/Rani`, `Villain`, `Saas`, `Context_BRoll`)
+    with a mandatory 1.2-second stagger delay and distinct seeds so Pollinations/Free APIs never rate-limit or return black images!
+    If any role times out, immediately recovers via fast turbo retry -> local same-gender cached photo -> horizontal flip + warm golden/royal color grade + zoom!
+    """
     os.makedirs(work_dir, exist_ok=True)
     dynamic_prompts = get_dynamic_character_prompts(topic)
-    tasks = {}
-    for role, prompt in dynamic_prompts.items():
-        out_file = os.path.join(work_dir, f"master_{role.lower()}.jpg")
-        if os.path.exists(out_file) and os.path.getsize(out_file) > 5000:
-            async def _existing(p=out_file):
-                return p
-            tasks[role] = _existing()
-        else:
-            tasks[role] = fetch_single_master_frame(role, prompt, out_file, width, height)
-    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
     casting: dict[str, str] = {}
-    for role, res in zip(tasks.keys(), results):
-        if isinstance(res, str) and res and os.path.exists(res) and os.path.getsize(res) > 4000:
+
+    for idx_r, (role, prompt) in enumerate(dynamic_prompts.items()):
+        out_file = os.path.join(work_dir, f"master_{role.lower()}.jpg")
+        if _is_valid_non_black_image_file(out_file, min_bytes=5000):
+            casting[role] = out_file
+            continue
+        if idx_r > 0:
+            # Mandatory 1.2s delay between role fetches so free image servers never rate-limit!
+            await asyncio.sleep(1.2)
+        res = await fetch_single_master_frame(role, prompt, out_file, width, height, role_idx=idx_r)
+        if res and _is_valid_non_black_image_file(res):
             casting[role] = res
 
-    # Strict Gender-Aware & Wide-Scene Mirror/Zoom Recovery so NO character slot is ever missing or blank!
+    # Strict Gender-Aware & Atmospheric Golden/Royal Grade Recovery so NO character slot is ever missing or black!
     fallback_preference = {
         "Hero": ("Hero", "Villain", "Wide_Confrontation", "Context_BRoll"),
         "Villain": ("Villain", "Hero", "Wide_Confrontation", "Context_BRoll"),
@@ -1366,24 +1474,55 @@ async def build_master_casting_sheet(
         "Wide_Confrontation": ("Wide_Confrontation", "Hero", "Villain", "Heroine", "Context_BRoll"),
         "Context_BRoll": ("Context_BRoll", "Wide_Confrontation", "Hero", "Villain"),
     }
+    grade_cycle = ("golden", "royal", "mist")
+    role_to_internal = {
+        "Hero": "hero",
+        "Heroine": "female",
+        "Villain": "villain",
+        "Saas": "saas",
+        "Wide_Confrontation": "wide_confrontation",
+        "Context_BRoll": "context_broll",
+    }
+
     for idx_r, role in enumerate(dynamic_prompts.keys()):
-        if role in casting and os.path.exists(casting[role]):
+        if role in casting and _is_valid_non_black_image_file(casting[role]):
             continue
         out_file = os.path.join(work_dir, f"master_{role.lower()}.jpg")
+
+        # Try pre-cached same-gender/role image from local cache first
+        internal_rk = role_to_internal.get(role, "hero")
+        cached_im = _reuse_cached_photorealistic_scene(width, height, internal_rk, idx_r + 101)
+        if cached_im is not None:
+            try:
+                cached_im.save(out_file, "JPEG", quality=93)
+                if _is_valid_non_black_image_file(out_file):
+                    casting[role] = out_file
+                    continue
+            except Exception:
+                pass
+
+        # Otherwise horizontal flip + warm golden/royal color grade + digital zoom on available master frame
         prefs = list(fallback_preference.get(role, ())) + list(casting.keys())
         for donor_role in prefs:
             donor_path = casting.get(donor_role)
-            if donor_path and os.path.exists(donor_path):
+            if donor_path and _is_valid_non_black_image_file(donor_path):
                 if _create_mirrored_zoomed_variant(
                     donor_path,
                     out_file,
                     width,
                     height,
-                    mirror=(idx_r % 2 == 0),
-                    zoom_ratio=0.06 + (idx_r % 3) * 0.03,
+                    mirror=True,
+                    zoom_ratio=0.09 + (idx_r % 3) * 0.03,
+                    color_grade=grade_cycle[idx_r % len(grade_cycle)],
                 ):
                     casting[role] = out_file
                     break
+
+        # Final safety: rich golden palace canvas (never black!)
+        if role not in casting or not _is_valid_non_black_image_file(casting.get(role, "")):
+            _render_rich_cinematic_palace_actor_fallback(out_file, role=role, width=width, height=height)
+            casting[role] = out_file
+
     return casting
 
 
@@ -3326,10 +3465,10 @@ def _try_hf_fast_image_spaces(prompt: str, W: int, H: int, seed_val: int, cfg: d
 
 def _reuse_cached_photorealistic_scene(W: int, H: int, hero_role: str, seed_val: int) -> Optional[Image.Image]:
     """
-    STRICT GENDER & SPEAKER SYNC + ZERO BLANK BROWN SCREEN:
-    1. First try cached frame matching exact `hero_role`.
-    2. Next try same-gender cached frame (male: hero/villain, female: female/saas) mirrored + zoomed.
-    3. Next try any successfully downloaded master/cached scene frame mirrored + zoomed so a blank brown screen NEVER appears!
+    STRICT GENDER & SPEAKER SYNC + ZERO BLACK SCREEN:
+    1. First try valid non-black cached frame matching exact `hero_role`.
+    2. Next try same-gender valid non-black cached frame (male: hero/villain, female: female/saas) horizontally flipped + warm golden graded + zoomed.
+    3. Next try any valid non-black master/cached scene frame horizontally flipped + warm golden graded + zoomed so a black screen NEVER appears!
     """
     try:
         candidates = [
@@ -3337,15 +3476,19 @@ def _reuse_cached_photorealistic_scene(W: int, H: int, hero_role: str, seed_val:
             for f in os.listdir("/tmp")
             if f.startswith("cinepop_tv_") and f.endswith(".jpg")
         ]
-        # Also include any downloaded master_cast images from active projects
         if os.path.isdir("all_projects"):
-            for p_id in os.listdir("all_projects")[:15]:
+            for p_id in os.listdir("all_projects")[:20]:
                 mc_dir = os.path.join("all_projects", p_id, "master_cast")
                 if os.path.isdir(mc_dir):
                     for mf in os.listdir(mc_dir):
                         if mf.endswith(".jpg"):
                             candidates.append(os.path.join(mc_dir, mf))
-        valid_files = [p for p in candidates if os.path.exists(p) and os.path.getsize(p) > 6000]
+        if os.path.isdir("all_characters"):
+            for cf in os.listdir("all_characters")[:15]:
+                if cf.lower().endswith((".jpg", ".jpeg", ".png")):
+                    candidates.append(os.path.join("all_characters", cf))
+
+        valid_files = [p for p in candidates if _is_valid_non_black_image_file(p, min_bytes=5000)]
         if not valid_files:
             return None
 
@@ -3367,12 +3510,16 @@ def _reuse_cached_photorealistic_scene(W: int, H: int, hero_role: str, seed_val:
         pool = exact_matches or gender_matches or valid_files
         chosen = pool[seed_val % len(pool)]
         img = open_upright_image(chosen).resize((W, H), Image.Resampling.LANCZOS)
-        # Apply mirror + subtle cinematic zoom when reusing across cuts so every frame looks dynamic
+        # Apply horizontal flip + warm golden/royal color grade + digital zoom when reusing across cuts
         if not exact_matches or (seed_val % 2 == 1):
             img = ImageOps.mirror(img)
-        margin_x = max(10, int(W * 0.06))
-        margin_y = max(10, int(H * 0.06))
+        margin_x = max(14, int(W * 0.08))
+        margin_y = max(14, int(H * 0.08))
         img = img.crop((margin_x, margin_y, W - margin_x, H - margin_y)).resize((W, H), Image.Resampling.LANCZOS)
+        overlay = Image.new("RGBA", (W, H), (240, 170, 55, 32))
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        img = ImageEnhance.Contrast(img).enhance(1.07)
+        img = ImageEnhance.Color(img).enhance(1.10)
         return img
     except Exception:
         return None
@@ -3550,7 +3697,7 @@ def render_location_backdrop(
         except Exception:
             pass
 
-    # Priority 6B: Mirror + Zoom any existing same-gender / wide master scene frame so a blank brown screen NEVER appears!
+    # Priority 6B: Mirror + Warm Golden Grade + Zoom any existing same-gender / wide master scene frame so a black screen NEVER appears!
     cached_photo = _reuse_cached_photorealistic_scene(W, H, hero_role, seed_val)
     if cached_photo is not None:
         return cached_photo
@@ -3566,13 +3713,14 @@ def render_location_backdrop(
         if em_resp.status_code == 200 and len(em_resp.content) > 5000:
             em_img = open_upright_image(em_resp.content).resize((W, H), Image.Resampling.LANCZOS)
             em_img.save(cache_path, "JPEG", quality=93)
-            return em_img
+            if _is_valid_non_black_image_file(cache_path):
+                return em_img
     except Exception:
         pass
 
-    plate = Image.new("RGB", (W, H), (22, 16, 28))
-    _draw_vertical_gradient(plate, (44, 24, 36), (18, 12, 24))
-    return plate
+    tmp_fb = f"/tmp/cinepop_palace_fb_{hero_role}_{W}x{H}.jpg"
+    _render_rich_cinematic_palace_actor_fallback(tmp_fb, role=hero_role, width=W, height=H)
+    return open_upright_image(tmp_fb).resize((W, H), Image.Resampling.LANCZOS)
 
 
 def draw_channel_watermark(
@@ -4548,9 +4696,11 @@ def _build_overlay_ffmpeg_cmd(
 
     cmd.extend([
         "-r", str(fps),
-        "-shortest",
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "24",
+        "-t", f"{max(1.5, float(dur)):.2f}",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "23",
+        "-g", str(fps), "-bf", "0", "-video_track_timescale", "15360",
         "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "96k",
+        "-movflags", "+faststart",
         out_mp4,
     ])
     return cmd
@@ -4973,9 +5123,11 @@ def _render_multishot_pollinations_motion_clip(
         "-map", f"[{cur_v}]",
         "-map", f"{audio_idx}:a:0",
         "-r", str(fps),
-        "-shortest",
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "24",
+        "-t", f"{max(1.5, float(dur)):.2f}",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "23",
+        "-g", str(fps), "-bf", "0", "-video_track_timescale", "15360",
         "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "96k",
+        "-movflags", "+faststart",
         out_mp4,
     ])
     try:
@@ -5289,6 +5441,10 @@ def render_exact_face_clip(
 
 
 def ffmpeg_concat(file_list: list, out_path: str):
+    """
+    Stitch scene clips into an episode/movie with regenerated PTS/DTS timestamps (`+genpts`)
+    and uniform 30fps yuv420p H.264 stream so the video player NEVER stalls or shows a black screen after Scene 1!
+    """
     valid_files = [
         f for f in file_list if os.path.exists(f) and os.path.getsize(f) > 500
     ]
@@ -5298,14 +5454,33 @@ def ffmpeg_concat(file_list: list, out_path: str):
     with open(txt, "w", encoding="utf-8") as f:
         for item in valid_files:
             f.write(f"file '{os.path.abspath(item)}'\n")
-    subprocess.run(
-        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", txt, "-c", "copy", out_path],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if os.path.exists(txt):
-        os.remove(txt)
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-fflags", "+genpts", "-f", "concat", "-safe", "0", "-i", txt,
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-r", "30", "-crf", "23",
+                "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "96k",
+                "-movflags", "+faststart",
+                out_path,
+            ],
+            check=True,
+            timeout=120,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        subprocess.run(
+            ["ffmpeg", "-y", "-fflags", "+genpts", "-f", "concat", "-safe", "0", "-i", txt, "-c", "copy", "-movflags", "+faststart", out_path],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    finally:
+        if os.path.exists(txt):
+            try:
+                os.remove(txt)
+            except Exception:
+                pass
 
 
 def rebuild_parts_and_full(proj_dir: str, state: dict):
@@ -6041,30 +6216,36 @@ async def autonomous_movie_worker(project_id: str):
                                         pitch_override=tts_pitch,
                                         rate_override=tts_rate,
                                     )
-                                if not os.path.exists(f_img) or os.path.getsize(f_img) < 4000:
+                                if not _is_valid_non_black_image_file(f_img):
                                     w_fb, h_fb = get_aspect_dimensions(aspect_ratio)
-                                    # Never show a blank brown frame: mirror + zoom any downloaded master image!
+                                    # Zero Black Screen Guarantee: horizontal flip + warm golden/royal grade + zoom on any available master image!
                                     gender_donors = (
-                                        ("female", "saas", "wide_confrontation", "hero", "context_broll")
+                                        ("female", "saas", "wide_confrontation", "hero", "villain", "context_broll")
                                         if role_kind in ("female", "saas")
-                                        else ("hero", "villain", "wide_confrontation", "context_broll", "female")
+                                        else ("hero", "villain", "wide_confrontation", "context_broll", "female", "saas")
                                     )
                                     recovered = False
                                     for dk in gender_donors:
                                         dp = master_cast.get(dk)
-                                        if dp and os.path.exists(dp):
-                                            if _create_mirrored_zoomed_variant(dp, f_img, w_fb, h_fb, mirror=(i % 2 == 1), zoom_ratio=0.08):
+                                        if dp and _is_valid_non_black_image_file(dp):
+                                            if _create_mirrored_zoomed_variant(
+                                                dp,
+                                                f_img,
+                                                w_fb,
+                                                h_fb,
+                                                mirror=True,
+                                                zoom_ratio=0.09 + (i % 3) * 0.02,
+                                                color_grade="royal" if role_kind in ("hero", "female") else "golden",
+                                            ):
                                                 recovered = True
                                                 break
                                     if not recovered:
                                         cached_fb = _reuse_cached_photorealistic_scene(w_fb, h_fb, role_kind, i + 17)
                                         if cached_fb is not None:
                                             cached_fb.save(f_img, "JPEG", quality=92)
-                                            recovered = True
+                                            recovered = _is_valid_non_black_image_file(f_img)
                                     if not recovered:
-                                        fb_bg = Image.new("RGB", (w_fb, h_fb), (18, 12, 32))
-                                        _draw_vertical_gradient(fb_bg, (24, 14, 46), (62, 22, 48))
-                                        fb_bg.save(f_img, "JPEG", quality=90)
+                                        _render_rich_cinematic_palace_actor_fallback(f_img, role=c_name, width=w_fb, height=h_fb)
                                 await asyncio.to_thread(
                                     _render_pro_motion_vfx_clip,
                                     f_img,
