@@ -420,19 +420,21 @@ def resolve_character_voice_profile(
             return ("en-IN-PrabhatNeural", "-12Hz", "-6%")
         return ("en-IN-PrabhatNeural", "+3Hz", "+2%")
 
-    # Hindi strict gender lock: Female -> hi-IN-SwaraNeural ONLY, Male -> hi-IN-MadhurNeural ONLY
+    # Hindi strict gender lock & natural conversational character voices (Storyteller tone removed!):
+    # - Hero/Raja: hi-IN-MadhurNeural (rate="+6%", pitch="-2Hz")
+    # - Villain/Bhoot/Mantri: hi-IN-MadhurNeural (rate="-4%", pitch="-10Hz")
+    # - Heroine/Rani: hi-IN-SwaraNeural (rate="+5%", pitch="+3Hz")
+    # - Saas/Rajmata/Chudail: hi-IN-SwaraNeural (rate="-3%", pitch="-5Hz")
     if is_female:
         if role == "saas":
-            return ("hi-IN-SwaraNeural", "+6Hz", "+4%")
-        return ("hi-IN-SwaraNeural", "+4Hz", "+2%")
+            return ("hi-IN-SwaraNeural", "-5Hz", "-3%")
+        return ("hi-IN-SwaraNeural", "+3Hz", "+5%")
 
-    if role == "narrator":
-        return ("hi-IN-MadhurNeural", "-4Hz", "+3%")
     if role == "villain":
-        return ("hi-IN-MadhurNeural", "-12Hz", "-6%")
+        return ("hi-IN-MadhurNeural", "-10Hz", "-4%")
     if role == "crowd":
-        return ("hi-IN-MadhurNeural", "+6Hz", "+5%")
-    return ("hi-IN-MadhurNeural", "+3Hz", "+2%")
+        return ("hi-IN-MadhurNeural", "+2Hz", "+5%")
+    return ("hi-IN-MadhurNeural", "-2Hz", "+6%")
 
 
 def _get_or_create_role_portrait(role_kind: str, proj_dir: str) -> Optional[str]:
@@ -905,6 +907,8 @@ def _detect_topic_story_archetype(topic: str) -> str:
         return "police_thriller"
     if any(k in low for k in ("comedy", "funny", "mazaak", "hasna", "jugaad", "padosi", "kanjoos", "कॉमेडी", "मज़ाक", "मजाक", "हंसी", "जुगाड़", "पड़ोसी", "कंजूस")):
         return "comedy_drama"
+    if any(k in low for k in ("pyar", "pyaar", "love", "ishq", "mohabbat", "ladki", "shaadi", "shadi", "dil", "bewafa", "romance", "romantic", "breakup", "प्यार", "इश्क़", "इश्क", "मोहब्बत", "लड़की", "शादी", "दिल", "बेवफा", "प्रेम")):
+        return "love_romance"
     return "custom_topic"
 
 
@@ -1051,115 +1055,211 @@ def get_dynamic_character_prompts(topic: str = "") -> dict[str, str]:
             ),
         }
 
+    if archetype == "love_romance":
+        set_base = (
+            f"Live-action Bollywood romantic emotional TV drama frame, {topic_hint}"
+            "inside a grand warmly lit Indian heritage courtyard and haveli balcony with fairy lights and evening sunset glow, "
+            "35mm DSLR camera, medium waist-up framing showing full upper body and expressive hand gestures, no cartoon, no extreme close-up."
+        )
+        return {
+            "Wide_Confrontation": (
+                f"Medium wide two-shot emotional confrontation, {set_base} "
+                "Handsome Indian male hero in dark bandhgala kurta standing face-to-face with beautiful Indian female heroine in crimson chiffon saree while stern male antagonist watches."
+            ),
+            "Hero": (
+                f"Medium waist-up front-facing shot of ONE handsome young Indian MALE romantic hero only, {set_base} "
+                "man with neat short hair and light stubble wearing tailored navy-and-gold ethnic kurta-jacket looking straight at camera with intense emotional expression, strictly male actor."
+            ),
+            "Heroine": (
+                f"Medium waist-up front-facing shot of ONE beautiful young Indian FEMALE romantic heroine only, {set_base} "
+                "woman wearing flowing red-and-gold designer chiffon saree, delicate jhumkas and bindi speaking emotionally face-to-face with expressive eyes, strictly female actress."
+            ),
+            "Villain": (
+                f"Medium waist-up front-facing shot of ONE arrogant Indian MALE rival villain only, {set_base} "
+                "sharp-featured bearded man in dark black-and-burgundy tailored velvet blazer glaring angrily and pointing finger, strictly male actor."
+            ),
+            "Saas": (
+                f"Medium waist-up front-facing shot of ONE strict aristocratic Indian FEMALE matriarch mother only, {set_base} "
+                "older woman in rich emerald-and-gold Kanjeevaram silk saree and pearl necklace looking sternly with dramatic gesture, strictly female actress."
+            ),
+            "Context_BRoll": (
+                "Cinematic insert B-Roll shot of a glowing Indian palace terrace and courtyard decorated with golden lamps and marigold flowers at twilight rain, 8k DSLR live-action."
+            ),
+        }
+
     return dict(CHARACTER_PROMPTS)
 
 
 def _build_topic_aware_director_fallback(topic: str, part_num: int = 1, prev_cliffhanger: str = "") -> list[dict]:
     """
-    100% TOPIC-AWARE HINDI MULTI-CHARACTER FALLBACK STORY:
-    Reads the user's exact topic (Raja/Bhoot, Jungle, Police, Comedy, or Custom Topic)
-    and builds an authentic 7-dialogue script with topic-accurate characters.
-    ZERO hardcoded 'ghar jamai / sasural' lines!
+    100% FACE-TO-FACE PURE HINDI CHARACTER DIALOGUE GENERATOR (0% NARRATOR!):
+    - ZERO Narrator storytelling lines ("और इस तरह ... रहस्य से पर्दा उठ गया" DELETED!)
+    - ZERO raw English topic words inserted inside Hindi Devanagari dialogues!
+    - Every dialogue strictly alternates between distinct characters (Heroine, Hero, Villain, Saas / Rani, Raja, Bhoot, Rajmata)
+      so the camera cuts to a fresh speaking actor on every single dialogue line!
     """
     clean_t = re.sub(r"\(\s*Genre:.*?\)", "", (topic or "")).strip()
-    clean_t = re.sub(r"\s+", " ", clean_t).strip() or "रहस्यमयी महल का राज़"
-    short_t = clean_t[:48]
+    clean_t = re.sub(r"\s+", " ", clean_t).strip()
     archetype = _detect_topic_story_archetype(clean_t)
 
     if archetype == "royal_ghost":
         if part_num == 1:
             return [
-                {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"अमावस्या की आधी रात और {short_t} का खौफनाक राज़ आज खुलने वाला था!"},
                 {"speaker": "Rani", "emotion": "shocked", "broll": False, "dialogue": "महाराज रुक जाइए! उस बंद तहखाने से भयानक भूत की आवाज़ें आ रही हैं!"},
-                {"speaker": "Mantri", "emotion": "angry", "broll": False, "dialogue": "महाराज, जो भी उस शापित सिंहासन के पास गया, वह कभी ज़िंदा नहीं लौटा!"},
-                {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "एक राजा अपने राज्य और प्रजा की रक्षा के लिए किसी भूत से नहीं डरता!"},
+                {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "घबराओ मत रानी! एक राजा अपने राज्य की रक्षा के लिए किसी साये से नहीं डरता!"},
                 {"speaker": "Bhoot", "emotion": "angry", "broll": False, "dialogue": "हाहाहा! राजा, इस महल और तेरे सिंहासन पर सदियों से मेरा कब्ज़ा है!"},
-                {"speaker": "Rajmata", "emotion": "shocked", "broll": False, "dialogue": "सावधान पुत्र! इस भूत की असली शक्ति उस काले ताबीज़ में छुपी है!"},
-                {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": "तभी राजा की तलवार चमकी और तहखाने का दरवाज़ा टूटा — आगे क्या हुआ?"},
+                {"speaker": "Rajmata", "emotion": "shocked", "broll": False, "dialogue": "सावधान पुत्र! इस भूत की असली शक्ति इसके काले ताबीज़ में छुपी हुई है!"},
+                {"speaker": "Hero", "emotion": "angry", "broll": False, "dialogue": "तो आज इसी महल में तेरा यह काला जादू और तेरा अभिमान दोनों टूटेंगे!"},
+                {"speaker": "Bhoot", "emotion": "angry", "broll": False, "dialogue": "मेरी मायावी शक्ति के आगे तेरी तलवार एक पल भी नहीं टिक पाएगी!"},
+                {"speaker": "Rani", "emotion": "shocked", "broll": False, "dialogue": "महाराज, पीछे देखिए! तहखाने की आग हमारी तरफ बढ़ रही है!"},
             ]
         return [
-            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"Part {part_num} में राजा और महल के भूत का आमना-सामना चरम पर पहुँच गया!"},
-            {"speaker": "Bhoot", "emotion": "angry", "broll": False, "dialogue": "मेरी मायावी शक्ति के आगे तेरी तलवार कुछ नहीं कर सकती राजा!"},
+            {"speaker": "Bhoot", "emotion": "angry", "broll": False, "dialogue": "तुम दोनों इस शापित महल से आज रात ज़िंदा बाहर नहीं निकल पाओगे!"},
             {"speaker": "Rani", "emotion": "sad", "broll": False, "dialogue": "महाराज, राजमाता के बताए उस प्राचीन मंत्र और अग्नि-बाण का प्रयोग कीजिए!"},
-            {"speaker": "Mantri", "emotion": "shocked", "broll": False, "dialogue": "असंभव! महल के सारे स्तंभ हिल रहे हैं, यह भूत तो और शक्तिशाली हो रहा है!"},
-            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "सत्य और धर्म की अग्नि के सामने तेरा हर काला जादू आज भस्म हो जाएगा!"},
-            {"speaker": "Bhoot", "emotion": "shocked", "broll": False, "dialogue": "नहीं! मेरा काला ताबीज़ कैसे टूट गया? मेरी शक्तियाँ खत्म हो रही हैं!"},
-            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": "राजा के एक प्रहार से शाप मिट गया और पूरे राज्य में फिर से उजाला छा गया!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "सत्य और धर्म की अग्नि के सामने तेरा हर अंधेरा आज भस्म हो जाएगा!"},
+            {"speaker": "Rajmata", "emotion": "confident", "broll": False, "dialogue": "प्रहार करो पुत्र! यही वह क्षण है जब यह सौ साल पुराना शाप टूटेगा!"},
+            {"speaker": "Bhoot", "emotion": "shocked", "broll": False, "dialogue": "नहीं! मेरा काला ताबीज़ कैसे टूट गया? मेरी सारी शक्तियाँ खत्म हो रही हैं!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "तेरा आतंक यहीं समाप्त हुआ! अब इस महल में फिर से उजाला लौटेगा!"},
+            {"speaker": "Rani", "emotion": "confident", "broll": False, "dialogue": "आपकी वीरता ने आज पूरे राज्य और हमारे परिवार को बचा लिया महाराज!"},
         ]
 
     if archetype == "horror_ghost":
         return [
-            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"काली रात के सन्नाटे में {short_t} का खौफनाक खेल शुरू हो चुका था!"},
-            {"speaker": "Heroine", "emotion": "shocked", "broll": False, "dialogue": "देखो! हवेली के आईने में कोई साया दिखाई दे रहा है, यहाँ से बाहर चलो!"},
-            {"speaker": "Bhoot", "emotion": "angry", "broll": False, "dialogue": "इस चौखट के अंदर आने वाला कोई भी इंसान आज रात बचकर नहीं जाएगा!"},
-            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "डरो मत! मैं तुम्हें कुछ नहीं होने दूँगा, इसके पीछे ज़रूर कोई गहरा राज़ है!"},
-            {"speaker": "Saas", "emotion": "shocked", "broll": False, "dialogue": "यह कोई साधारण साया नहीं, पचास साल पुराना अधूरा इंतकाम जाग उठा है!"},
-            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "आज इस रहस्य से पर्दा उठेगा और इस खौफ का हमेशा के लिए अंत होगा!"},
-            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": "तभी अचानक बिजली कड़की और बंद दरवाज़े के पीछे का असली सच सामने आ गया!"},
+            {"speaker": "Heroine", "emotion": "shocked", "broll": False, "dialogue": "देखो! उस पुराने आईने में कोई काला साया हिल रहा है, यहाँ से बाहर चलो!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "डरो मत! मेरा हाथ थामो, आज मैं जानकर रहूँगा कि इस घर में कौन छुपा है!"},
+            {"speaker": "Bhoot", "emotion": "angry", "broll": False, "dialogue": "इस चौखट के अंदर कदम रखने वाला कोई भी इंसान आज रात बचकर नहीं जाएगा!"},
+            {"speaker": "Saas", "emotion": "shocked", "broll": False, "dialogue": "मैंने तुम दोनों को पहले ही रोका था! यह पचास साल पुराना अधूरा इंतकाम है!"},
+            {"speaker": "Heroine", "emotion": "sad", "broll": False, "dialogue": "माँ जी, हमें बताइए इस खौफ को हमेशा के लिए रोकने का रास्ता क्या है?"},
+            {"speaker": "Bhoot", "emotion": "angry", "broll": False, "dialogue": "कोई रास्ता नहीं है! अब इस अंधेरे में तुम्हारी चीख कोई नहीं सुन पाएगा!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "तेरा खेल यहीं खत्म होगा! सच की रोशनी के सामने तू एक पल नहीं टिकेगा!"},
         ]
 
     if archetype == "royal_kingdom":
         return [
-            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"शाही दरबार में {short_t} को लेकर सबसे बड़ा टकराव शुरू हो गया!"},
-            {"speaker": "Mantri", "emotion": "angry", "broll": False, "dialogue": "महाराज, पड़ोसी राज्य की सेना हमारी सीमा पर खड़ी है और खज़ाना खतरे में है!"},
-            {"speaker": "Rani", "emotion": "sad", "broll": False, "dialogue": "महाराज, हमारे ही दरबार में कोई गद्दार दुश्मनों को गुप्त संदेश भेज रहा है!"},
-            {"speaker": "Rajmata", "emotion": "angry", "broll": False, "dialogue": "इस सिंहासन के साथ गद्दारी करने वाले को किसी भी कीमत पर बख्शा नहीं जाएगा!"},
-            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "मैं जानता हूँ गद्दार कौन है — आज भरे दरबार में उसका नकाब उतरेगा!"},
-            {"speaker": "Mantri", "emotion": "shocked", "broll": False, "dialogue": "महाराज... यह गुप्त पत्र आपके हाथ कैसे लगा? मुझे क्षमा कर दीजिए!"},
-            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": "राजा के न्याय और पराक्रम ने पूरे साम्राज्य को एक बड़ी साज़िश से बचा लिया!"},
+            {"speaker": "Rani", "emotion": "shocked", "broll": False, "dialogue": "महाराज, हमारे ही दरबार में कोई गद्दार दुश्मनों को गुप्त संदेश भेज रहा है!"},
+            {"speaker": "Mantri", "emotion": "angry", "broll": False, "dialogue": "महारानी, बिना किसी ठोस प्रमाण के दरबारियों पर संदेह करना उचित नहीं है!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "प्रमाण मेरे हाथ में है मंत्री! आज भरे दरबार में असली गद्दार का नकाब उतरेगा!"},
+            {"speaker": "Rajmata", "emotion": "angry", "broll": False, "dialogue": "इस सिंहासन से गद्दारी करने वाले को किसी भी कीमत पर क्षमा नहीं मिलेगी!"},
+            {"speaker": "Mantri", "emotion": "shocked", "broll": False, "dialogue": "महाराज... वह गुप्त मुहर वाला पत्र आपके हाथ कैसे लगा? मेरी बात तो सुनिए!"},
+            {"speaker": "Rani", "emotion": "confident", "broll": False, "dialogue": "तुम्हारे झूठ का अंत हो गया मंत्री, अब तुम्हें अपने किए की सज़ा भुगतनी होगी!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "सैनिकों, इन्हें बंदी बना लो! इस साम्राज्य की रक्षा हर कीमत पर होगी!"},
         ]
 
     if archetype == "jungle_adventure":
         return [
-            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"घने जंगल के बीच {short_t} का सबसे खतरनाक सफर शुरू हो चुका था!"},
-            {"speaker": "Heroine", "emotion": "shocked", "broll": False, "dialogue": "सावधान! आगे गुफा के रास्ते पर खूंखार शिकारियों और जंगली जानवरों का पहरा है!"},
-            {"speaker": "Villain", "emotion": "angry", "broll": False, "dialogue": "इस जंगल के खज़ाने और राज़ पर सिर्फ मेरा हक है, पीछे हट जाओ!"},
-            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "यह जंगल और इसकी धरोहर किसी अपराधी की जागीर नहीं, हम पीछे नहीं हटेंगे!"},
-            {"speaker": "Saas", "emotion": "shocked", "broll": False, "dialogue": "प्राचीन मंदिर का द्वार केवल वही खोल सकता है जिसके दिल में सच्चाई हो!"},
-            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "तेरा हर जाल टूट चुका है, अब इस जंगल से तेरा खेल खत्म!"},
-            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": "तभी प्राचीन गुफा का रहस्यमयी दरवाज़ा खुला और सबकी आँखें फटी रह गईं!"},
+            {"speaker": "Heroine", "emotion": "shocked", "broll": False, "dialogue": "सावधान! आगे गुफा के रास्ते पर खूंखार शिकारियों ने चारों तरफ जाल बिछाया है!"},
+            {"speaker": "Villain", "emotion": "angry", "broll": False, "dialogue": "इस जंगल के प्राचीन खज़ाने पर सिर्फ मेरा हक है, पीछे हट जाओ वरना पछताओगे!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "यह जंगल और इसकी धरोहर किसी अपराधी की जागीर नहीं, हम एक कदम पीछे नहीं हटेंगे!"},
+            {"speaker": "Saas", "emotion": "shocked", "broll": False, "dialogue": "याद रखना, प्राचीन मंदिर का द्वार केवल सच्चे दिल वाले इंसान के लिए ही खुलता है!"},
+            {"speaker": "Villain", "emotion": "angry", "broll": False, "dialogue": "बकवास बंद करो! आज यह खज़ाना लेकर मैं ही यहाँ से बाहर जाऊँगा!"},
+            {"speaker": "Heroine", "emotion": "confident", "broll": False, "dialogue": "तुम्हारा हर दांव उल्टा पड़ चुका है, देखो गुफा का दरवाज़ा बंद होने लगा है!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "अब इस जंगल में तुम्हारा आतंक हमेशा के लिए खत्म हो चुका है!"},
         ]
 
     if archetype == "police_thriller":
         return [
-            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"शहर में {short_t} के केस ने पूरे पुलिस महकमे को हिला कर रख दिया!"},
-            {"speaker": "Villain", "emotion": "angry", "broll": False, "dialogue": "इंस्पेक्टर, मेरे खिलाफ सबूत ढूँढने की कोशिश मत कर, वरना अंजाम बुरा होगा!"},
-            {"speaker": "Heroine", "emotion": "confident", "broll": False, "dialogue": "मेरे पास इस पूरे घोटाले और साज़िश की असली रिकॉर्डिंग मौजूद है!"},
-            {"speaker": "Saas", "emotion": "shocked", "broll": False, "dialogue": "इतने बड़े अपराध को अब कानून की नज़र से कोई नहीं छुपा सकता!"},
-            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "कानून के हाथ बहुत लंबे होते हैं — तेरे हर जुर्म की फाइल अब कोर्ट में है!"},
-            {"speaker": "Villain", "emotion": "shocked", "broll": False, "dialogue": "यह कैसे हो सकता है? मेरा सबसे खास गवाह पुलिस के साथ कैसे मिल गया!"},
-            {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": "तभी पुलिस सायरन गूँजा और अपराधी के सारे राज़ दुनिया के सामने आ गए!"},
+            {"speaker": "Villain", "emotion": "angry", "broll": False, "dialogue": "इंस्पेक्टर, मेरे खिलाफ सबूत ढूँढने की गलती मत कर, वरना अंजाम बहुत बुरा होगा!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "धमकियाँ अपराधियों को शोभा देती हैं, कानून के सामने तेरा हर खेल खत्म है!"},
+            {"speaker": "Heroine", "emotion": "confident", "broll": False, "dialogue": "मेरे पास तुम्हारी पूरी साज़िश और सौदे की असली रिकॉर्डिंग मौजूद है!"},
+            {"speaker": "Saas", "emotion": "shocked", "broll": False, "dialogue": "इतने बड़े गुनाह को अब पैसे और ताकत के दम पर कोई नहीं छुपा सकता!"},
+            {"speaker": "Villain", "emotion": "shocked", "broll": False, "dialogue": "यह कैसे हो सकता है? मेरा सबसे भरोसेमंद आदमी पुलिस से कैसे मिल गया!"},
+            {"speaker": "Heroine", "emotion": "angry", "broll": False, "dialogue": "क्योंकि सच की कीमत तुम्हारी दौलत से कहीं ज़्यादा बड़ी होती है!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "हथकड़ी पहनाओ इसे! अब इसका पूरा हिसाब अदालत में होगा!"},
         ]
 
-    # Dynamic custom topic script directly built around user's exact topic words
+    if archetype == "comedy_drama":
+        return [
+            {"speaker": "Heroine", "emotion": "angry", "broll": False, "dialogue": "अरे सुनिए! आपने फिर से पड़ोसी की कार के आगे अपनी स्कूटी खड़ी कर दी?"},
+            {"speaker": "Hero", "emotion": "shocked", "broll": False, "dialogue": "अरे मैं तो बस दो मिनट के लिए समोसे लेने गया था, इतना हंगामा क्यों मचा है?"},
+            {"speaker": "Villain", "emotion": "angry", "broll": False, "dialogue": "दो मिनट कहकर तुमने पूरा एक घंटा लगा दिया और मेरा पूरा प्लान चौपट कर दिया!"},
+            {"speaker": "Saas", "emotion": "angry", "broll": False, "dialogue": "हे भगवान! इस घर में एक दिन भी बिना किसी नए झमेले के नहीं बीतता!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "माँ जी, गुस्सा छोड़िए, गरमा-गरम जलेबी लाया हूँ, खाते ही मूड ठीक हो जाएगा!"},
+            {"speaker": "Villain", "emotion": "shocked", "broll": False, "dialogue": "वाह! खुद गलती करो और फिर जलेबी खिलाकर सबको अपनी तरफ कर लो!"},
+            {"speaker": "Heroine", "emotion": "confident", "broll": False, "dialogue": "अब बहस बंद कीजिए और चलिए अंदर, वरना सारी जलेबी ठंडी हो जाएगी!"},
+        ]
+
+    if archetype == "love_romance":
+        return [
+            {"speaker": "Heroine", "emotion": "sad", "broll": False, "dialogue": "तुम मुझसे यह सच कब तक छुपाओगे? मेरी आँखों में देखकर सीधा जवाब दो!"},
+            {"speaker": "Hero", "emotion": "sad", "broll": False, "dialogue": "मजबूरी थी प्रिया, वरना मैं तुमसे एक पल के लिए भी कभी दूर न जाता!"},
+            {"speaker": "Villain", "emotion": "angry", "broll": False, "dialogue": "इस प्यार की कीमत तुम दोनों को जान देकर चुकानी होगी!"},
+            {"speaker": "Saas", "emotion": "angry", "broll": False, "dialogue": "खबरदार! यह रिश्ता मेरी इस चौखट पर कभी स्वीकार नहीं किया जाएगा!"},
+            {"speaker": "Heroine", "emotion": "confident", "broll": False, "dialogue": "चाहे पूरी दुनिया हमारे खिलाफ खड़ी हो जाए, मैं इनका हाथ कभी नहीं छोड़ूँगी!"},
+            {"speaker": "Villain", "emotion": "angry", "broll": False, "dialogue": "इतनी ज़िद अच्छी नहीं होती, आज की रात तुम्हारे इस प्यार का आखिरी दिन होगा!"},
+            {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "जब तक मेरी साँस चल रही है, कोई इसकी तरफ आँख उठाकर भी नहीं देख सकता!"},
+        ]
+
+    # Universal high-drama pure Hindi face-to-face dialogues (ZERO Narrator, ZERO raw English topic!)
     return [
-        {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"आज की इस धमाकेदार कहानी का केंद्र है — {short_t}!"},
-        {"speaker": "Heroine", "emotion": "shocked", "broll": False, "dialogue": f"{short_t} का यह सच अगर बाहर आ गया तो सब कुछ बदल जाएगा!"},
-        {"speaker": "Villain", "emotion": "angry", "broll": False, "dialogue": "जब तक मैं यहाँ खड़ा हूँ, मेरी योजना को कोई नहीं रोक सकता!"},
-        {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": f"तेरी हर चाल नाकाम होगी, क्योंकि {short_t} का असली फैसला आज मैं करूँगा!"},
-        {"speaker": "Saas", "emotion": "shocked", "broll": False, "dialogue": "सच्चाई और हिम्मत के आगे बड़े-बड़े षड्यंत्र भी टिक नहीं पाते!"},
-        {"speaker": "Villain", "emotion": "shocked", "broll": False, "dialogue": "नहीं! मेरी सारी बाज़ी एक ही पल में कैसे पलट गई?"},
-        {"speaker": "Narrator", "emotion": "twist", "broll": True, "dialogue": f"और इस तरह {short_t} के सबसे बड़े रहस्य से आखिरकार पर्दा उठ गया!"},
+        {"speaker": "Heroine", "emotion": "shocked", "broll": False, "dialogue": "तुम मुझसे यह सच कब तक छुपाओगे? आज मुझे पूरा जवाब चाहिए!"},
+        {"speaker": "Hero", "emotion": "sad", "broll": False, "dialogue": "मजबूरी थी प्रिया, वरना मैं तुम्हें कभी अंधेरे में न रखता!"},
+        {"speaker": "Villain", "emotion": "angry", "broll": False, "dialogue": "बहुत देर हो चुकी है! अब इस खेल की कीमत तुम दोनों को चुकानी होगी!"},
+        {"speaker": "Saas", "emotion": "angry", "broll": False, "dialogue": "रुको! मेरे रहते हुए इस घर की इज़्ज़त से कोई खिलवाड़ नहीं कर सकता!"},
+        {"speaker": "Heroine", "emotion": "confident", "broll": False, "dialogue": "मैं डरने वाली नहीं हूँ, अब सबके सामने तुम्हारा असली चेहरा बेनकाब होगा!"},
+        {"speaker": "Villain", "emotion": "shocked", "broll": False, "dialogue": "यह तुम क्या कह रही हो? तुम्हें उस रात का राज़ कैसे पता चला!"},
+        {"speaker": "Hero", "emotion": "confident", "broll": False, "dialogue": "क्योंकि सच ज़्यादा दिन छुपता नहीं, अब तुम्हारी हर चाल यहीं खत्म होती है!"},
     ]
 
 
-# 3. AUTO-FAILOVER STORY DIRECTOR (Gemini -> Groq -> Topic-Aware Dynamic Hindi Story)
+def _sanitize_no_narrator_dialogues(items: list[dict], archetype: str = "custom_topic") -> list[dict]:
+    """
+    Strictly enforce 0% Narrator storytelling in both Online (Gemini/Groq) and Offline outputs:
+    - Reassign any 'Narrator' / 'Sutradhar' speaker to an actual alternating face-to-face character.
+    - Drop storyteller summary lines like 'और इस तरह ... रहस्य से पर्दा उठ गया'.
+    - Ensure consecutive lines switch speakers so the video cuts cleanly between faces.
+    """
+    if archetype in ("royal_ghost", "horror_ghost", "royal_kingdom"):
+        cycle_roles = ("Rani", "Hero", "Bhoot" if "ghost" in archetype else "Mantri", "Rajmata")
+    else:
+        cycle_roles = ("Heroine", "Hero", "Villain", "Saas")
+
+    cleaned: list[dict] = []
+    prev_role_bucket = ""
+    for idx, it in enumerate(items or []):
+        if not isinstance(it, dict):
+            continue
+        dlg = str(it.get("dialogue") or "").strip()
+        if not dlg or len(dlg) < 3:
+            continue
+        if "और इस तरह" in dlg and "पर्दा उठ" in dlg:
+            continue
+        spk = str(it.get("speaker") or it.get("character") or "").strip()
+        role_bucket = detect_speaker_role(spk, None)
+        if not spk or role_bucket in ("narrator", "crowd"):
+            # Pick a real character different from the previous speaker
+            cand = cycle_roles[idx % len(cycle_roles)]
+            if detect_speaker_role(cand, None) == prev_role_bucket:
+                cand = cycle_roles[(idx + 1) % len(cycle_roles)]
+            spk = cand
+            role_bucket = detect_speaker_role(spk, None)
+        cleaned.append({
+            "speaker": spk,
+            "emotion": str(it.get("emotion") or "confident").strip().lower(),
+            "broll": False,
+            "dialogue": dlg,
+        })
+        prev_role_bucket = role_bucket
+    return cleaned[:8]
+
+
+# 3. AUTO-FAILOVER STORY DIRECTOR (Gemini -> Groq -> Topic-Aware 100% Face-to-Face Hindi Dialogues)
 async def director_generate_story(topic: str, part_num: int = 1, prev_cliffhanger: str = "") -> list[dict]:
     _sync_runtime_api_vault_from_config()
     archetype = _detect_topic_story_archetype(topic)
     role_guide = (
-        'Allowed speaker names for this topic: "Narrator", "Hero" (or "Raja"), "Heroine" (or "Rani"), "Villain" (or "Bhoot" / "Mantri"), "Saas" (or "Rajmata").'
+        'Allowed speaker names ONLY: "Hero" (or "Raja"), "Heroine" (or "Rani"), "Villain" (or "Bhoot" / "Mantri"), "Saas" (or "Rajmata").'
         if archetype in ("royal_ghost", "horror_ghost", "royal_kingdom")
-        else 'Allowed speaker names: "Narrator", "Hero", "Heroine", "Villain", "Saas".'
+        else 'Allowed speaker names ONLY: "Hero", "Heroine", "Villain", "Saas".'
     )
     system_prompt = (
-        "You are an expert Indian Hindi TV Serial & Film Showrunner. "
-        "Write a crisp, high-drama 7-dialogue scene in natural Hindi (Devanagari) strictly based on the user's exact Topic with zero incomplete sentences. "
+        "You are an expert Indian Hindi TV Serial & Bollywood Dialogue Writer. "
+        "Write 7 intense, direct face-to-face spoken dialogues strictly in pure Hindi (Devanagari script only, NEVER insert raw English words or topic strings). "
+        "STRICT RULE: 0% Narrator! NEVER use Narrator, voiceover, or storytelling summaries like 'और इस तरह रहस्य से पर्दा उठ गया'. "
+        "Every single line MUST be one character speaking directly to another character face-to-face, alternating speakers on every line so the camera cuts to a different face each time! "
         "NEVER insert unrelated 'ghar jamai' or 'sasural' plots unless the user's topic explicitly asks for it! "
         f"{role_guide} "
-        "Narrator speaks ONLY line 1 (hook) and line 7 (cliffhanger). "
         "Return ONLY valid JSON array of 7 objects: "
-        '[{"speaker":"Narrator|Hero|Heroine|Villain|Saas","emotion":"angry|shocked|sad|confident|twist","broll":false,"dialogue":"..."}]'
+        '[{"speaker":"Heroine|Hero|Villain|Saas","emotion":"angry|shocked|sad|confident|twist","broll":false,"dialogue":"..."}]'
     )
     user_prompt = f"Exact Story Topic: {topic}. Episode Part: {part_num}. Previous Cliffhanger: {prev_cliffhanger or 'Start of story'}."
 
@@ -1178,8 +1278,10 @@ async def director_generate_story(topic: str, part_num: int = 1, prev_cliffhange
                     txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
                     data = json.loads(txt)
                     if isinstance(data, list) and len(data) >= 5:
-                        API_HEALTH_STATUS["gemini"] = "active"
-                        return data[:8]
+                        sanitized = _sanitize_no_narrator_dialogues(data, archetype=archetype)
+                        if len(sanitized) >= 5:
+                            API_HEALTH_STATUS["gemini"] = "active"
+                            return sanitized
             API_HEALTH_STATUS["gemini"] = "quota_full"
         except Exception:
             API_HEALTH_STATUS["gemini"] = "error"
@@ -1206,13 +1308,15 @@ async def director_generate_story(topic: str, part_num: int = 1, prev_cliffhange
                     start, end = raw.find("["), raw.rfind("]") + 1
                     data = json.loads(raw[start:end])
                     if isinstance(data, list) and len(data) >= 5:
-                        API_HEALTH_STATUS["groq"] = "active"
-                        return data[:8]
+                        sanitized = _sanitize_no_narrator_dialogues(data, archetype=archetype)
+                        if len(sanitized) >= 5:
+                            API_HEALTH_STATUS["groq"] = "active"
+                            return sanitized
             API_HEALTH_STATUS["groq"] = "quota_full"
         except Exception:
             API_HEALTH_STATUS["groq"] = "error"
 
-    # Priority 3: Topic-Aware Multi-Character Hindi Story Fallback (Matches Raja/Bhoot, Jungle, Police, or Custom Topic!)
+    # Priority 3: 100% Pure Hindi Direct Face-to-Face Multi-Character Dialogues (0% Narrator!)
     return _build_topic_aware_director_fallback(topic=topic, part_num=part_num, prev_cliffhanger=prev_cliffhanger)
 
 
@@ -4279,23 +4383,184 @@ def _detect_skin_face_box(frame_bgr) -> tuple[int, int, int, int]:
         return fallback_box
 
 
-def _apply_speech_lipsync_mouth_motion(frame_bgr, mouth_open: float, head_box: tuple[int, int, int, int]):
+_CV_CASCADES_CACHE: Optional[dict] = None
+
+
+def _get_strict_frontal_cascades() -> dict:
+    """Lazy-load OpenCV Haar cascades (frontal face, eyes, mouth/smile) for strict front-face lip-sync gating."""
+    global _CV_CASCADES_CACHE
+    if _CV_CASCADES_CACHE is not None:
+        return _CV_CASCADES_CACHE
+    loaded: dict = {"face": None, "mouth": None, "eye": None}
+    if cv2 is None:
+        _CV_CASCADES_CACHE = loaded
+        return loaded
+    try:
+        hdir = getattr(getattr(cv2, "data", None), "haarcascades", "") or ""
+        if hdir:
+            for fname in ("haarcascade_frontalface_default.xml", "haarcascade_frontalface_alt2.xml"):
+                fpath = os.path.join(hdir, fname)
+                if os.path.exists(fpath):
+                    c = cv2.CascadeClassifier(fpath)
+                    if not c.empty():
+                        loaded["face"] = c
+                        break
+            for mname in ("haarcascade_mcs_mouth.xml", "haarcascade_smile.xml"):
+                mpath = os.path.join(hdir, mname)
+                if os.path.exists(mpath):
+                    c = cv2.CascadeClassifier(mpath)
+                    if not c.empty():
+                        loaded["mouth"] = c
+                        break
+            epath = os.path.join(hdir, "haarcascade_eye.xml")
+            if os.path.exists(epath):
+                c = cv2.CascadeClassifier(epath)
+                if not c.empty():
+                    loaded["eye"] = c
+    except Exception:
+        pass
+    _CV_CASCADES_CACHE = loaded
+    return loaded
+
+
+def _detect_strict_frontal_mouth(frame_bgr) -> Optional[dict]:
     """
-    Drive realistic rhythmic mouth-opening & lower-jaw articulation on the speaker's face
-    driven by the real Hindi dialogue RMS amplitude (ZERO CascadeClassifier!).
+    STRICT FRONT-FACE + LOWER-CENTER MOUTH GATE (Zero Wrong-Place Black Dots!):
+    Returns verified `{"face": (fx, fy, fw, fh), "mouth": (mcx, mcy, mrw, mrh)}` ONLY when:
+      1. `face_cascade` detects a clean front-facing face with square frontal aspect ratio,
+      2. Upper-face bilateral symmetry / dual-eye check confirms it is NOT a side-profile face, AND
+      3. `mouth_cascade` detects a mouth strictly inside the lower-center zone of that exact face!
+    If ANY check fails (e.g. side-profile, tilted, distant, two-shot), returns `None` so NO dot/patch is ever drawn!
     """
-    if cv2 is None or np is None or mouth_open < 0.08:
+    if cv2 is None or np is None or frame_bgr is None:
+        return None
+    cascades = _get_strict_frontal_cascades()
+    face_c = cascades.get("face")
+    mouth_c = cascades.get("mouth")
+    eye_c = cascades.get("eye")
+    if face_c is None or mouth_c is None:
+        return None
+    try:
+        h, w = frame_bgr.shape[:2]
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        min_face = max(72, int(min(w, h) * 0.14))
+        faces = face_c.detectMultiScale(
+            gray,
+            scaleFactor=1.12,
+            minNeighbors=6,
+            minSize=(min_face, min_face),
+        )
+        if faces is None or len(faces) == 0:
+            return None
+
+        # Choose largest central frontal face
+        best_face = None
+        best_score = 0.0
+        for (fx, fy, fw, fh) in faces:
+            ratio = fw / max(1.0, float(fh))
+            if ratio < 0.74 or ratio > 1.26:
+                continue
+            # Reject faces clipped at frame border
+            if fx < 8 or fy < 8 or (fx + fw) > (w - 8) or (fy + fh) > (h - 8):
+                continue
+            cx_dist = abs((fx + fw * 0.5) - (w * 0.5)) / max(1.0, w * 0.5)
+            score = (fw * fh) * (1.2 - 0.5 * cx_dist)
+            if score > best_score:
+                best_score = score
+                best_face = (int(fx), int(fy), int(fw), int(fh))
+
+        if best_face is None:
+            return None
+        fx, fy, fw, fh = best_face
+
+        # Front-facing verification: check left/right eyes or horizontal symmetry in upper face (rejects side-profiles!)
+        upper_gray = gray[fy : fy + int(fh * 0.55), fx : fx + fw]
+        if upper_gray.size == 0:
+            return None
+        if eye_c is not None:
+            eyes = eye_c.detectMultiScale(
+                upper_gray,
+                scaleFactor=1.1,
+                minNeighbors=4,
+                minSize=(max(14, int(fw * 0.12)), max(12, int(fh * 0.08))),
+            )
+            if eyes is not None and len(eyes) >= 2:
+                eye_xs = sorted(float(ex + ew * 0.5) / max(1.0, float(fw)) for (ex, _, ew, _) in eyes)
+                # Must have one eye on left half and one eye on right half for true frontal pose
+                if not (eye_xs[0] < 0.46 and eye_xs[-1] > 0.54):
+                    return None
+            else:
+                # Strict fallback symmetry check when eyes are shadowed: side-profile fails symmetry!
+                half_w = upper_gray.shape[1] // 2
+                if half_w < 16:
+                    return None
+                left_half = upper_gray[:, :half_w].astype(np.float32)
+                right_half = cv2.flip(upper_gray[:, upper_gray.shape[1] - half_w :], 1).astype(np.float32)
+                sym_diff = float(np.mean(np.abs(left_half - right_half)))
+                if sym_diff > 34.0:
+                    return None
+
+        # Search STRICTLY inside lower-center face zone for mouth_cascade match
+        mx_off = fx + int(fw * 0.18)
+        my_off = fy + int(fh * 0.58)
+        mw_roi = max(24, int(fw * 0.64))
+        mh_roi = max(20, int(fh * 0.36))
+        mouth_roi = gray[my_off : min(h, my_off + mh_roi), mx_off : min(w, mx_off + mw_roi)]
+        if mouth_roi.size == 0:
+            return None
+
+        mouths = mouth_c.detectMultiScale(
+            mouth_roi,
+            scaleFactor=1.15,
+            minNeighbors=10,
+            minSize=(max(18, int(fw * 0.18)), max(10, int(fh * 0.08))),
+        )
+        if mouths is None or len(mouths) == 0:
+            return None
+
+        # Pick mouth detection closest to exact lower-center of frontal face (x~0.50, y~0.75)
+        best_mouth = None
+        best_dist = 999.0
+        for (mx, my, mw, mh) in mouths:
+            mcx = mx_off + mx + mw * 0.5
+            mcy = my_off + my + mh * 0.5
+            rel_x = (mcx - fx) / max(1.0, float(fw))
+            rel_y = (mcy - fy) / max(1.0, float(fh))
+            if not (0.35 <= rel_x <= 0.65 and 0.63 <= rel_y <= 0.87):
+                continue
+            if mw > fw * 0.58 or mh > fh * 0.28:
+                continue
+            dist = abs(rel_x - 0.50) * 1.4 + abs(rel_y - 0.75)
+            if dist < best_dist:
+                best_dist = dist
+                best_mouth = (int(mcx), int(mcy), max(10, int(mw * 0.44)), max(6, int(mh * 0.38)))
+
+        if best_mouth is None:
+            return None
+
+        return {"face": best_face, "mouth": best_mouth}
+    except Exception:
+        return None
+
+
+def _apply_speech_lipsync_mouth_motion(frame_bgr, mouth_open: float, frontal_mouth_info: Optional[dict]):
+    """
+    STRICT FRONT-FACE LIP-SYNC (ZERO WRONG-PLACE BLACK DOTS!):
+    - If `frontal_mouth_info` is None (side-profile or no exact face+mouth cascade match),
+      returns `frame_bgr` COMPLETELY UNTOUCHED so no dark oval/dot is ever drawn!
+    - When verified on a front-facing face, applies smooth natural lower-lip warp ONLY (no black patch!).
+    """
+    if cv2 is None or np is None or mouth_open < 0.10 or not isinstance(frontal_mouth_info, dict):
         return frame_bgr
-    h, w = frame_bgr.shape[:2]
-    fx, fy, fw, fh = head_box
-    if fw < 40 or fh < 40:
+    mouth_tuple = frontal_mouth_info.get("mouth")
+    if not mouth_tuple or len(mouth_tuple) != 4:
         return frame_bgr
 
-    # Mouth center sits cleanly around ~73% down the tracked face box
-    mcx = int(fx + fw * 0.50)
-    mcy = int(fy + fh * 0.73)
-    mrw = max(14, int(fw * 0.17))
-    mrh = max(8, int(fh * 0.085))
+    h, w = frame_bgr.shape[:2]
+    mcx, mcy, mrw, mrh = mouth_tuple
+    if mrw < 8 or mrh < 5:
+        return frame_bgr
 
     x1 = max(0, mcx - mrw * 2)
     x2 = min(w, mcx + mrw * 2)
@@ -4306,39 +4571,25 @@ def _apply_speech_lipsync_mouth_motion(frame_bgr, mouth_open: float, head_box: t
         return frame_bgr
 
     roi = frame_bgr[y1:y2, x1:x2].copy()
-    # Local vertical jaw stretch downward proportional to spoken syllable loudness
     yy, xx = np.mgrid[0:roi_h, 0:roi_w].astype(np.float32)
     local_cx = float(mcx - x1)
     local_cy = float(mcy - y1)
-    dx = (xx - local_cx) / max(1.0, float(mrw * 1.35))
-    dy = (yy - local_cy) / max(1.0, float(mrh * 1.75))
+    dx = (xx - local_cx) / max(1.0, float(mrw * 1.30))
+    dy = (yy - local_cy) / max(1.0, float(mrh * 1.70))
     dist2 = dx * dx + dy * dy
-    falloff = np.exp(-dist2 * 1.45)
+    falloff = np.exp(-dist2 * 1.65)
 
-    # Pull lower lip/jaw subtly downward & upper lip slightly upward when speaking loudly
-    amp = min(1.0, mouth_open) * max(2.2, mrh * 0.58)
-    direction = np.where(yy >= local_cy, -1.0, 0.35)
+    # Pure smooth lower-lip/jaw articulation warp (ZERO solid black oval/dot!)
+    amp = min(0.85, mouth_open) * max(1.8, mrh * 0.52)
+    direction = np.where(yy >= local_cy, -1.0, 0.25)
     map_y = np.clip(yy + direction * amp * falloff, 0, roi_h - 1).astype(np.float32)
-    map_x = xx
-    warped = cv2.remap(roi, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    warped = cv2.remap(roi, xx, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
-    # Subtle realistic inner mouth cavity shadow when opening mouth on loud vowels
-    if mouth_open > 0.24:
-        cavity = warped.copy()
-        open_h = max(2, int(mrh * 0.62 * min(1.0, mouth_open)))
-        open_w = max(8, int(mrw * 0.72))
-        cv2.ellipse(
-            cavity,
-            (int(local_cx), int(local_cy + open_h * 0.15)),
-            (open_w, open_h),
-            0, 0, 360,
-            (22, 18, 34),
-            -1,
-            cv2.LINE_AA,
-        )
-        # Soft feather inner mouth shadow so it never looks drawn-on
-        cav_alpha = min(0.55, (mouth_open - 0.18) * 0.65)
-        warped = cv2.addWeighted(cavity, cav_alpha, warped, 1.0 - cav_alpha, 0)
+    # Gentle natural lip-parting depth tint strictly proportional to existing lip pixels (never a black dot!)
+    if mouth_open > 0.30:
+        inner_mask = np.exp(-(((xx - local_cx) / max(1.0, mrw * 0.68)) ** 2 + ((yy - local_cy) / max(1.0, mrh * 0.42 * min(1.0, mouth_open))) ** 2) * 2.2)
+        darken = np.clip(1.0 - 0.24 * min(1.0, mouth_open) * inner_mask, 0.72, 1.0)[..., None]
+        warped = np.clip(warped.astype(np.float32) * darken, 0, 255).astype(np.uint8)
 
     frame_bgr[y1:y2, x1:x2] = warped
     return frame_bgr
@@ -4347,22 +4598,23 @@ def _apply_speech_lipsync_mouth_motion(frame_bgr, mouth_open: float, head_box: t
 def _apply_natural_eye_blink_and_breathing(
     frame_bgr,
     f_idx: int,
-    head_box: tuple[int, int, int, int],
+    frontal_mouth_info: Optional[dict],
     fps: int = 24,
 ):
     """
-    Bring photorealistic actors to life with:
-    1. Subtle natural 4-frame eye-blink every ~2.7 seconds on the tracked eye band
-    2. Subtle organic breathing micro-lift across the upper torso/shoulders
+    Subtle natural 4-frame eye-blink strictly on verified front-facing faces only
+    (skips cleanly on side-profile / non-frontal frames so there are never misplaced artifacts).
     """
-    if cv2 is None or np is None:
+    if cv2 is None or np is None or not isinstance(frontal_mouth_info, dict):
+        return frame_bgr
+    head_box = frontal_mouth_info.get("face")
+    if not head_box or len(head_box) != 4:
         return frame_bgr
     h, w = frame_bgr.shape[:2]
     fx, fy, fw, fh = head_box
     if fw < 40 or fh < 40:
         return frame_bgr
 
-    # 1. Natural rhythmic eye blink (~every 64 frames = ~2.65s at 24fps)
     blink_cycle = max(48, int(fps * 2.65))
     phase = (f_idx + 18) % blink_cycle
     blink_weights = {0: 0.45, 1: 0.92, 2: 0.85, 3: 0.35}
@@ -4386,11 +4638,9 @@ def _apply_natural_eye_blink_and_breathing(
             d_right = ((xx - right_cx) / erx) ** 2 + ((yy - cy) / ery) ** 2
             eye_mask = np.maximum(np.exp(-d_left * 1.8), np.exp(-d_right * 1.8))
             pull = blink_amt * max(2.0, ery * 0.95)
-            # Pull upper eyelid skin smoothly downward over eye aperture
             map_y = np.clip(yy - pull * eye_mask, 0, rh - 1).astype(np.float32)
             warped = cv2.remap(roi, xx, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-            # Subtle warm natural upper-eyelash crease shadow
-            shade = np.clip(1.0 - 0.16 * blink_amt * eye_mask, 0.78, 1.0)[..., None]
+            shade = np.clip(1.0 - 0.14 * blink_amt * eye_mask, 0.82, 1.0)[..., None]
             warped = np.clip(warped.astype(np.float32) * shade, 0, 255).astype(np.uint8)
             frame_bgr[y1:y2, x1:x2] = warped
 
@@ -4746,7 +4996,8 @@ def _render_pro_motion_vfx_clip(
             if base is not None:
                 src = cv2.resize(base, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
                 sh, sw = src.shape[:2]
-                face_box_src = _detect_skin_face_box(src)
+                # Strict front-face + mouth cascade verification (None on side-profile -> zero black dots!)
+                strict_mouth_src = _detect_strict_frontal_mouth(src)
 
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 writer = cv2.VideoWriter(raw_vfx_mp4, fourcc, fps, (w_out, h_out))
@@ -4767,13 +5018,19 @@ def _render_pro_motion_vfx_clip(
                     t = f_idx / max(1, total_frames - 1)
                     talk_amp = speech_env[f_idx] if f_idx < len(speech_env) else 0.0
 
-                    work_src = _apply_speech_lipsync_mouth_motion(src.copy(), talk_amp, face_box_src)
-                    work_src = _apply_natural_eye_blink_and_breathing(work_src, f_idx, face_box_src, fps=fps)
+                    if strict_mouth_src is not None:
+                        work_src = _apply_speech_lipsync_mouth_motion(src.copy(), talk_amp, strict_mouth_src)
+                        work_src = _apply_natural_eye_blink_and_breathing(work_src, f_idx, strict_mouth_src, fps=fps)
+                    else:
+                        # Side-profile / non-frontal shot: NO mouth dot drawn — rely on smooth push-in & head-sway!
+                        work_src = src
 
+                    # Subtle dynamic 2.5s angle push-in when single frame plays longer than 2.5s
+                    angle_punch = 0.08 if (total_frames > 82 and (f_idx // 75) % 2 == 1) else 0.0
                     breath_y = math.sin(f_idx * 0.11) * 3.5
-                    nod_y = math.sin(f_idx * 0.46) * (4.8 * talk_amp) + breath_y
-                    nod_x = math.cos(f_idx * 0.28) * (2.5 * talk_amp)
-                    talk_zoom_boost = 0.015 * talk_amp
+                    nod_y = math.sin(f_idx * 0.44) * (5.2 * talk_amp) + breath_y
+                    nod_x = math.cos(f_idx * 0.26) * (3.2 * talk_amp)
+                    talk_zoom_boost = 0.018 * talk_amp + angle_punch
 
                     if mood == "Action":
                         zoom = 1.05 + 0.12 * t + talk_zoom_boost
@@ -4952,20 +5209,21 @@ def _render_multishot_pollinations_motion_clip(
                 if im is not None:
                     rs = cv2.resize(im, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
                     loaded_srcs.append(rs)
-                    loaded_faces.append(_detect_skin_face_box(rs))
+                    loaded_faces.append(_detect_strict_frontal_mouth(rs))
 
             if len(loaded_srcs) >= 2:
                 n_cuts = len(loaded_srcs)
                 speech_env = _extract_audio_speech_envelope(
                     dialogue_audio_path or final_audio, total_frames, fps=fps
                 )
-                # Cut 0 (Speaking Actor): ~58% for 2 cuts, ~54% for 3-4 cuts (leaves crisp 1.5s twist/B-roll beats!)
-                cut0_end = max(28, min(total_frames - (n_cuts - 1) * 14, int(total_frames * (0.58 if n_cuts == 2 else 0.54))))
-                rem_frames = max(14, total_frames - cut0_end)
-                per_extra = max(12, rem_frames // (n_cuts - 1))
+                # Fast ~2.5s dynamic speaking-character to reaction-character cuts (max 75 frames on Cut 0 so faces switch every ~2.5s!)
+                target_cut0 = min(75, int(total_frames * (0.58 if n_cuts == 2 else 0.50)))
+                cut0_end = max(30, min(total_frames - (n_cuts - 1) * 16, target_cut0))
+                rem_frames = max(16, total_frames - cut0_end)
+                per_extra = max(14, rem_frames // (n_cuts - 1))
                 cut_bounds = [0, cut0_end]
                 for c_i in range(1, n_cuts - 1):
-                    cut_bounds.append(min(total_frames - 12, cut0_end + c_i * per_extra))
+                    cut_bounds.append(min(total_frames - 14, cut0_end + c_i * per_extra))
                 cut_bounds.append(total_frames)
                 blend_len = 3
 
@@ -4974,23 +5232,27 @@ def _render_multishot_pollinations_motion_clip(
 
                 def _render_cut_frame(cut_idx: int, f_idx: int, local_t: float, talk_amp: float):
                     src_img = loaded_srcs[cut_idx]
-                    face_box = loaded_faces[cut_idx]
+                    strict_mouth = loaded_faces[cut_idx]
                     is_speaking = (cut_idx == 0)
                     sh, sw = src_img.shape[:2]
-                    work = src_img.copy()
-                    if is_speaking:
-                        work = _apply_speech_lipsync_mouth_motion(work, talk_amp, face_box)
-                    work = _apply_natural_eye_blink_and_breathing(work, f_idx, face_box, fps=fps)
+                    if strict_mouth is not None:
+                        work = src_img.copy()
+                        if is_speaking:
+                            work = _apply_speech_lipsync_mouth_motion(work, talk_amp, strict_mouth)
+                        work = _apply_natural_eye_blink_and_breathing(work, f_idx, strict_mouth, fps=fps)
+                    else:
+                        # Side-profile / non-frontal face: ZERO black dot — smooth cinematic push-in & head-sway!
+                        work = src_img
 
                     breath_y = math.sin(f_idx * 0.12) * 3.6
                     if is_speaking:
-                        nod_y = math.sin(f_idx * 0.48) * (5.0 * talk_amp) + breath_y
-                        nod_x = math.cos(f_idx * 0.29) * (2.8 * talk_amp)
-                        zoom = 1.04 + 0.14 * local_t + 0.015 * talk_amp
-                        pan_x = math.sin(local_t * math.pi * 0.9) * 14.0 + nod_x
+                        nod_y = math.sin(f_idx * 0.45) * (5.2 * talk_amp) + breath_y
+                        nod_x = math.cos(f_idx * 0.27) * (3.2 * talk_amp)
+                        zoom = 1.04 + 0.15 * local_t + 0.018 * talk_amp
+                        pan_x = math.sin(local_t * math.pi * 0.95) * 16.0 + nod_x
                         pan_y = -9.0 * local_t + nod_y
-                        shake_x = math.sin(f_idx * 1.7) * (5.5 if high_impact else 1.0)
-                        shake_y = math.cos(f_idx * 2.0) * (3.8 if high_impact else 0.7)
+                        shake_x = math.sin(f_idx * 1.7) * (5.5 if high_impact else 1.2)
+                        shake_y = math.cos(f_idx * 2.0) * (3.8 if high_impact else 0.8)
                     else:
                         # Reaction / B-Roll / Dangal TV 3-Angle Twist Punch-In!
                         ease = 1.0 - (1.0 - local_t) ** 2
@@ -5323,18 +5585,29 @@ def generate_free_ai_video_clip(
                     except Exception:
                         pass
 
-            # Counterpart Reaction Cut (reuses Master Casting Sheet instantly if available!)
-            def _pick_reaction_role(role_k: str, diag: str) -> str:
+            # Counterpart Reaction Cut: ALWAYS cut to a DIFFERENT listening character from the speaker every ~2.5s!
+            def _pick_reaction_candidates(role_k: str, diag: str) -> list[str]:
                 h = abs(hash((role_k or "") + (diag or "")[:24])) % 2
-                if role_k in ("saas", "villain"):
-                    return "female" if h == 0 else "hero"
-                if role_k in ("hero", "female"):
-                    return "villain" if h == 0 else "saas"
-                return "hero"
+                if role_k == "female":
+                    return ["hero", "villain", "saas"] if h == 0 else ["villain", "hero", "saas"]
+                if role_k == "hero":
+                    return ["female", "villain", "saas"] if h == 0 else ["villain", "female", "saas"]
+                if role_k == "villain":
+                    return ["hero", "female", "saas"] if h == 0 else ["female", "hero", "saas"]
+                if role_k == "saas":
+                    return ["female", "hero", "villain"] if h == 0 else ["hero", "female", "villain"]
+                return ["female", "villain", "hero"]
 
-            react_role = _pick_reaction_role(speaker_role, dialogue_text)
-            cast_react = cast_map.get(react_role)
-            if cast_react and os.path.exists(cast_react) and cast_react not in keyframe_list:
+            react_candidates = _pick_reaction_candidates(speaker_role, dialogue_text)
+            react_role = react_candidates[0]
+            cast_react = None
+            for cand_role in react_candidates:
+                cand_path = cast_map.get(cand_role)
+                if cand_path and os.path.exists(cand_path) and os.path.abspath(cand_path) != os.path.abspath(framed_img_path) and cand_path not in keyframe_list:
+                    cast_react = cand_path
+                    react_role = cand_role
+                    break
+            if cast_react:
                 keyframe_list.append(cast_react)
             elif not custom_bg_path and len(keyframe_list) < 2:
                 counterpart_label = {"hero": "Hero", "female": "Heroine", "villain": "Villain", "saas": "Saas"}.get(react_role, "Hero")
@@ -6026,21 +6299,23 @@ async def autonomous_movie_worker(project_id: str):
                 except Exception:
                     dialogues = fallback_dialogues
 
-                # Guarantee Cliffhanger ending on Part k < N in Series Mode
+                # Guarantee Direct Face-to-Face Cliffhanger ending on Part k < N in Series Mode (0% Narrator!)
                 if series_mode == "series" and ch_no < total_ch_count and dialogues:
                     last_line = dialogues[-1]["dialogue"]
+                    last_role = detect_speaker_role(dialogues[-1].get("character", ""), char_map)
+                    cliff_spk = "Villain" if last_role != "villain" else hero_display
                     if f"Part {ch_no + 1}" not in last_line and "पार्ट" not in last_line:
                         dialogues.append(
                             {
-                                "character": "Narrator",
-                                "dialogue": f"अगले पार्ट में जानिए असली सच... देखिए Part {ch_no + 1} में!",
+                                "character": cliff_spk,
+                                "dialogue": f"अभी असली खेल बाकी है! असली सच जानने के लिए मिलो Part {ch_no + 1} में!",
                                 "location": dialogues[-1].get("location", "Royal Palace"),
                                 "location_key": dialogues[-1].get("location_key", "royal_palace"),
                                 "mood": "Suspense",
                                 "sfx": "thunder",
                                 "camera_angle": "front",
-                                "visual_action_prompt": "dramatic medium wide confrontation cliffhanger inside royal Indian haveli hall",
-                                "broll": True,
+                                "visual_action_prompt": "dramatic medium waist-up confrontation cliffhanger inside royal Indian haveli hall",
+                                "broll": False,
                             }
                         )
 
@@ -6138,19 +6413,22 @@ async def autonomous_movie_worker(project_id: str):
                                 rate_override=tts_rate,
                             )
 
-                            # Reuse Master Character Casting Sheet frame with strict Male/Female photo lock!
-                            if bool(d.get("broll", False)) and master_cast.get("context_broll"):
-                                cast_lookup_key = "context_broll"
-                            elif role_kind == "narrator":
-                                cast_lookup_key = "wide_confrontation"
-                            elif role_kind in ("female", "saas"):
-                                cast_lookup_key = role_kind if master_cast.get(role_kind) else ("female" if master_cast.get("female") else "saas")
+                            # Strictly show the EXACT SPEAKING CHARACTER'S distinct photo on every dialogue!
+                            # Heroine -> female photo, Hero/Raja -> hero photo, Villain/Bhoot -> villain photo, Saas -> saas photo!
+                            if role_kind == "female":
+                                cast_lookup_key = "female" if master_cast.get("female") else "saas"
+                            elif role_kind == "saas":
+                                cast_lookup_key = "saas" if master_cast.get("saas") else "female"
+                            elif role_kind == "villain":
+                                cast_lookup_key = "villain" if master_cast.get("villain") else "hero"
+                            elif role_kind == "hero":
+                                cast_lookup_key = "hero" if master_cast.get("hero") else "villain"
                             else:
-                                cast_lookup_key = role_kind if master_cast.get(role_kind) else ("hero" if master_cast.get("hero") else "villain")
+                                cast_lookup_key = ("hero", "female", "villain", "saas")[i % 4]
 
                             master_frame_path = master_cast.get(cast_lookup_key) if not bg_override else None
                             if master_frame_path and os.path.exists(master_frame_path) and os.path.getsize(master_frame_path) > 4000:
-                                if cast_lookup_key != role_kind and role_kind not in ("narrator", "crowd"):
+                                if cast_lookup_key != role_kind and role_kind in ("hero", "female", "villain", "saas"):
                                     # Same-gender fallback frame: mirror + zoom so it looks distinct and never blank!
                                     await asyncio.to_thread(
                                         _create_mirrored_zoomed_variant,
