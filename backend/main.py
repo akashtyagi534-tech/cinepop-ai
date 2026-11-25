@@ -362,7 +362,9 @@ def detect_speaker_role(speaker_name: str, char_map: Optional[dict] = None) -> s
         for k in (
             "hero", "raja", "king", "rajkumar", "prince", "inspector", "police", "officer", "captain",
             "sipahi", "detective", "beta", "pati", "bhai", "dost", "vaidya", "pandit",
+            "aryan", "arjun", "vikram", "rahul", "kabir", "karan", "rohit", "dev", "aman", "raj",
             "नायक", "हीरो", "राजा", "महाराज", "राजकुमार", "इंस्पेक्टर", "पुलिस", "अफसर", "सिपाही", "बेटा", "पति", "भाई",
+            "आर्यन", "अर्जुन", "विक्रम", "राहुल", "कबीर", "करण", "रोहित", "देव", "अमन", "राज",
         )
     ):
         return "hero"
@@ -927,7 +929,7 @@ def get_dynamic_character_prompts(topic: str = "") -> dict[str, str]:
         set_base = (
             f"Live-action Indian supernatural royal thriller drama frame, {topic_hint}"
             "inside an ancient candle-lit haunted Indian royal palace darbar hall with mysterious blue-golden mist, "
-            "carved stone pillars, flickering मशाल torches, 35mm DSLR camera, medium waist-up framing showing full upper body and hand gestures, no cartoon, no extreme close-up."
+            "carved stone pillars, flickering flaming mashaal torches, 35mm DSLR camera, medium waist-up framing showing full upper body and hand gestures, no cartoon, no extreme close-up."
         )
         return {
             "Wide_Confrontation": (
@@ -1375,7 +1377,7 @@ def _render_rich_cinematic_palace_actor_fallback(
     return out_path
 
 
-# 4. AUTO-FAILOVER IMAGE ENGINE (Cloudflare -> Together -> HF -> Pollinations Flux + Fast Turbo Retry)
+# 4. AUTO-FAILOVER 4K IMAGE ENGINE (Priority #1: Google Gemini Imagen 3 / Flash Image -> CF -> Together -> HF -> High-Res Pollinations)
 async def fetch_single_master_frame(
     role: str,
     prompt: str,
@@ -1386,41 +1388,116 @@ async def fetch_single_master_frame(
 ) -> str:
     _sync_runtime_api_vault_from_config()
     role_seed_base = (abs(hash(f"{role}_{prompt[:48]}_{int(time.time()) // 60}")) + role_idx * 7919) % 899999 + 100000
+    is_vertical = height > width
+    aspect_str = "9:16" if is_vertical else "16:9"
+    sharp_4k_prompt = (
+        f"Ultra-sharp 4K DSLR live-action Indian Hindi TV serial drama photograph, razor-sharp focus on actor's face and attire, "
+        f"rich cinema studio lighting, crisp textures, zero blur, {prompt}"
+    )
 
-    # Priority 1: Cloudflare Workers AI (@cf/black-forest-labs/flux-1-schnell)
+    def _save_sharp_master_bytes(raw_bytes: bytes) -> bool:
+        try:
+            im = Image.open(io.BytesIO(raw_bytes))
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            im = im.resize((width, height), Image.Resampling.LANCZOS)
+            im = ImageEnhance.Sharpness(im).enhance(1.16)
+            im.save(out_path, "JPEG", quality=95)
+            return _is_valid_non_black_image_file(out_path)
+        except Exception:
+            try:
+                with open(out_path, "wb") as f_raw:
+                    f_raw.write(raw_bytes)
+                return _is_valid_non_black_image_file(out_path)
+            except Exception:
+                return False
+
+    # Priority #1A: Google Gemini Imagen 3 (`imagen-3.0-generate-002:predict`) — Crystal-Clear 4K TV Serial Photos!
+    gemini_key = (RUNTIME_API_VAULT.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
+    if gemini_key:
+        if time.time() - _GEMINI_IMG_MODEL_COOLDOWN.get("imagen-3.0-generate-002", 0.0) > 300:
+            try:
+                imagen_url = f"https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key={gemini_key}"
+                imagen_payload = {
+                    "instances": [{"prompt": sharp_4k_prompt}],
+                    "parameters": {
+                        "sampleCount": 1,
+                        "aspectRatio": aspect_str,
+                        "personGeneration": "allow_adult",
+                    },
+                }
+                async with httpx.AsyncClient(timeout=18.0) as client_http:
+                    r = await client_http.post(imagen_url, json=imagen_payload)
+                    if r.status_code == 200:
+                        preds = (r.json() or {}).get("predictions") or []
+                        if preds and isinstance(preds[0], dict):
+                            b64_data = preds[0].get("bytesBase64Encoded") or preds[0].get("image")
+                            if b64_data and _save_sharp_master_bytes(base64.b64decode(b64_data)):
+                                API_HEALTH_STATUS["gemini"] = "active"
+                                return out_path
+                    elif r.status_code in (403, 404, 429):
+                        _GEMINI_IMG_MODEL_COOLDOWN["imagen-3.0-generate-002"] = time.time()
+            except Exception:
+                pass
+
+        # Priority #1B: Gemini Image Generation Fallback (`gemini-2.0-flash-exp-image-generation` -> `gemini-2.5-flash-image`)
+        for gem_img_model in ("gemini-2.0-flash-exp-image-generation", "gemini-2.5-flash-image"):
+            if time.time() - _GEMINI_IMG_MODEL_COOLDOWN.get(gem_img_model, 0.0) <= 300:
+                continue
+            try:
+                gem_url = f"https://generativelanguage.googleapis.com/v1beta/models/{gem_img_model}:generateContent?key={gemini_key}"
+                gem_payload = {
+                    "contents": [{"parts": [{"text": f"Generate a single crystal-clear {aspect_str} 4K photorealistic frame (no text, no watermark): {sharp_4k_prompt}"}]}],
+                    "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+                }
+                async with httpx.AsyncClient(timeout=18.0) as client_http:
+                    r = await client_http.post(gem_url, json=gem_payload)
+                    if r.status_code == 200:
+                        cands = (r.json() or {}).get("candidates") or []
+                        for cand in cands:
+                            parts = (cand.get("content") or {}).get("parts") or []
+                            for part in parts:
+                                inline = part.get("inlineData") or part.get("inline_data") or {}
+                                b64_img = inline.get("data")
+                                if b64_img and _save_sharp_master_bytes(base64.b64decode(b64_img)):
+                                    API_HEALTH_STATUS["gemini"] = "active"
+                                    return out_path
+                    elif r.status_code in (400, 403, 404, 429):
+                        _GEMINI_IMG_MODEL_COOLDOWN[gem_img_model] = time.time()
+            except Exception:
+                continue
+
+    # Priority #2: Cloudflare Workers AI (@cf/black-forest-labs/flux-1-schnell)
     cf_id = RUNTIME_API_VAULT.get("CF_ACCOUNT_ID", "").strip()
     cf_tok = RUNTIME_API_VAULT.get("CF_API_TOKEN", "").strip()
     if cf_id and cf_tok:
         try:
             url = f"https://api.cloudflare.com/client/v4/accounts/{cf_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
-            async with httpx.AsyncClient(timeout=10.0) as client_http:
-                r = await client_http.post(url, headers={"Authorization": f"Bearer {cf_tok}"}, json={"prompt": prompt, "num_steps": 4})
+            async with httpx.AsyncClient(timeout=12.0) as client_http:
+                r = await client_http.post(url, headers={"Authorization": f"Bearer {cf_tok}"}, json={"prompt": sharp_4k_prompt, "num_steps": 6})
                 if r.status_code == 200:
                     res_json = r.json()
                     img_b64 = res_json.get("result", {}).get("image")
-                    if img_b64:
-                        with open(out_path, "wb") as f:
-                            f.write(base64.b64decode(img_b64))
-                        if _is_valid_non_black_image_file(out_path):
-                            API_HEALTH_STATUS["cloudflare"] = "active"
-                            return out_path
+                    if img_b64 and _save_sharp_master_bytes(base64.b64decode(img_b64)):
+                        API_HEALTH_STATUS["cloudflare"] = "active"
+                        return out_path
             API_HEALTH_STATUS["cloudflare"] = "quota_full"
         except Exception:
             API_HEALTH_STATUS["cloudflare"] = "error"
 
-    # Priority 2: Together AI (FLUX.1-schnell-Free)
+    # Priority #3: Together AI (FLUX.1-schnell-Free) at high resolution
     tog_key = RUNTIME_API_VAULT.get("TOGETHER_API_KEY", "").strip()
     if tog_key:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client_http:
+            tog_w, tog_h = (768, 1344) if is_vertical else (1344, 768)
+            async with httpx.AsyncClient(timeout=12.0) as client_http:
                 r = await client_http.post(
                     "https://api.together.xyz/v1/images/generations",
                     headers={"Authorization": f"Bearer {tog_key}"},
                     json={
                         "model": "black-forest-labs/FLUX.1-schnell-Free",
-                        "prompt": prompt,
-                        "width": 768,
-                        "height": 1024,
+                        "prompt": sharp_4k_prompt,
+                        "width": tog_w,
+                        "height": tog_h,
                         "steps": 4,
                         "seed": role_seed_base,
                         "response_format": "b64_json",
@@ -1428,50 +1505,46 @@ async def fetch_single_master_frame(
                 )
                 if r.status_code == 200:
                     img_b64 = r.json()["data"][0]["b64_json"]
-                    with open(out_path, "wb") as f:
-                        f.write(base64.b64decode(img_b64))
-                    if _is_valid_non_black_image_file(out_path):
+                    if img_b64 and _save_sharp_master_bytes(base64.b64decode(img_b64)):
                         API_HEALTH_STATUS["together"] = "active"
                         return out_path
             API_HEALTH_STATUS["together"] = "quota_full"
         except Exception:
             API_HEALTH_STATUS["together"] = "error"
 
-    # Priority 3: HuggingFace Direct Inference API
+    # Priority #4: HuggingFace Direct Inference API
     hf_tok = RUNTIME_API_VAULT.get("HF_TOKEN", "").strip()
     if hf_tok:
         try:
-            async with httpx.AsyncClient(timeout=12.0) as client_http:
+            async with httpx.AsyncClient(timeout=14.0) as client_http:
                 r = await client_http.post(
                     "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
                     headers={"Authorization": f"Bearer {hf_tok}"},
-                    json={"inputs": prompt},
+                    json={"inputs": sharp_4k_prompt},
                 )
-                if r.status_code == 200 and len(r.content) > 5000:
-                    with open(out_path, "wb") as f:
-                        f.write(r.content)
-                    if _is_valid_non_black_image_file(out_path):
-                        API_HEALTH_STATUS["huggingface"] = "active"
-                        return out_path
+                if r.status_code == 200 and len(r.content) > 5000 and _save_sharp_master_bytes(r.content):
+                    API_HEALTH_STATUS["huggingface"] = "active"
+                    return out_path
             API_HEALTH_STATUS["huggingface"] = "quota_full"
         except Exception:
             API_HEALTH_STATUS["huggingface"] = "error"
 
-    # Priority 4: Pollinations AI (`model=flux` -> immediate fast `model=turbo` retry with distinct role seed!)
+    # Priority #5: Pollinations AI High-Res Sharp Fallback (width=768, height=1344, enhance=true!)
+    pol_w, pol_h = (768, 1344) if is_vertical else (1344, 768)
     pollinations_attempts = [
-        ("flux", prompt[:380], role_seed_base, 11.0),
-        ("turbo", prompt[:260], role_seed_base + 313, 10.0),
+        ("flux", sharp_4k_prompt[:420], role_seed_base, 14.0),
+        ("turbo", sharp_4k_prompt[:300], role_seed_base + 313, 12.0),
         (
-            "turbo",
-            f"Live-action Indian royal drama medium waist-up shot of {role}, {prompt[:160]}, warm golden palace lighting, 8k DSLR",
+            "flux",
+            f"4K ultra-sharp live-action Indian TV drama waist-up portrait of {role}, {prompt[:180]}, crisp cinema lighting, 8k DSLR",
             role_seed_base + 997,
-            9.0,
+            11.0,
         ),
     ]
     for model_name, p_text, seed_v, t_out in pollinations_attempts:
         try:
             enc = urllib.parse.quote(p_text)
-            url = f"https://image.pollinations.ai/prompt/{enc}?width={width}&height={height}&model={model_name}&nologo=true&seed={seed_v}"
+            url = f"https://image.pollinations.ai/prompt/{enc}?width={pol_w}&height={pol_h}&model={model_name}&enhance=true&nologo=true&seed={seed_v}"
             async with httpx.AsyncClient(timeout=t_out, follow_redirects=True) as client_http:
                 r = await client_http.get(
                     url,
@@ -1480,12 +1553,9 @@ async def fetch_single_master_frame(
                         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
                     },
                 )
-                if r.status_code == 200 and len(r.content) > 5000:
-                    with open(out_path, "wb") as f:
-                        f.write(r.content)
-                    if _is_valid_non_black_image_file(out_path):
-                        API_HEALTH_STATUS["pollinations"] = "active"
-                        return out_path
+                if r.status_code == 200 and len(r.content) > 5000 and _save_sharp_master_bytes(r.content):
+                    API_HEALTH_STATUS["pollinations"] = "active"
+                    return out_path
         except Exception:
             continue
 
@@ -1503,8 +1573,8 @@ def _create_mirrored_zoomed_variant(
 ) -> bool:
     """
     Create a visually distinct horizontal-flipped + warm golden/royal color-graded + strong digital zoomed
-    + atmospheric (warm golden light / royal mist / ember glow) frame from an available character photo
-    so a failed image fetch NEVER shows a black or duplicate frame!
+    + atmospheric (warm golden light / royal mist / ember glow) frame from an available same-gender character photo
+    so a failed image fetch NEVER shows a black frame!
     """
     try:
         if not _is_valid_non_black_image_file(src_img_path):
@@ -1533,15 +1603,15 @@ def _create_mirrored_zoomed_variant(
 
         img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
         img = ImageEnhance.Contrast(img).enhance(1.08)
-        img = ImageEnhance.Color(img).enhance(1.12)
-        img = ImageEnhance.Brightness(img).enhance(1.04)
-        img.save(out_img_path, "JPEG", quality=93)
+        img = ImageEnhance.Color(img).enhance(1.10)
+        img = ImageEnhance.Sharpness(img).enhance(1.18)
+        img.save(out_img_path, "JPEG", quality=95)
         return _is_valid_non_black_image_file(out_img_path)
     except Exception:
         return False
 
 
-# 5. STAGGERED 1.2s MASTER CASTING SHEET (Avoids Rate-Limit + 0% Black Screen Guarantee!)
+# 5. STAGGERED 1.2s MASTER CASTING SHEET (4K Role-Distinct Photos — NEVER Repeat Saas Across Hero/Villain/Heroine!)
 async def build_master_casting_sheet(
     work_dir: str,
     width: int = 720,
@@ -1549,34 +1619,53 @@ async def build_master_casting_sheet(
     topic: str = "",
 ) -> dict[str, str]:
     """
-    Fetch all 6 topic-aware roles (`Wide_Confrontation`, `Hero/Raja`, `Heroine/Rani`, `Villain`, `Saas`, `Context_BRoll`)
-    with a mandatory 1.2-second stagger delay and distinct seeds so Pollinations/Free APIs never rate-limit or return black images!
-    If any role times out, immediately recovers via fast turbo retry -> local same-gender cached photo -> horizontal flip + warm golden/royal color grade + zoom!
+    Fetch distinct 4K role-specific waist-up / over-the-shoulder photos for EVERY speaking role:
+    `Hero`, `Heroine`, `Villain`, `Saas`, plus `Wide_Confrontation` & `Context_BRoll`.
+    - Priority #1: Google Gemini Imagen 3 / Flash Image -> CF -> Together -> HF -> High-Res Pollinations (768x1344 enhance=true).
+    - Dedicated Pass-2 retry for any missing primary role so every speaker gets its OWN distinct actor photo!
+    - STRICT GENDER ISOLATION: Male roles (`Hero`, `Villain`) NEVER copy `Saas` or `Heroine` photos,
+      and Female roles (`Heroine`, `Saas`) NEVER copy `Hero` or `Villain` photos!
     """
     os.makedirs(work_dir, exist_ok=True)
     dynamic_prompts = get_dynamic_character_prompts(topic)
+    # Prioritize the 4 core speaking actors first so each speaking character gets its own crisp photo!
+    ordered_roles = [
+        r for r in ("Hero", "Heroine", "Villain", "Saas", "Wide_Confrontation", "Context_BRoll")
+        if r in dynamic_prompts
+    ]
     casting: dict[str, str] = {}
 
-    for idx_r, (role, prompt) in enumerate(dynamic_prompts.items()):
+    for idx_r, role in enumerate(ordered_roles):
+        prompt = dynamic_prompts[role]
         out_file = os.path.join(work_dir, f"master_{role.lower()}.jpg")
         if _is_valid_non_black_image_file(out_file, min_bytes=5000):
             casting[role] = out_file
             continue
         if idx_r > 0:
-            # Mandatory 1.2s delay between role fetches so free image servers never rate-limit!
             await asyncio.sleep(1.2)
         res = await fetch_single_master_frame(role, prompt, out_file, width, height, role_idx=idx_r)
         if res and _is_valid_non_black_image_file(res):
             casting[role] = res
 
-    # Strict Gender-Aware & Atmospheric Golden/Royal Grade Recovery so NO character slot is ever missing or black!
-    fallback_preference = {
-        "Hero": ("Hero", "Villain", "Wide_Confrontation", "Context_BRoll"),
-        "Villain": ("Villain", "Hero", "Wide_Confrontation", "Context_BRoll"),
-        "Heroine": ("Heroine", "Saas", "Wide_Confrontation", "Context_BRoll"),
-        "Saas": ("Saas", "Heroine", "Wide_Confrontation", "Context_BRoll"),
-        "Wide_Confrontation": ("Wide_Confrontation", "Hero", "Villain", "Heroine", "Context_BRoll"),
-        "Context_BRoll": ("Context_BRoll", "Wide_Confrontation", "Hero", "Villain"),
+    # Pass 2 Dedicated Retry for any core speaking character that missed on Pass 1 (guarantees unique face per role!)
+    for retry_i, role in enumerate(("Hero", "Heroine", "Villain", "Saas")):
+        if role in casting and _is_valid_non_black_image_file(casting[role]):
+            continue
+        out_file = os.path.join(work_dir, f"master_{role.lower()}.jpg")
+        await asyncio.sleep(1.2)
+        prompt = dynamic_prompts.get(role, f"Indian TV drama medium waist-up actor portrait for {role}")
+        res = await fetch_single_master_frame(role, prompt, out_file, width, height, role_idx=20 + retry_i)
+        if res and _is_valid_non_black_image_file(res):
+            casting[role] = res
+
+    # STRICT PER-ROLE ISOLATION: NEVER repeat Saas onto Heroine/Nayika, Villain, or Hero/Aryan!
+    strict_same_role_fallback = {
+        "Hero": ("Hero",),
+        "Villain": ("Villain",),
+        "Heroine": ("Heroine",),
+        "Saas": ("Saas",),
+        "Wide_Confrontation": ("Wide_Confrontation", "Hero", "Villain", "Heroine"),
+        "Context_BRoll": ("Context_BRoll", "Wide_Confrontation"),
     }
     grade_cycle = ("golden", "royal", "mist")
     role_to_internal = {
@@ -1588,26 +1677,25 @@ async def build_master_casting_sheet(
         "Context_BRoll": "context_broll",
     }
 
-    for idx_r, role in enumerate(dynamic_prompts.keys()):
+    for idx_r, role in enumerate(ordered_roles):
         if role in casting and _is_valid_non_black_image_file(casting[role]):
             continue
         out_file = os.path.join(work_dir, f"master_{role.lower()}.jpg")
 
-        # Try pre-cached same-gender/role image from local cache first
+        # Try pre-cached EXACT SAME-ROLE / SAME-GENDER image from local cache first
         internal_rk = role_to_internal.get(role, "hero")
         cached_im = _reuse_cached_photorealistic_scene(width, height, internal_rk, idx_r + 101)
         if cached_im is not None:
             try:
-                cached_im.save(out_file, "JPEG", quality=93)
+                cached_im.save(out_file, "JPEG", quality=95)
                 if _is_valid_non_black_image_file(out_file):
                     casting[role] = out_file
                     continue
             except Exception:
                 pass
 
-        # Otherwise horizontal flip + warm golden/royal color grade + digital zoom on available master frame
-        prefs = list(fallback_preference.get(role, ())) + list(casting.keys())
-        for donor_role in prefs:
+        # STRICTLY same-role donor ONLY — never repeat Saas across Hero/Villain/Heroine!
+        for donor_role in strict_same_role_fallback.get(role, ()):
             donor_path = casting.get(donor_role)
             if donor_path and _is_valid_non_black_image_file(donor_path):
                 if _create_mirrored_zoomed_variant(
@@ -1622,7 +1710,7 @@ async def build_master_casting_sheet(
                     casting[role] = out_file
                     break
 
-        # Final safety: rich golden palace canvas (never black!)
+        # Final safety: rich golden palace canvas (never black and never wrong gender!)
         if role not in casting or not _is_valid_non_black_image_file(casting.get(role, "")):
             _render_rich_cinematic_palace_actor_fallback(out_file, role=role, width=width, height=height)
             casting[role] = out_file
@@ -3492,13 +3580,15 @@ def _try_gemini_photorealistic_image(prompt: str, W: int, H: int) -> Optional[Im
         except Exception:
             _GEMINI_IMG_MODEL_COOLDOWN["imagen-3.0-generate-002"] = time.time()
 
-    # 3B: Try Gemini Flash Image (`gemini-2.5-flash-image`)
-    if now_t - _GEMINI_IMG_MODEL_COOLDOWN.get("gemini-2.5-flash-image", 0.0) > 600:
-        def _call_flash_img():
+    # 3B: Try Gemini Flash Image (`gemini-2.0-flash-exp-image-generation` -> `gemini-2.5-flash-image`)
+    for flash_img_model in ("gemini-2.0-flash-exp-image-generation", "gemini-2.5-flash-image"):
+        if now_t - _GEMINI_IMG_MODEL_COOLDOWN.get(flash_img_model, 0.0) <= 600:
+            continue
+        def _call_flash_img(m_name=flash_img_model):
             return rt_client.models.generate_content(
-                model="gemini-2.5-flash-image",
+                model=m_name,
                 contents=prompt,
-                config={"response_modalities": ["IMAGE"]},
+                config={"response_modalities": ["IMAGE", "TEXT"]},
             )
         try:
             with ThreadPoolExecutor(max_workers=1) as pool:
@@ -3514,7 +3604,7 @@ def _try_gemini_photorealistic_image(prompt: str, W: int, H: int) -> Optional[Im
                         if len(raw_bytes) > 5000:
                             return open_upright_image(raw_bytes).resize((W, H), Image.Resampling.LANCZOS)
         except Exception:
-            _GEMINI_IMG_MODEL_COOLDOWN["gemini-2.5-flash-image"] = time.time()
+            _GEMINI_IMG_MODEL_COOLDOWN[flash_img_model] = time.time()
 
     return None
 
@@ -3611,7 +3701,10 @@ def _reuse_cached_photorealistic_scene(W: int, H: int, hero_role: str, seed_val:
             )
         ]
 
-        pool = exact_matches or gender_matches or valid_files
+        # STRICT same-role / same-gender match ONLY (NEVER reuse a Saas photo for Hero/Villain or Hero for Heroine!)
+        pool = exact_matches or gender_matches
+        if not pool:
+            return None
         chosen = pool[seed_val % len(pool)]
         img = open_upright_image(chosen).resize((W, H), Image.Resampling.LANCZOS)
         # Apply horizontal flip + warm golden/royal color grade + digital zoom when reusing across cuts
@@ -3620,10 +3713,11 @@ def _reuse_cached_photorealistic_scene(W: int, H: int, hero_role: str, seed_val:
         margin_x = max(14, int(W * 0.08))
         margin_y = max(14, int(H * 0.08))
         img = img.crop((margin_x, margin_y, W - margin_x, H - margin_y)).resize((W, H), Image.Resampling.LANCZOS)
-        overlay = Image.new("RGBA", (W, H), (240, 170, 55, 32))
+        overlay = Image.new("RGBA", (W, H), (240, 170, 55, 28))
         img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
         img = ImageEnhance.Contrast(img).enhance(1.07)
-        img = ImageEnhance.Color(img).enhance(1.10)
+        img = ImageEnhance.Color(img).enhance(1.08)
+        img = ImageEnhance.Sharpness(img).enhance(1.18)
         return img
     except Exception:
         return None
@@ -3716,11 +3810,21 @@ def render_location_backdrop(
     cfg = get_runtime_ai_config()
 
     # Visual Auto-Failover Chain:
-    # P1: Cloudflare Workers AI Flux -> P2: Together AI FLUX -> P3: Gemini Imagen/Flash -> P4: HF Spaces -> P5: Pollinations -> Same-Gender/Mirrored Cache
+    # P1: Google Gemini Imagen 3 / Flash Image -> P2: Cloudflare Flux -> P3: Together FLUX -> P4: HF Spaces -> P5: Pollinations High-Res (768x1344 enhance=true)
+    gem_img = _try_gemini_photorealistic_image(full_prompt, W, H)
+    if gem_img is not None:
+        try:
+            gem_img = ImageEnhance.Sharpness(gem_img).enhance(1.15)
+            gem_img.save(cache_path, "JPEG", quality=95)
+        except Exception:
+            pass
+        return gem_img
+
     cf_img = _try_cloudflare_flux_image(full_prompt, W, H, cfg)
     if cf_img is not None:
         try:
-            cf_img.save(cache_path, "JPEG", quality=93)
+            cf_img = ImageEnhance.Sharpness(cf_img).enhance(1.15)
+            cf_img.save(cache_path, "JPEG", quality=95)
         except Exception:
             pass
         return cf_img
@@ -3728,23 +3832,17 @@ def render_location_backdrop(
     tog_img = _try_together_flux_image(full_prompt, W, H, cfg)
     if tog_img is not None:
         try:
-            tog_img.save(cache_path, "JPEG", quality=93)
+            tog_img = ImageEnhance.Sharpness(tog_img).enhance(1.15)
+            tog_img.save(cache_path, "JPEG", quality=95)
         except Exception:
             pass
         return tog_img
 
-    gem_img = _try_gemini_photorealistic_image(full_prompt, W, H)
-    if gem_img is not None:
-        try:
-            gem_img.save(cache_path, "JPEG", quality=93)
-        except Exception:
-            pass
-        return gem_img
-
     hf_img = _try_hf_fast_image_spaces(full_prompt, W, H, seed_val, cfg)
     if hf_img is not None:
         try:
-            hf_img.save(cache_path, "JPEG", quality=93)
+            hf_img = ImageEnhance.Sharpness(hf_img).enhance(1.15)
+            hf_img.save(cache_path, "JPEG", quality=95)
         except Exception:
             pass
         return hf_img
@@ -3756,9 +3854,10 @@ def render_location_backdrop(
     if cfg.get("enable_pollinations", True) and not _is_vault_provider_cooling("pollinations"):
         pref_model = cfg.get("pollinations_model", "flux")
         alt_model = "turbo" if pref_model != "turbo" else "flux"
+        pol_w, pol_h = (768, 1344) if H > W else (1344, 768)
         candidate_urls = [
-            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model={pref_model}&nologo=true&seed={seed_val}", 9),
-            (f"https://image.pollinations.ai/prompt/{encoded}?width={W}&height={H}&model={alt_model}&nologo=true&seed={(seed_val + 73) % 99999}", 9),
+            (f"https://image.pollinations.ai/prompt/{encoded}?width={pol_w}&height={pol_h}&model={pref_model}&enhance=true&nologo=true&seed={seed_val}", 12),
+            (f"https://image.pollinations.ai/prompt/{encoded}?width={pol_w}&height={pol_h}&model={alt_model}&enhance=true&nologo=true&seed={(seed_val + 73) % 99999}", 12),
         ]
         for url, t_sec in candidate_urls:
             try:
@@ -4925,8 +5024,15 @@ def _build_overlay_ffmpeg_cmd(
 
     fc_parts: list[str] = []
     cur_v = "0:v"
-    if base_v_filter:
-        fc_parts.append(f"[0:v]{base_v_filter}[vb]")
+    # Always apply crisp HD unsharp=5:5:0.8 sharpening so every output frame looks 4K-sharp with zero blur!
+    sharp_filter = base_v_filter.strip()
+    if sharp_filter:
+        if "unsharp=" not in sharp_filter:
+            sharp_filter = f"{sharp_filter},unsharp=5:5:0.8"
+        fc_parts.append(f"[0:v]{sharp_filter}[vb]")
+        cur_v = "vb"
+    else:
+        fc_parts.append("[0:v]unsharp=5:5:0.8[vb]")
         cur_v = "vb"
     if sub_idx is not None:
         fc_parts.append(f"[{cur_v}][{sub_idx}:v]overlay=0:H-h[vsub]")
@@ -4947,7 +5053,7 @@ def _build_overlay_ffmpeg_cmd(
     cmd.extend([
         "-r", str(fps),
         "-t", f"{max(1.5, float(dur)):.2f}",
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "23",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "20",
         "-g", str(fps), "-bf", "0", "-video_track_timescale", "15360",
         "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "96k",
         "-movflags", "+faststart",
@@ -4994,7 +5100,7 @@ def _render_pro_motion_vfx_clip(
         try:
             base = cv2.imread(framed_img_path)
             if base is not None:
-                src = cv2.resize(base, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
+                src = cv2.resize(base, (src_w, src_h), interpolation=cv2.INTER_LANCZOS4)
                 sh, sw = src.shape[:2]
                 # Strict front-face + mouth cascade verification (None on side-profile -> zero black dots!)
                 strict_mouth_src = _detect_strict_frontal_mouth(src)
@@ -5070,7 +5176,7 @@ def _render_pro_motion_vfx_clip(
                     frame = cv2.resize(
                         work_src[y1 : y1 + crop_h, x1 : x1 + crop_w],
                         (w_out, h_out),
-                        interpolation=cv2.INTER_LINEAR,
+                        interpolation=cv2.INTER_CUBIC,
                     )
 
                     frame = _apply_mood_lighting_tint(frame, mood)
@@ -5107,7 +5213,7 @@ def _render_pro_motion_vfx_clip(
                 if os.path.exists(raw_vfx_mp4) and os.path.getsize(raw_vfx_mp4) > 2000:
                     cmd = _build_overlay_ffmpeg_cmd(
                         ["-i", raw_vfx_mp4],
-                        "",
+                        f"scale={w_out}:{h_out}:flags=lanczos,unsharp=5:5:0.8",
                         final_audio,
                         out_mp4,
                         dur=dur,
@@ -5128,15 +5234,15 @@ def _render_pro_motion_vfx_clip(
                 except Exception:
                     pass
 
-    # Path B: Pure FFmpeg 30fps Pro Motion (NO `-loop 1` before zoompan so zoompan animates EVERY frame!)
+    # Path B: Pure FFmpeg 30fps Pro Motion (Crisp HD lanczos + unsharp=5:5:0.8!)
     shake_expr_x = "iw/2-(iw/zoom/2)+sin(on*1.5)*12" if high_impact else "iw/2-(iw/zoom/2)+sin(on*0.12)*16"
     shake_expr_y = "ih/2-(ih/zoom/2)+cos(on*1.9)*8" if high_impact else "ih/2-(ih/zoom/2)+sin(on*0.14)*10"
     zoom_rate = "0.0017" if high_impact else "0.0012"
     zoom_cap = "1.20" if high_impact else "1.16"
     vf_base = (
-        f"scale={src_w}:{src_h}:force_original_aspect_ratio=increase,crop={src_w}:{src_h},"
+        f"scale={src_w}:{src_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={src_w}:{src_h},"
         f"zoompan=z='min(1.04+on*{zoom_rate},{zoom_cap})':x='{shake_expr_x}':y='{shake_expr_y}':d={total_frames}:s={w_out}x{h_out}:fps={fps},"
-        f"eq=contrast=1.06:saturation=1.10:brightness=0.01,vignette=PI/5"
+        f"eq=contrast=1.06:saturation=1.10:brightness=0.01,unsharp=5:5:0.8,vignette=PI/5"
     )
     cmd_fb = _build_overlay_ffmpeg_cmd(
         ["-i", framed_img_path],
@@ -5207,7 +5313,7 @@ def _render_multishot_pollinations_motion_clip(
             for fp in valid_frames:
                 im = cv2.imread(fp)
                 if im is not None:
-                    rs = cv2.resize(im, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
+                    rs = cv2.resize(im, (src_w, src_h), interpolation=cv2.INTER_LANCZOS4)
                     loaded_srcs.append(rs)
                     loaded_faces.append(_detect_strict_frontal_mouth(rs))
 
@@ -5274,7 +5380,7 @@ def _render_multishot_pollinations_motion_clip(
                     out_f = cv2.resize(
                         work[y1 : y1 + crop_h, x1 : x1 + crop_w],
                         (w_out, h_out),
-                        interpolation=cv2.INTER_LINEAR,
+                        interpolation=cv2.INTER_CUBIC,
                     )
                     out_f = _apply_mood_lighting_tint(out_f, mood)
                     l_boost = 1.0 + (0.03 * talk_amp if is_speaking else 0.05 * max(0.0, 1.0 - local_t * 3.5))
@@ -5305,7 +5411,7 @@ def _render_multishot_pollinations_motion_clip(
                 if os.path.exists(raw_vfx_mp4) and os.path.getsize(raw_vfx_mp4) > 2000:
                     cmd_mux = _build_overlay_ffmpeg_cmd(
                         ["-i", raw_vfx_mp4],
-                        "",
+                        f"scale={w_out}:{h_out}:flags=lanczos,unsharp=5:5:0.8",
                         final_audio,
                         out_mp4,
                         dur=dur,
@@ -5326,7 +5432,7 @@ def _render_multishot_pollinations_motion_clip(
                 except Exception:
                     pass
 
-    # Path B (Pure-FFmpeg 2-Cut 30fps Motion Fallback — NO `-loop 1` before zoompan!)
+    # Path B (Pure-FFmpeg 2-Cut 30fps Motion Fallback with crisp HD lanczos + unsharp=5:5:0.8!)
     use_frames = valid_frames[:2]
     n_shots = len(use_frames)
     xfade_dur = 0.20
@@ -5336,8 +5442,8 @@ def _render_multishot_pollinations_motion_clip(
     shot_frames_list = [max(30, int(sd * fps) + 2) for sd in shot_durs]
 
     zoompan_moves = [
-        f"scale={src_w}:{src_h}:force_original_aspect_ratio=increase,crop={src_w}:{src_h},zoompan=z='min(1.20,1.04+0.0016*on)':x='iw/2-(iw/zoom/2)+sin(on*0.15)*12':y='ih/2-(ih/zoom/2)+sin(on*0.18)*8':d={shot_frames_list[0]}:s={w_out}x{h_out}:fps={fps}",
-        f"scale={src_w}:{src_h}:force_original_aspect_ratio=increase,crop={src_w}:{src_h},zoompan=z='min(1.22,1.05+0.0022*on)':x='iw/2-(iw/zoom/2)-on*0.35':y='ih/2-(ih/zoom/2)+sin(on*0.24)*6':d={shot_frames_list[1]}:s={w_out}x{h_out}:fps={fps}",
+        f"scale={src_w}:{src_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={src_w}:{src_h},zoompan=z='min(1.20,1.04+0.0016*on)':x='iw/2-(iw/zoom/2)+sin(on*0.15)*12':y='ih/2-(ih/zoom/2)+sin(on*0.18)*8':d={shot_frames_list[0]}:s={w_out}x{h_out}:fps={fps}",
+        f"scale={src_w}:{src_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={src_w}:{src_h},zoompan=z='min(1.22,1.05+0.0022*on)':x='iw/2-(iw/zoom/2)-on*0.35':y='ih/2-(ih/zoom/2)+sin(on*0.24)*6':d={shot_frames_list[1]}:s={w_out}x{h_out}:fps={fps}",
     ]
 
     cmd = ["ffmpeg", "-y"]
@@ -5366,7 +5472,7 @@ def _render_multishot_pollinations_motion_clip(
     for idx in range(n_shots):
         fc_parts.append(f"[{idx}:v]{zoompan_moves[idx]},setsar=1,format=yuv420p[s{idx}]")
     fc_parts.append(
-        f"[s0][s1]xfade=transition=fade:duration={xfade_dur:.2f}:offset={max(0.5, cut1_dur - xfade_dur):.2f},eq=contrast=1.06:saturation=1.10,vignette=PI/5[vcur]"
+        f"[s0][s1]xfade=transition=fade:duration={xfade_dur:.2f}:offset={max(0.5, cut1_dur - xfade_dur):.2f},eq=contrast=1.06:saturation=1.10,unsharp=5:5:0.8,vignette=PI/5[vcur]"
     )
     cur_v = "vcur"
     if sub_idx is not None:
@@ -5386,7 +5492,7 @@ def _render_multishot_pollinations_motion_clip(
         "-map", f"{audio_idx}:a:0",
         "-r", str(fps),
         "-t", f"{max(1.5, float(dur)):.2f}",
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "23",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "20",
         "-g", str(fps), "-bf", "0", "-video_track_timescale", "15360",
         "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "96k",
         "-movflags", "+faststart",
@@ -5488,7 +5594,7 @@ def generate_free_ai_video_clip(
 
     def _mux_video_with_audio_and_sub(src_video: str) -> bool:
         try:
-            scale_crop = f"scale={w_out}:{h_out}:force_original_aspect_ratio=increase,crop={w_out}:{h_out},eq=contrast=1.06:saturation=1.10,vignette=PI/5"
+            scale_crop = f"scale={w_out}:{h_out}:force_original_aspect_ratio=increase:flags=lanczos,crop={w_out}:{h_out},eq=contrast=1.06:saturation=1.10,unsharp=5:5:0.8,vignette=PI/5"
             cmd = _build_overlay_ffmpeg_cmd(
                 ["-stream_loop", "-1", "-i", src_video],
                 scale_crop,
@@ -6132,9 +6238,10 @@ async def autonomous_movie_worker(project_id: str):
                             im = open_upright_image(in_path).resize((cast_w, cast_h), Image.Resampling.LANCZOS)
                             im = ImageEnhance.Contrast(im).enhance(1.06)
                             im = ImageEnhance.Color(im).enhance(1.06)
+                            im = ImageEnhance.Sharpness(im).enhance(1.18)
                             if watermark_text:
                                 draw_channel_watermark(im, watermark_text, watermark_position)
-                            im.save(out_path, "JPEG", quality=93)
+                            im.save(out_path, "JPEG", quality=95)
 
                         await asyncio.to_thread(_finalize_role_frame)
                     if os.path.exists(final_p) and os.path.getsize(final_p) > 4000:
@@ -6150,20 +6257,20 @@ async def autonomous_movie_worker(project_id: str):
                     return_exceptions=True,
                 )
 
-            # Final Zero-Blank-Screen Guarantee: fill any still-missing role from same-gender / wide master frame via mirror+zoom
+            # STRICT PER-ROLE ISOLATION (NEVER copy Saas photo onto Hero/Aryan, Villain, or Heroine/Nayika!)
             cast_donor_prefs = {
-                "hero": ("hero", "villain", "wide_confrontation", "context_broll"),
-                "villain": ("villain", "hero", "wide_confrontation", "context_broll"),
-                "female": ("female", "saas", "wide_confrontation", "context_broll"),
-                "saas": ("saas", "female", "wide_confrontation", "context_broll"),
-                "wide_confrontation": ("wide_confrontation", "hero", "villain", "female", "context_broll"),
-                "context_broll": ("context_broll", "wide_confrontation", "hero", "villain"),
+                "hero": ("hero",),
+                "villain": ("villain",),
+                "female": ("female",),
+                "saas": ("saas",),
+                "wide_confrontation": ("wide_confrontation", "hero", "villain", "female"),
+                "context_broll": ("context_broll", "wide_confrontation"),
             }
             for idx_ck, (ck, _, _, _, _) in enumerate(cast_specs):
                 if ck in master_cast and os.path.exists(master_cast[ck]):
                     continue
                 target_p = f"{master_cast_dir}/{ck}.jpg"
-                for donor_k in list(cast_donor_prefs.get(ck, ())) + list(master_cast.keys()):
+                for donor_k in cast_donor_prefs.get(ck, ()):
                     donor_p = master_cast.get(donor_k)
                     if donor_p and os.path.exists(donor_p):
                         if _create_mirrored_zoomed_variant(
@@ -6176,6 +6283,9 @@ async def autonomous_movie_worker(project_id: str):
                         ):
                             master_cast[ck] = target_p
                             break
+                if ck not in master_cast or not os.path.exists(master_cast.get(ck, "")):
+                    _render_rich_cinematic_palace_actor_fallback(target_p, role=ck, width=cast_w, height=cast_h)
+                    master_cast[ck] = target_p
 
         chapters = state["outline"]["chapters"]
         manual_chunks = state.get("manual_chunks")
@@ -6413,16 +6523,10 @@ async def autonomous_movie_worker(project_id: str):
                                 rate_override=tts_rate,
                             )
 
-                            # Strictly show the EXACT SPEAKING CHARACTER'S distinct photo on every dialogue!
-                            # Heroine -> female photo, Hero/Raja -> hero photo, Villain/Bhoot -> villain photo, Saas -> saas photo!
-                            if role_kind == "female":
-                                cast_lookup_key = "female" if master_cast.get("female") else "saas"
-                            elif role_kind == "saas":
-                                cast_lookup_key = "saas" if master_cast.get("saas") else "female"
-                            elif role_kind == "villain":
-                                cast_lookup_key = "villain" if master_cast.get("villain") else "hero"
-                            elif role_kind == "hero":
-                                cast_lookup_key = "hero" if master_cast.get("hero") else "villain"
+                            # Strictly show the EXACT SPEAKING CHARACTER'S own distinct photo on every dialogue!
+                            # Heroine/Nayika -> female photo, Hero/Aryan -> hero photo, Villain -> villain photo, Saas -> saas photo (NEVER repeat Saas on other speakers!)
+                            if role_kind in ("female", "saas", "villain", "hero"):
+                                cast_lookup_key = role_kind
                             else:
                                 cast_lookup_key = ("hero", "female", "villain", "saas")[i % 4]
 
@@ -6496,11 +6600,11 @@ async def autonomous_movie_worker(project_id: str):
                                     )
                                 if not _is_valid_non_black_image_file(f_img):
                                     w_fb, h_fb = get_aspect_dimensions(aspect_ratio)
-                                    # Zero Black Screen Guarantee: horizontal flip + warm golden/royal grade + zoom on any available master image!
+                                    # Strict Role-Only Recovery: NEVER copy Saas onto Hero/Villain/Heroine!
                                     gender_donors = (
-                                        ("female", "saas", "wide_confrontation", "hero", "villain", "context_broll")
-                                        if role_kind in ("female", "saas")
-                                        else ("hero", "villain", "wide_confrontation", "context_broll", "female", "saas")
+                                        (role_kind,)
+                                        if role_kind in ("hero", "female", "villain", "saas")
+                                        else ("wide_confrontation", "context_broll")
                                     )
                                     recovered = False
                                     for dk in gender_donors:
