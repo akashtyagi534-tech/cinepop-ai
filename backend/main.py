@@ -705,9 +705,20 @@ DEFAULT_AI_CONFIG = {
     "custom_video_space": "",
     "custom_faceswap_space": "",
     "hf_token": os.getenv("HF_TOKEN", ""),
+    # Master ON/OFF Control Center Switches (Paid Real-Video Mode defaults strictly to OFF!)
+    "enable_paid_video_engine": False,
+    "fal_key": os.getenv("FAL_KEY", ""),
+    "fal_video_model": "fal-ai/kling-video/v2/master/image-to-video",
+    "replicate_api_token": os.getenv("REPLICATE_API_TOKEN", ""),
+    "replicate_video_model": "wavespeedai/wan-2.1-i2v-480p",
+    "runway_api_secret": os.getenv("RUNWAY_API_SECRET", ""),
+    "luma_api_key": os.getenv("LUMA_API_KEY", ""),
+    "enable_free_viral_motion": True,
+    "enable_face_swap_engine": True,
+    "enable_auto_foley_ducking": True,
     "enable_custom_hf": True,
     "enable_pollinations": True,
-    "pollinations_model": "flux",
+    "pollinations_model": "turbo",
     "enable_public_hf_spaces": True,
     "enable_ltx_video": True,
     "enable_wan21": True,
@@ -751,25 +762,46 @@ def normalize_ai_config(raw: Optional[dict]) -> dict:
         "custom_video_space",
         "custom_faceswap_space",
         "hf_token",
+        "fal_key",
+        "fal_video_model",
+        "replicate_api_token",
+        "replicate_video_model",
+        "runway_api_secret",
+        "luma_api_key",
         "upi_id",
         "announcement_banner",
     ):
         cfg[skey] = str(cfg.get(skey) or "").strip()
+    if cfg["fal_video_model"] not in (
+        "fal-ai/kling-video/v2/master/image-to-video",
+        "fal-ai/wan-i2v",
+        "fal-ai/minimax-video/image-to-video",
+    ):
+        cfg["fal_video_model"] = "fal-ai/kling-video/v2/master/image-to-video"
+    if cfg["replicate_video_model"] not in (
+        "wavespeedai/wan-2.1-i2v-480p",
+        "kwaivgi/kling-v1.6-pro",
+    ):
+        cfg["replicate_video_model"] = "wavespeedai/wan-2.1-i2v-480p"
     if not cfg["upi_id"]:
         cfg["upi_id"] = UPI_ID
     cfg["announcement_banner"] = cfg["announcement_banner"][:240]
-    pm = str(cfg.get("pollinations_model") or "flux").strip().lower()
-    cfg["pollinations_model"] = pm if pm in ("flux", "turbo", "flux-realism") else "flux"
-    for bkey in (
-        "enable_custom_hf",
-        "enable_pollinations",
-        "enable_public_hf_spaces",
-        "enable_ltx_video",
-        "enable_wan21",
-        "enable_cogvideox",
-        "enable_local_motion_fallback",
+    pm = str(cfg.get("pollinations_model") or "turbo").strip().lower()
+    cfg["pollinations_model"] = pm if pm in ("flux", "turbo", "flux-realism") else "turbo"
+    for bkey, default_b in (
+        ("enable_paid_video_engine", False),
+        ("enable_free_viral_motion", True),
+        ("enable_face_swap_engine", True),
+        ("enable_auto_foley_ducking", True),
+        ("enable_custom_hf", True),
+        ("enable_pollinations", True),
+        ("enable_public_hf_spaces", True),
+        ("enable_ltx_video", True),
+        ("enable_wan21", True),
+        ("enable_cogvideox", True),
+        ("enable_local_motion_fallback", True),
     ):
-        val = cfg.get(bkey, True)
+        val = cfg.get(bkey, default_b)
         if isinstance(val, str):
             cfg[bkey] = val.strip().lower() in ("true", "1", "yes", "on")
         else:
@@ -810,6 +842,10 @@ RUNTIME_API_VAULT = {
     "TOGETHER_API_KEY": os.getenv("TOGETHER_API_KEY", ""),
     "HF_TOKEN": os.getenv("HF_TOKEN", ""),
     "CUSTOM_HF_SPACE": os.getenv("CUSTOM_HF_SPACE", "black-forest-labs/FLUX.1-schnell"),
+    "FAL_KEY": os.getenv("FAL_KEY", ""),
+    "REPLICATE_API_TOKEN": os.getenv("REPLICATE_API_TOKEN", ""),
+    "RUNWAY_API_SECRET": os.getenv("RUNWAY_API_SECRET", ""),
+    "LUMA_API_KEY": os.getenv("LUMA_API_KEY", ""),
 }
 
 API_HEALTH_STATUS = {
@@ -819,6 +855,10 @@ API_HEALTH_STATUS = {
     "together": "standby",
     "huggingface": "standby",
     "pollinations": "active",
+    "fal": "off",
+    "replicate": "off",
+    "runway": "off",
+    "luma": "off",
 }
 
 _VAULT_TO_AI_CONFIG_KEY = {
@@ -829,6 +869,10 @@ _VAULT_TO_AI_CONFIG_KEY = {
     "TOGETHER_API_KEY": "together_api_key",
     "HF_TOKEN": "hf_token",
     "CUSTOM_HF_SPACE": "custom_video_space",
+    "FAL_KEY": "fal_key",
+    "REPLICATE_API_TOKEN": "replicate_api_token",
+    "RUNWAY_API_SECRET": "runway_api_secret",
+    "LUMA_API_KEY": "luma_api_key",
 }
 
 
@@ -845,10 +889,11 @@ def _sync_runtime_api_vault_from_config(cfg: Optional[dict] = None) -> dict:
     return RUNTIME_API_VAULT
 
 
-# 2. DYNAMIC TOPIC-AWARE CHARACTER & SCENE PROMPTS (Waist-Up Only & Strict Male/Female Visual Lock!)
+# 2. DYNAMIC TOPIC-AWARE CHARACTER & SCENE PROMPTS (Waist-Up Fully Dressed & Strict Male/Female Visual Lock!)
 TV_SERIAL_SET_BASE = (
-    "Live-action Indian Hindi TV drama frame, warm cinematic lighting, 35mm DSLR camera, "
-    "medium waist-up framing showing full upper body and expressive hand gestures, realistic skin texture, no cartoon, no extreme close-up."
+    "cinematic medium waist-up 9:16 vertical shot, fully dressed in traditional/royal Indian attire, "
+    "4K DSLR live-action Indian TV serial frame, sharp focus, warm cinematic studio lighting, "
+    "expressive hand gestures, realistic skin texture, no shirtless, no passport close-up, no cartoon."
 )
 
 CHARACTER_PROMPTS = {
@@ -1343,41 +1388,110 @@ def _is_valid_non_black_image_file(img_path: str, min_bytes: int = 4500) -> bool
         return False
 
 
-def _render_rich_cinematic_palace_actor_fallback(
+def _failover_photorealistic_role_frame(
     out_path: str,
     role: str = "Hero",
     width: int = 720,
     height: int = 1280,
+    donor_paths: Optional[list[str]] = None,
 ) -> str:
     """
-    Emergency 100% non-black, richly lit royal Indian palace / atmospheric character silhouette + golden chandelier canvas
-    if every internet provider is offline and zero donor images exist yet.
+    ZERO BROWN-CIRCLES / ZERO BLACK-SCREEN PHOTOREALISTIC FAILOVER:
+    Legacy brown concentric circles placeholder has been PERMANENTLY DELETED!
+    1. Tries any available photorealistic donor frame with horizontal flip + warm/dramatic color grade + zoom.
+    2. Tries cached photorealistic Indian TV serial scene from `/tmp` / `all_projects/*/master_cast`.
+    3. Final live rescue: fetches a crisp dressed Pollinations `model=turbo` vertical 4K Indian drama frame with unique seed.
     """
-    img = Image.new("RGB", (width, height), (54, 28, 18))
-    _draw_vertical_gradient(img, (98, 48, 24), (36, 18, 28))
-    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
-    cx, cy = width // 2, int(height * 0.36)
-    # Warm golden chandelier & royal arch glow
-    for rad, alpha in ((int(width * 0.55), 45), (int(width * 0.38), 75), (int(width * 0.22), 110)):
-        od.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], fill=(255, 195, 75, alpha))
-    # Ornate golden palace pillars
-    pw = max(24, int(width * 0.07))
-    od.rectangle([int(width * 0.06), 0, int(width * 0.06) + pw, height], fill=(165, 110, 42, 120))
-    od.rectangle([int(width * 0.94) - pw, 0, int(width * 0.94), height], fill=(165, 110, 42, 120))
-    # Atmospheric fire/mist embers
-    rng = random.Random(abs(hash(role)) + 77)
-    for _ in range(42):
-        ex = rng.randint(20, width - 20)
-        ey = rng.randint(40, height - 40)
-        er = rng.randint(3, 9)
-        od.ellipse([ex - er, ey - er, ex + er, ey + er], fill=(255, 210, 115, rng.randint(60, 155)))
-    composed = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-    composed.save(out_path, "JPEG", quality=93)
+    role_key = detect_speaker_role(role, None) if role else "hero"
+    seed_v = (abs(hash(f"{role}_{out_path}_{int(time.time())}")) % 899999) + 100001
+    grade_map = {"hero": "golden", "female": "royal", "villain": "dramatic", "saas": "mist"}
+    c_grade = grade_map.get(role_key, "golden")
+
+    # 1. Try explicit donor paths first (horizontal flip + warm/dramatic color grade + zoom)
+    for dp in (donor_paths or []):
+        if dp and os.path.exists(dp) and _is_valid_non_black_image_file(dp):
+            if _create_mirrored_zoomed_variant(
+                dp, out_path, width, height, mirror=True, zoom_ratio=0.10, color_grade=c_grade
+            ):
+                return out_path
+
+    # 2. Try cached photorealistic scene matching role/gender
+    cached_im = _reuse_cached_photorealistic_scene(width, height, role_key, seed_v)
+    if cached_im is not None:
+        try:
+            cached_im.save(out_path, "JPEG", quality=95)
+            if _is_valid_non_black_image_file(out_path):
+                return out_path
+        except Exception:
+            pass
+
+    # 3. Try ANY valid non-black photorealistic TV serial frame on disk (flipped + graded + zoomed — NEVER brown circles!)
+    try:
+        disk_pool: list[str] = []
+        for fn in os.listdir("/tmp"):
+            if fn.startswith("cinepop_tv_") and fn.endswith(".jpg"):
+                disk_pool.append(os.path.join("/tmp", fn))
+        if os.path.isdir("all_projects"):
+            for pid in os.listdir("all_projects")[:15]:
+                mc = os.path.join("all_projects", pid, "master_cast")
+                if os.path.isdir(mc):
+                    for mf in os.listdir(mc):
+                        if mf.endswith(".jpg"):
+                            disk_pool.append(os.path.join(mc, mf))
+        for dp in disk_pool:
+            if _is_valid_non_black_image_file(dp, min_bytes=5000):
+                if _create_mirrored_zoomed_variant(
+                    dp, out_path, width, height, mirror=True, zoom_ratio=0.11, color_grade=c_grade
+                ):
+                    return out_path
+    except Exception:
+        pass
+
+    # 4. Live rescue fetch via Pollinations `model=turbo` (fully dressed waist-up 4K Indian TV serial frame!)
+    is_vertical = height > width
+    shot_tag = "9:16 vertical shot" if is_vertical else "16:9 widescreen shot"
+    role_desc_map = {
+        "hero": "handsome Indian male hero wearing royal embroidered sherwani inside grand palace hall",
+        "female": "beautiful Indian female heroine wearing crimson Banarasi silk saree and gold jhumkas inside palace hall",
+        "villain": "intense bearded Indian male villain wearing dark royal velvet bandhgala coat inside palace hall",
+        "saas": "regal older Indian female matriarch wearing heavy maroon Banarasi silk saree and gold jewelry inside palace hall",
+    }
+    rescue_prompt = (
+        f"cinematic medium waist-up {shot_tag}, fully dressed in traditional/royal Indian attire, "
+        f"4K DSLR live-action Indian TV serial frame, sharp focus, "
+        f"{role_desc_map.get(role_key, role_desc_map['hero'])}, dramatic cinema lighting, no shirtless, no passport close-up"
+    )
+    pol_w, pol_h = (768, 1344) if is_vertical else (1344, 768)
+    for model_try, s_off in (("turbo", 17), ("flux", 509)):
+        try:
+            url = (
+                f"https://image.pollinations.ai/prompt/{urllib.parse.quote(rescue_prompt, safe='')}"
+                f"?width={pol_w}&height={pol_h}&model={model_try}&enhance=true&nologo=true&seed={seed_v + s_off}"
+            )
+            r = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 CinePopStudio/14.0", "Accept": "image/*,*/*;q=0.8"},
+                timeout=12,
+                allow_redirects=True,
+            )
+            if r.status_code == 200 and len(r.content) > 5000:
+                im = ImageOps.exif_transpose(Image.open(io.BytesIO(r.content))).convert("RGB")
+                im = im.resize((width, height), Image.Resampling.LANCZOS)
+                im = ImageEnhance.Sharpness(im).enhance(1.18)
+                im.save(out_path, "JPEG", quality=95)
+                if _is_valid_non_black_image_file(out_path):
+                    return out_path
+        except Exception:
+            continue
+
+    # Last-resort clean atmospheric gradient canvas (ZERO concentric brown circles!)
+    img = Image.new("RGB", (width, height), (28, 22, 42))
+    _draw_vertical_gradient(img, (44, 30, 62), (18, 14, 30))
+    img.save(out_path, "JPEG", quality=93)
     return out_path
 
 
-# 4. AUTO-FAILOVER 4K IMAGE ENGINE (Priority #1: Google Gemini Imagen 3 / Flash Image -> CF -> Together -> HF -> High-Res Pollinations)
+# 4. AUTO-FAILOVER 4K IMAGE ENGINE (Priority #1: Google Gemini Imagen 3 / Flash Image -> CF -> Together -> HF -> Pollinations turbo)
 async def fetch_single_master_frame(
     role: str,
     prompt: str,
@@ -1390,9 +1504,11 @@ async def fetch_single_master_frame(
     role_seed_base = (abs(hash(f"{role}_{prompt[:48]}_{int(time.time()) // 60}")) + role_idx * 7919) % 899999 + 100000
     is_vertical = height > width
     aspect_str = "9:16" if is_vertical else "16:9"
+    shot_orient = "9:16 vertical shot" if is_vertical else "16:9 widescreen shot"
     sharp_4k_prompt = (
-        f"Ultra-sharp 4K DSLR live-action Indian Hindi TV serial drama photograph, razor-sharp focus on actor's face and attire, "
-        f"rich cinema studio lighting, crisp textures, zero blur, {prompt}"
+        f"cinematic medium waist-up {shot_orient}, fully dressed in traditional/royal Indian attire, "
+        f"4K DSLR live-action Indian TV serial frame, sharp focus, razor-sharp focus on actor face and royal outfit, "
+        f"no shirtless, no passport close-up, zero blur, {prompt}"
     )
 
     def _save_sharp_master_bytes(raw_bytes: bytes) -> bool:
@@ -1529,16 +1645,16 @@ async def fetch_single_master_frame(
         except Exception:
             API_HEALTH_STATUS["huggingface"] = "error"
 
-    # Priority #5: Pollinations AI High-Res Sharp Fallback (width=768, height=1344, enhance=true!)
+    # Priority #5: Pollinations AI (`model=turbo` FIRST with unique seed & enhance=true -> `flux` backup!)
     pol_w, pol_h = (768, 1344) if is_vertical else (1344, 768)
     pollinations_attempts = [
-        ("flux", sharp_4k_prompt[:420], role_seed_base, 14.0),
-        ("turbo", sharp_4k_prompt[:300], role_seed_base + 313, 12.0),
+        ("turbo", sharp_4k_prompt[:380], role_seed_base, 14.0),
+        ("flux", sharp_4k_prompt[:420], role_seed_base + 313, 14.0),
         (
-            "flux",
-            f"4K ultra-sharp live-action Indian TV drama waist-up portrait of {role}, {prompt[:180]}, crisp cinema lighting, 8k DSLR",
+            "turbo",
+            f"cinematic medium waist-up {shot_orient}, fully dressed in traditional/royal Indian attire, 4K DSLR live-action Indian TV serial frame of {role}, {prompt[:160]}, sharp focus",
             role_seed_base + 997,
-            11.0,
+            12.0,
         ),
     ]
     for model_name, p_text, seed_v, t_out in pollinations_attempts:
@@ -1572,9 +1688,8 @@ def _create_mirrored_zoomed_variant(
     color_grade: str = "golden",
 ) -> bool:
     """
-    Create a visually distinct horizontal-flipped + warm golden/royal color-graded + strong digital zoomed
-    + atmospheric (warm golden light / royal mist / ember glow) frame from an available same-gender character photo
-    so a failed image fetch NEVER shows a black frame!
+    Create a visually distinct horizontal-flipped + warm/dramatic filmic color-graded + zoomed
+    frame from an available photorealistic image (ZERO circles/ellipses, ZERO black frame!).
     """
     try:
         if not _is_valid_non_black_image_file(src_img_path):
@@ -1587,23 +1702,17 @@ def _create_mirrored_zoomed_variant(
         if width - 2 * mx > 100 and height - 2 * my > 100:
             img = img.crop((mx, my, width - mx, height - my)).resize((width, height), Image.Resampling.LANCZOS)
 
-        # Apply warm golden / royal / atmospheric color grade + mist/ember overlay
-        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        od = ImageDraw.Draw(overlay)
-        if color_grade == "royal":
-            od.rectangle([0, 0, width, height], fill=(215, 140, 45, 34))
-            od.ellipse([-int(width * 0.2), -int(height * 0.15), int(width * 0.8), int(height * 0.45)], fill=(255, 200, 90, 42))
-        elif color_grade == "mist":
-            od.rectangle([0, 0, width, height], fill=(180, 145, 95, 30))
-            od.rectangle([0, int(height * 0.58), width, height], fill=(235, 195, 130, 44))
-        else:
-            # Default warm golden palace grade
-            od.rectangle([0, 0, width, height], fill=(245, 175, 55, 36))
-            od.ellipse([int(width * 0.15), -int(height * 0.1), int(width * 0.85), int(height * 0.5)], fill=(255, 215, 110, 40))
-
+        # Clean filmic warm/dramatic tint ONLY (ZERO concentric circles/ellipses!)
+        tint_map = {
+            "royal": (210, 145, 55, 28),
+            "dramatic": (36, 48, 92, 34),
+            "mist": (175, 140, 95, 24),
+            "golden": (235, 165, 60, 26),
+        }
+        overlay = Image.new("RGBA", (width, height), tint_map.get(color_grade, (235, 165, 60, 26)))
         img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-        img = ImageEnhance.Contrast(img).enhance(1.08)
-        img = ImageEnhance.Color(img).enhance(1.10)
+        img = ImageEnhance.Contrast(img).enhance(1.10)
+        img = ImageEnhance.Color(img).enhance(1.12)
         img = ImageEnhance.Sharpness(img).enhance(1.18)
         img.save(out_img_path, "JPEG", quality=95)
         return _is_valid_non_black_image_file(out_img_path)
@@ -1611,7 +1720,7 @@ def _create_mirrored_zoomed_variant(
         return False
 
 
-# 5. STAGGERED 1.2s MASTER CASTING SHEET (4K Role-Distinct Photos — NEVER Repeat Saas Across Hero/Villain/Heroine!)
+# 5. STAGGERED 1.2s MASTER CASTING SHEET (4K Role-Distinct Photos — ZERO Brown Circles, ZERO Black Frames!)
 async def build_master_casting_sheet(
     work_dir: str,
     width: int = 720,
@@ -1619,16 +1728,14 @@ async def build_master_casting_sheet(
     topic: str = "",
 ) -> dict[str, str]:
     """
-    Fetch distinct 4K role-specific waist-up / over-the-shoulder photos for EVERY speaking role:
+    Fetch distinct 4K role-specific dressed waist-up photos for EVERY speaking role:
     `Hero`, `Heroine`, `Villain`, `Saas`, plus `Wide_Confrontation` & `Context_BRoll`.
-    - Priority #1: Google Gemini Imagen 3 / Flash Image -> CF -> Together -> HF -> High-Res Pollinations (768x1344 enhance=true).
+    - Priority #1: Google Gemini Imagen 3 / Flash Image -> CF -> Together -> HF -> Pollinations `model=turbo` (1.2s staggered gap + unique seed).
     - Dedicated Pass-2 retry for any missing primary role so every speaker gets its OWN distinct actor photo!
-    - STRICT GENDER ISOLATION: Male roles (`Hero`, `Villain`) NEVER copy `Saas` or `Heroine` photos,
-      and Female roles (`Heroine`, `Saas`) NEVER copy `Hero` or `Villain` photos!
+    - Zero Brown Circles / Zero Black Screen: if any role still misses, flips + color-grades + zooms an available photorealistic role image.
     """
     os.makedirs(work_dir, exist_ok=True)
     dynamic_prompts = get_dynamic_character_prompts(topic)
-    # Prioritize the 4 core speaking actors first so each speaking character gets its own crisp photo!
     ordered_roles = [
         r for r in ("Hero", "Heroine", "Villain", "Saas", "Wide_Confrontation", "Context_BRoll")
         if r in dynamic_prompts
@@ -1658,16 +1765,16 @@ async def build_master_casting_sheet(
         if res and _is_valid_non_black_image_file(res):
             casting[role] = res
 
-    # STRICT PER-ROLE ISOLATION: NEVER repeat Saas onto Heroine/Nayika, Villain, or Hero/Aryan!
-    strict_same_role_fallback = {
-        "Hero": ("Hero",),
-        "Villain": ("Villain",),
-        "Heroine": ("Heroine",),
-        "Saas": ("Saas",),
-        "Wide_Confrontation": ("Wide_Confrontation", "Hero", "Villain", "Heroine"),
-        "Context_BRoll": ("Context_BRoll", "Wide_Confrontation"),
+    # Role-ordered photorealistic failover (prefers same-role cached -> same-gender donor -> any available role image with flip + warm/dramatic grade + zoom; NEVER brown circles or black!)
+    role_donor_order = {
+        "Hero": ("Hero", "Villain", "Wide_Confrontation", "Heroine", "Saas"),
+        "Villain": ("Villain", "Hero", "Wide_Confrontation", "Saas", "Heroine"),
+        "Heroine": ("Heroine", "Wide_Confrontation", "Hero", "Saas", "Villain"),
+        "Saas": ("Saas", "Wide_Confrontation", "Heroine", "Villain", "Hero"),
+        "Wide_Confrontation": ("Wide_Confrontation", "Hero", "Villain", "Heroine", "Saas"),
+        "Context_BRoll": ("Context_BRoll", "Wide_Confrontation", "Hero", "Heroine"),
     }
-    grade_cycle = ("golden", "royal", "mist")
+    grade_cycle = ("golden", "royal", "dramatic", "mist")
     role_to_internal = {
         "Hero": "hero",
         "Heroine": "female",
@@ -1682,7 +1789,7 @@ async def build_master_casting_sheet(
             continue
         out_file = os.path.join(work_dir, f"master_{role.lower()}.jpg")
 
-        # Try pre-cached EXACT SAME-ROLE / SAME-GENDER image from local cache first
+        # 1. Try pre-cached EXACT SAME-ROLE / SAME-GENDER photorealistic frame from local cache first
         internal_rk = role_to_internal.get(role, "hero")
         cached_im = _reuse_cached_photorealistic_scene(width, height, internal_rk, idx_r + 101)
         if cached_im is not None:
@@ -1694,26 +1801,27 @@ async def build_master_casting_sheet(
             except Exception:
                 pass
 
-        # STRICTLY same-role donor ONLY — never repeat Saas across Hero/Villain/Heroine!
-        for donor_role in strict_same_role_fallback.get(role, ()):
-            donor_path = casting.get(donor_role)
-            if donor_path and _is_valid_non_black_image_file(donor_path):
-                if _create_mirrored_zoomed_variant(
-                    donor_path,
-                    out_file,
-                    width,
-                    height,
-                    mirror=True,
-                    zoom_ratio=0.09 + (idx_r % 3) * 0.03,
-                    color_grade=grade_cycle[idx_r % len(grade_cycle)],
-                ):
-                    casting[role] = out_file
-                    break
-
-        # Final safety: rich golden palace canvas (never black and never wrong gender!)
-        if role not in casting or not _is_valid_non_black_image_file(casting.get(role, "")):
-            _render_rich_cinematic_palace_actor_fallback(out_file, role=role, width=width, height=height)
+        # 2. Horizontal flip + warm/dramatic color grade + zoom on available role image
+        donor_paths = [
+            casting[dr]
+            for dr in role_donor_order.get(role, ())
+            if dr in casting and _is_valid_non_black_image_file(casting[dr])
+        ]
+        if donor_paths and _create_mirrored_zoomed_variant(
+            donor_paths[0],
+            out_file,
+            width,
+            height,
+            mirror=True,
+            zoom_ratio=0.10 + (idx_r % 3) * 0.025,
+            color_grade=grade_cycle[idx_r % len(grade_cycle)],
+        ):
             casting[role] = out_file
+            continue
+
+        # 3. Zero-brown-circles photorealistic failover rescue
+        _failover_photorealistic_role_frame(out_file, role=role, width=width, height=height, donor_paths=donor_paths)
+        casting[role] = out_file
 
     return casting
 
@@ -1730,10 +1838,12 @@ def _apply_hero_faceswap_to_master_frame(
     """
     Strictly face-swap user's selfie onto the AI-generated Hero inside the haveli.
     NEVER displays the raw bedroom selfie directly on screen!
-    Chain: HF AI Face-Swap -> OpenCV seamlessClone face-only blend -> Clean AI Hero fallback.
+    Respects Admin `enable_face_swap_engine` switch (Default = True).
     """
     bg = open_upright_image(hero_master_path).resize((width, height), Image.Resampling.LANCZOS)
-    has_user = bool(user_selfie_path and os.path.exists(user_selfie_path) and os.path.getsize(user_selfie_path) > 512)
+    cfg = get_runtime_ai_config()
+    face_swap_on = bool(cfg.get("enable_face_swap_engine", True))
+    has_user = bool(face_swap_on and user_selfie_path and os.path.exists(user_selfie_path) and os.path.getsize(user_selfie_path) > 512)
     upright_tmp = f"{out_path}_upright_user.jpg"
     scene_tmp = f"{out_path}_hero_scene.jpg"
     swapped_tmp = f"{out_path}_hero_swapped.jpg"
@@ -1755,9 +1865,10 @@ def _apply_hero_faceswap_to_master_frame(
 
         composed = ImageEnhance.Contrast(composed).enhance(1.06)
         composed = ImageEnhance.Color(composed).enhance(1.06)
+        composed = ImageEnhance.Sharpness(composed).enhance(1.16)
         if watermark_text:
             draw_channel_watermark(composed, watermark_text, watermark_position)
-        composed.save(out_path, "JPEG", quality=93)
+        composed.save(out_path, "JPEG", quality=95)
         return out_path
     finally:
         for tmp_f in (upright_tmp, scene_tmp, swapped_tmp):
@@ -2615,6 +2726,16 @@ async def save_admin_ai_config(request: Request):
         "custom_video_space",
         "custom_faceswap_space",
         "hf_token",
+        "enable_paid_video_engine",
+        "fal_key",
+        "fal_video_model",
+        "replicate_api_token",
+        "replicate_video_model",
+        "runway_api_secret",
+        "luma_api_key",
+        "enable_free_viral_motion",
+        "enable_face_swap_engine",
+        "enable_auto_foley_ducking",
         "enable_custom_hf",
         "enable_pollinations",
         "pollinations_model",
@@ -2834,16 +2955,40 @@ async def test_admin_ai_servers(request: Request):
             ms = int((time.time() - t0) * 1000)
             return {"name": f"Visual P4: Pollinations ({model})", "target": "image.pollinations.ai", "status": "🟡 Standby", "online": False, "latency_ms": ms, "detail": str(e)[:60]}
 
+    def _probe_paid_video_key(label: str, key_val: str, target_model: str, test_url: str, headers_map: dict) -> dict:
+        paid_on = bool(cfg.get("enable_paid_video_engine", False))
+        if not paid_on:
+            return {"name": label, "target": target_model, "status": "🔒 Paid Mode OFF", "online": False, "latency_ms": 0, "detail": "Safe: ENABLE_PAID_VIDEO_ENGINE is OFF (zero billing)"}
+        if not key_val:
+            return {"name": label, "target": target_model, "status": "🟡 Key Empty", "online": False, "latency_ms": 0, "detail": "Add API key to activate"}
+        t0 = time.time()
+        try:
+            r = requests.get(test_url, headers=headers_map, timeout=6)
+            ms = int((time.time() - t0) * 1000)
+            if r.status_code in (200, 405):
+                return {"name": label, "target": target_model, "status": "🟢 Active", "online": True, "latency_ms": ms, "detail": "Paid Real-Video Ready"}
+            if r.status_code in (401, 403):
+                return {"name": label, "target": target_model, "status": "🔴 Auth Error", "online": False, "latency_ms": ms, "detail": f"HTTP {r.status_code}"}
+            return {"name": label, "target": target_model, "status": "🟢 Reachable", "online": True, "latency_ms": ms, "detail": f"HTTP {r.status_code}"}
+        except Exception as e:
+            return {"name": label, "target": target_model, "status": "🟡 Standby", "online": False, "latency_ms": int((time.time() - t0) * 1000), "detail": str(e)[:60]}
+
     def _run_all():
+        fal_k = (cfg.get("fal_key") or os.getenv("FAL_KEY") or "").strip()
+        rep_k = (cfg.get("replicate_api_token") or os.getenv("REPLICATE_API_TOKEN") or "").strip()
+        runway_k = (cfg.get("runway_api_secret") or os.getenv("RUNWAY_API_SECRET") or "").strip()
+        luma_k = (cfg.get("luma_api_key") or os.getenv("LUMA_API_KEY") or "").strip()
         tasks = [
             _probe_gemini,
             _probe_groq,
             _probe_cloudflare,
             _probe_together,
+            lambda: _probe_paid_video_key("Paid I2V: Fal.ai", fal_k, cfg.get("fal_video_model", "fal-ai/kling-video/v2/master/image-to-video"), "https://queue.fal.run/fal-ai/wan-i2v", {"Authorization": f"Key {fal_k}"}),
+            lambda: _probe_paid_video_key("Paid I2V: Replicate", rep_k, cfg.get("replicate_video_model", "wavespeedai/wan-2.1-i2v-480p"), "https://api.replicate.com/v1/account", {"Authorization": f"Bearer {rep_k}"}),
+            lambda: _probe_paid_video_key("Paid I2V: Runway Gen-3/4", runway_k, "gen3a_turbo", "https://api.dev.runwayml.com/v1/tasks", {"Authorization": f"Bearer {runway_k}", "X-Runway-Version": "2024-11-06"}),
+            lambda: _probe_paid_video_key("Paid I2V: Luma Ray-2", luma_k, "ray-2", "https://api.lumalabs.ai/dream-machine/v1/generations", {"Authorization": f"Bearer {luma_k}"}),
             lambda: _probe_hf_space("Visual P3: Custom HF Space", cfg.get("custom_video_space", ""), cfg.get("enable_custom_hf", True)),
-            lambda: _probe_hf_space("Face-Swap HF Space", cfg.get("custom_faceswap_space", "") or "tonyassi/face-swap", cfg.get("enable_public_hf_spaces", True)),
-            lambda: _probe_hf_space("I2V: Wan 2.1", "Wan-AI/Wan2.1", cfg.get("enable_public_hf_spaces", True) and cfg.get("enable_wan21", True)),
-            lambda: _probe_hf_space("I2V: LTX-Video", "Lightricks/LTX-Video", cfg.get("enable_public_hf_spaces", True) and cfg.get("enable_ltx_video", True)),
+            lambda: _probe_hf_space("Face-Swap HF Space", cfg.get("custom_faceswap_space", "") or "tonyassi/face-swap", cfg.get("enable_face_swap_engine", True)),
             _probe_pollinations,
         ]
         results = []
@@ -3261,6 +3406,9 @@ def mix_cinematic_audio(
     using automatic sidechain audio ducking (BGM ducks low during speech, swells in pauses)
     and optional target_duration_sec pacing for exact ~60s 1-minute reels.
     """
+    cfg = get_runtime_ai_config()
+    if not cfg.get("enable_auto_foley_ducking", True):
+        return dialogue_path
     raw_dur = _probe_audio_duration(dialogue_path)
     total_dur = max(raw_dur + 0.45, min(14.0, float(target_duration_sec or 0.0)))
     bgm_wav = f"{out_mixed_mp3}_bgm.wav"
@@ -3677,10 +3825,6 @@ def _reuse_cached_photorealistic_scene(W: int, H: int, hero_role: str, seed_val:
                     for mf in os.listdir(mc_dir):
                         if mf.endswith(".jpg"):
                             candidates.append(os.path.join(mc_dir, mf))
-        if os.path.isdir("all_characters"):
-            for cf in os.listdir("all_characters")[:15]:
-                if cf.lower().endswith((".jpg", ".jpeg", ".png")):
-                    candidates.append(os.path.join("all_characters", cf))
 
         valid_files = [p for p in candidates if _is_valid_non_black_image_file(p, min_bytes=5000)]
         if not valid_files:
@@ -3799,11 +3943,13 @@ def render_location_backdrop(
         subject_prefix = f"{shot_desc}, "
 
     scene_detail = f"{hint_clean}, " if hint_clean else ""
+    orient_str = "9:16 vertical shot" if H > W else "16:9 widescreen shot"
     full_prompt = (
-        f"photorealistic live-action still frame from an Indian Hindi TV drama, "
+        f"cinematic medium waist-up {orient_str}, fully dressed in traditional/royal Indian attire, "
+        f"4K DSLR live-action Indian TV serial frame, sharp focus, "
         f"{subject_prefix}{scene_detail}{desc}, {mood} dramatic cinema lighting, "
-        f"8k DSLR live-action film photography, real Indian actors waist-up with natural body language and hand gestures, "
-        f"no passport photo, no extreme macro face close-up, no cartoon, no illustration, no anime, no 3d render, no text, no watermark"
+        f"real Indian actors waist-up with natural body language and hand gestures, "
+        f"no shirtless, no passport photo, no extreme macro face close-up, no cartoon, no illustration, no anime, no 3d render, no text, no watermark"
     )
     encoded = urllib.parse.quote(full_prompt, safe="")
     seed_val = abs(hash(cache_key)) % 99999
@@ -3922,7 +4068,7 @@ def render_location_backdrop(
         pass
 
     tmp_fb = f"/tmp/cinepop_palace_fb_{hero_role}_{W}x{H}.jpg"
-    _render_rich_cinematic_palace_actor_fallback(tmp_fb, role=hero_role, width=W, height=H)
+    _failover_photorealistic_role_frame(tmp_fb, role=hero_role, width=W, height=H)
     return open_upright_image(tmp_fb).resize((W, H), Image.Resampling.LANCZOS)
 
 
@@ -3977,9 +4123,9 @@ def render_hindi_subtitle_png(
     full_line = f"{clean_spk}: {clean_diag}" if clean_spk else clean_diag
 
     is_vertical = width < 900
-    if is_vertical and height < 360:
-        # Raise vertical strip so subtitle text sits cleanly around y = H - 220 (well above bottom player controls!)
-        height = 360
+    if is_vertical and height < 390:
+        # Anchor vertical 9:16 subtitles cleanly at y = H - 230 (safe above mobile bottom buttons!)
+        height = 390
 
     strip = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(strip)
@@ -4009,17 +4155,19 @@ def render_hindi_subtitle_png(
     lines = lines[:max_lines]
 
     line_h = 40 if is_vertical else 42
-    # Place 9:16 subtitles cleanly above bottom player controls (~220px from bottom)
-    bottom_pad = 215 if is_vertical else 24
+    # Place 9:16 subtitles strictly at y = video_height - 230 so bottom mobile controls NEVER overlap!
+    bottom_pad = 230 if is_vertical else 26
     start_y = max(18, height - (len(lines) * line_h) - bottom_pad)
 
-    # Smooth translucent cinema band strictly behind the subtitle text (leaves bottom controls clean!)
-    band_top = max(0, start_y - 16)
-    band_bot = min(height - 1, start_y + len(lines) * line_h + 14)
+    # Bold black-outlined viral cinema subtitle box strictly behind the dialogue lines
+    band_top = max(4, start_y - 14)
+    band_bot = min(height - 4, start_y + len(lines) * line_h + 14)
     draw.rounded_rectangle(
         [18 if is_vertical else 40, band_top, width - (18 if is_vertical else 40), band_bot],
         radius=16,
-        fill=(6, 6, 16, 178),
+        fill=(6, 6, 16, 210),
+        outline=(0, 0, 0, 255),
+        width=4,
     )
     for idx, ln in enumerate(lines):
         try:
@@ -4043,16 +4191,16 @@ def render_hindi_subtitle_png(
                 spk_label,
                 font=font_main,
                 fill=(255, 214, 0, 255),
-                stroke_width=3,
-                stroke_fill=(0, 0, 0, 240),
+                stroke_width=4,
+                stroke_fill=(0, 0, 0, 255),
             )
             draw.text(
                 (tx + spk_w, ty),
                 rest_part.strip(),
                 font=font_main,
                 fill=(255, 255, 255, 255),
-                stroke_width=3,
-                stroke_fill=(0, 0, 0, 240),
+                stroke_width=4,
+                stroke_fill=(0, 0, 0, 255),
             )
         else:
             draw.text(
@@ -4060,8 +4208,8 @@ def render_hindi_subtitle_png(
                 ln,
                 font=font_main,
                 fill=(255, 255, 255, 255),
-                stroke_width=3,
-                stroke_fill=(0, 0, 0, 240),
+                stroke_width=4,
+                stroke_fill=(0, 0, 0, 255),
             )
 
     strip.save(out_png_path, "PNG")
@@ -4182,13 +4330,15 @@ def prepare_character_frame(
             )
             use_hf_swap = True
 
-        # AI AUTO-CAST MODE (or non-face-swap roles): Pure Full-Screen Live-Action TV Serial Scene
-        if not has_user_face:
+        # AI AUTO-CAST MODE (or Face-Swap switch OFF): Pure Full-Screen Live-Action TV Serial Scene
+        cfg_fs = get_runtime_ai_config()
+        if not has_user_face or not cfg_fs.get("enable_face_swap_engine", True):
             composed = ImageEnhance.Contrast(bg).enhance(1.06)
             composed = ImageEnhance.Color(composed).enhance(1.07)
+            composed = ImageEnhance.Sharpness(composed).enhance(1.16)
             if watermark_text:
                 draw_channel_watermark(composed, watermark_text, watermark_position)
-            composed.save(out_frame_path, "JPEG", quality=93)
+            composed.save(out_frame_path, "JPEG", quality=95)
             return
 
         # User provided a 5-angle scanned face -> straighten EXIF orientation
@@ -5062,6 +5212,52 @@ def _build_overlay_ffmpeg_cmd(
     return cmd
 
 
+def _apply_3d_parallax_frame(
+    work_src,
+    w_out: int,
+    h_out: int,
+    zoom: float,
+    pan_x: float,
+    pan_y: float,
+    shake_x: float,
+    shake_y: float,
+    enable_3d_parallax: bool = True,
+):
+    """
+    FREE VIRAL 3D FOREGROUND-BACKGROUND PARALLAX ENGINE:
+    Separates the background (moving 1.48x faster with subtle depth zoom) from the central foreground actor
+    (moving at 0.72x speed with crisp foreground focus) using a smooth feathered depth mask, creating genuine
+    3D camera parallax depth on every vertical 9:16 and 16:9 shot!
+    """
+    sh, sw = work_src.shape[:2]
+
+    def _crop_layer(z_val: float, px_val: float, py_val: float):
+        cw = max(32, min(sw, int(sw / max(1.01, z_val))))
+        ch = max(32, min(sh, int(sh / max(1.01, z_val))))
+        cx = int(sw / 2 + px_val + shake_x)
+        cy = int(sh / 2 + py_val + shake_y)
+        x1 = max(0, min(sw - cw, cx - cw // 2))
+        y1 = max(0, min(sh - ch, cy - ch // 2))
+        return cv2.resize(work_src[y1 : y1 + ch, x1 : x1 + cw], (w_out, h_out), interpolation=cv2.INTER_CUBIC)
+
+    if not enable_3d_parallax:
+        return _crop_layer(zoom, pan_x, pan_y)
+
+    # Background moves faster & slightly wider; central actor foreground moves slower & closer -> 3D Parallax!
+    bg_layer = _crop_layer(max(1.02, zoom * 0.985), pan_x * 1.48, pan_y * 1.35)
+    fg_layer = _crop_layer(zoom * 1.028, pan_x * 0.68, pan_y * 0.72)
+
+    # Soft feathered central subject depth mask (wider in lower-middle waist-up torso + upper head zone)
+    yy, xx = np.ogrid[:h_out, :w_out]
+    nx = (xx - w_out * 0.50) / max(1.0, w_out * 0.34)
+    ny = (yy - h_out * 0.48) / max(1.0, h_out * 0.44)
+    dist2 = nx * nx + ny * ny
+    fg_alpha = np.clip(np.exp(-dist2 * 1.15), 0.0, 1.0).astype(np.float32)[..., None]
+
+    blended = (fg_layer.astype(np.float32) * fg_alpha + bg_layer.astype(np.float32) * (1.0 - fg_alpha))
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
+
 def _render_pro_motion_vfx_clip(
     framed_img_path: str,
     final_audio: str,
@@ -5162,21 +5358,15 @@ def _render_pro_motion_vfx_clip(
                     shake_x = 0.0
                     shake_y = 0.0
                     if high_impact:
-                        burst = 1.0 if (f_idx % 30) < 8 else 0.28
-                        amp_s = (10.5 if sfx_type in ("explosion", "punch") else 6.0) * burst
-                        shake_x = math.sin(f_idx * 1.7) * amp_s
-                        shake_y = math.cos(f_idx * 2.1) * (amp_s * 0.7)
+                        # Crisp 0.3s (9 frames @ 30fps) action impact shake burst!
+                        burst = 1.0 if (f_idx % 36) < 9 else 0.20
+                        amp_s = (11.0 if sfx_type in ("explosion", "punch", "sword") else 6.5) * burst
+                        shake_x = math.sin(f_idx * 1.8) * amp_s
+                        shake_y = math.cos(f_idx * 2.2) * (amp_s * 0.72)
 
-                    crop_w = int(sw / zoom)
-                    crop_h = int(sh / zoom)
-                    cx = int(sw / 2 + pan_x + shake_x)
-                    cy = int(sh / 2 + pan_y + shake_y)
-                    x1 = max(0, min(sw - crop_w, cx - crop_w // 2))
-                    y1 = max(0, min(sh - crop_h, cy - crop_h // 2))
-                    frame = cv2.resize(
-                        work_src[y1 : y1 + crop_h, x1 : x1 + crop_w],
-                        (w_out, h_out),
-                        interpolation=cv2.INTER_CUBIC,
+                    vfx_on = bool(get_runtime_ai_config().get("enable_free_viral_motion", True))
+                    frame = _apply_3d_parallax_frame(
+                        work_src, w_out, h_out, zoom, pan_x, pan_y, shake_x, shake_y, enable_3d_parallax=vfx_on
                     )
 
                     frame = _apply_mood_lighting_tint(frame, mood)
@@ -5335,6 +5525,17 @@ def _render_multishot_pollinations_motion_clip(
 
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 writer = cv2.VideoWriter(raw_vfx_mp4, fourcc, fps, (w_out, h_out))
+                rng_m = random.Random(hash(out_mp4) & 0xFFFFFFFF)
+                particles_m = [
+                    {
+                        "x": rng_m.uniform(0, w_out),
+                        "y": rng_m.uniform(0, h_out),
+                        "vx": rng_m.uniform(-6.5, -2.0) if sfx_type in ("rain", "thunder") else rng_m.uniform(-2.0, 2.0),
+                        "vy": rng_m.uniform(13.0, 20.0) if sfx_type in ("rain", "thunder") else rng_m.uniform(-3.0, -0.8),
+                        "r": rng_m.randint(2, 4),
+                    }
+                    for _ in range(34 if (high_impact or sfx_type in ("rain", "thunder")) else 16)
+                ]
 
                 def _render_cut_frame(cut_idx: int, f_idx: int, local_t: float, talk_amp: float):
                     src_img = loaded_srcs[cut_idx]
@@ -5371,18 +5572,23 @@ def _render_multishot_pollinations_motion_clip(
                         shake_x = math.sin(f_idx * 2.4) * amp_s
                         shake_y = math.cos(f_idx * 2.8) * (amp_s * 0.75)
 
-                    crop_w = int(sw / zoom)
-                    crop_h = int(sh / zoom)
-                    cx = int(sw / 2 + pan_x + shake_x)
-                    cy = int(sh / 2 + pan_y + shake_y)
-                    x1 = max(0, min(sw - crop_w, cx - crop_w // 2))
-                    y1 = max(0, min(sh - crop_h, cy - crop_h // 2))
-                    out_f = cv2.resize(
-                        work[y1 : y1 + crop_h, x1 : x1 + crop_w],
-                        (w_out, h_out),
-                        interpolation=cv2.INTER_CUBIC,
+                    vfx_on = bool(get_runtime_ai_config().get("enable_free_viral_motion", True))
+                    out_f = _apply_3d_parallax_frame(
+                        work, w_out, h_out, zoom, pan_x, pan_y, shake_x, shake_y, enable_3d_parallax=vfx_on
                     )
                     out_f = _apply_mood_lighting_tint(out_f, mood)
+                    if vfx_on and particles_m:
+                        p_ov = out_f.copy()
+                        for pt in particles_m:
+                            px = int((pt["x"] + pt["vx"] * f_idx) % w_out)
+                            py = int((pt["y"] + pt["vy"] * f_idx) % h_out)
+                            if sfx_type in ("rain", "thunder"):
+                                cv2.line(p_ov, (px, py), (px - 7, py + 22), (240, 225, 200), 1, cv2.LINE_AA)
+                            elif high_impact:
+                                cv2.circle(p_ov, (px, py), pt["r"], (65, 185, 255), -1, cv2.LINE_AA)
+                            else:
+                                cv2.circle(p_ov, (px, py), max(2, pt["r"] - 1), (110, 210, 255), -1, cv2.LINE_AA)
+                        cv2.addWeighted(p_ov, 0.24, out_f, 0.76, 0, out_f)
                     l_boost = 1.0 + (0.03 * talk_amp if is_speaking else 0.05 * max(0.0, 1.0 - local_t * 3.5))
                     if abs(l_boost - 1.0) > 0.01:
                         out_f = cv2.convertScaleAbs(out_f, alpha=l_boost, beta=2)
@@ -5519,6 +5725,191 @@ def _render_multishot_pollinations_motion_clip(
     )
 
 
+def _try_paid_real_video_i2v(
+    image_path: str,
+    prompt: str,
+    aspect_ratio: str,
+    out_mp4_path: str,
+) -> tuple[Optional[str], str]:
+    """
+    MASTER PAID REAL-VIDEO I2V ENGINE (STRICTLY GATED BEHIND `enable_paid_video_engine == True`!):
+    - Default is `False` so ZERO paid API credits are ever spent without explicit Admin opt-in!
+    - When Admin enables `ENABLE_PAID_VIDEO_ENGINE = ON`:
+      1. Fal.ai (`FAL_KEY`): `fal-ai/kling-video/v2/master/image-to-video` / `fal-ai/wan-i2v` / `fal-ai/minimax-video/image-to-video`
+      2. Replicate (`REPLICATE_API_TOKEN`): `wavespeedai/wan-2.1-i2v-480p` / `kwaivgi/kling-v1.6-pro`
+      3. Runway (`RUNWAY_API_SECRET`): Gen-3 / Gen-4 Image-to-Video
+      4. Luma (`LUMA_API_KEY`): Ray-2 Image-to-Video
+    """
+    cfg = get_runtime_ai_config()
+    if not bool(cfg.get("enable_paid_video_engine", False)):
+        return (None, "")
+    if not image_path or not os.path.exists(image_path):
+        return (None, "")
+
+    try:
+        with open(image_path, "rb") as f_im:
+            img_b64 = base64.b64encode(f_im.read()).decode("utf-8")
+        data_uri = f"data:image/jpeg;base64,{img_b64}"
+    except Exception:
+        return (None, "")
+
+    clean_prompt = (
+        f"cinematic live-action Indian Hindi TV serial drama motion, natural expressive talking & head movement, "
+        f"subtle camera push-in, fully dressed royal attire, 4K film look, {(prompt or '')[:220]}"
+    )
+    is_vert = str(aspect_ratio or "").strip() in ("9:16", "vertical", "reel")
+    aspect_str = "9:16" if is_vert else "16:9"
+
+    def _download_mp4(video_url: str) -> bool:
+        try:
+            r_vid = requests.get(video_url, timeout=45, stream=True)
+            if r_vid.status_code == 200:
+                with open(out_mp4_path, "wb") as fw:
+                    for chunk in r_vid.iter_content(chunk_size=65536):
+                        if chunk:
+                            fw.write(chunk)
+                return os.path.exists(out_mp4_path) and os.path.getsize(out_mp4_path) > 5000
+        except Exception:
+            pass
+        return False
+
+    # 1. Fal.ai (Kling v2 / Wan I2V / Minimax Video)
+    fal_key = (cfg.get("fal_key") or os.getenv("FAL_KEY") or "").strip()
+    if fal_key:
+        fal_model = cfg.get("fal_video_model") or "fal-ai/kling-video/v2/master/image-to-video"
+        try:
+            headers_fal = {"Authorization": f"Key {fal_key}", "Content-Type": "application/json"}
+            submit_r = requests.post(
+                f"https://queue.fal.run/{fal_model}",
+                headers=headers_fal,
+                json={"prompt": clean_prompt, "image_url": data_uri, "duration": "5", "aspect_ratio": aspect_str},
+                timeout=20,
+            )
+            if submit_r.status_code in (200, 201):
+                sj = submit_r.json() or {}
+                direct_v = ((sj.get("video") or {}).get("url") if isinstance(sj.get("video"), dict) else None)
+                if direct_v and _download_mp4(direct_v):
+                    API_HEALTH_STATUS["fal"] = "active"
+                    return (out_mp4_path, f"Fal.ai ({fal_model.split('/')[1]})")
+                status_url = sj.get("status_url") or ""
+                resp_url = sj.get("response_url") or ""
+                if status_url and resp_url:
+                    for _ in range(36):
+                        time.sleep(3.0)
+                        st = requests.get(status_url, headers=headers_fal, timeout=10).json() or {}
+                        if st.get("status") == "COMPLETED":
+                            res_j = requests.get(resp_url, headers=headers_fal, timeout=15).json() or {}
+                            v_url = ((res_j.get("video") or {}).get("url") if isinstance(res_j.get("video"), dict) else res_j.get("video_url"))
+                            if v_url and _download_mp4(v_url):
+                                API_HEALTH_STATUS["fal"] = "active"
+                                return (out_mp4_path, f"Fal.ai ({fal_model.split('/')[1]})")
+                            break
+                        if st.get("status") in ("FAILED", "CANCELLED"):
+                            break
+        except Exception:
+            API_HEALTH_STATUS["fal"] = "error"
+
+    # 2. Replicate (wavespeedai/wan-2.1-i2v-480p / kwaivgi/kling-v1.6-pro)
+    rep_tok = (cfg.get("replicate_api_token") or os.getenv("REPLICATE_API_TOKEN") or "").strip()
+    if rep_tok:
+        rep_model = cfg.get("replicate_video_model") or "wavespeedai/wan-2.1-i2v-480p"
+        try:
+            headers_rep = {"Authorization": f"Bearer {rep_tok}", "Content-Type": "application/json", "Prefer": "wait=60"}
+            r_rep = requests.post(
+                f"https://api.replicate.com/v1/models/{rep_model}/predictions",
+                headers=headers_rep,
+                json={"input": {"image": data_uri, "prompt": clean_prompt}},
+                timeout=65,
+            )
+            if r_rep.status_code in (200, 201):
+                rj = r_rep.json() or {}
+                out_v = rj.get("output")
+                poll_u = (rj.get("urls") or {}).get("get")
+                if not out_v and poll_u:
+                    for _ in range(30):
+                        time.sleep(3.0)
+                        pj = requests.get(poll_u, headers={"Authorization": f"Bearer {rep_tok}"}, timeout=10).json() or {}
+                        if pj.get("status") == "succeeded":
+                            out_v = pj.get("output")
+                            break
+                        if pj.get("status") in ("failed", "canceled"):
+                            break
+                v_url = out_v[0] if isinstance(out_v, list) and out_v else (out_v if isinstance(out_v, str) else "")
+                if v_url and _download_mp4(v_url):
+                    API_HEALTH_STATUS["replicate"] = "active"
+                    return (out_mp4_path, f"Replicate ({rep_model.split('/')[-1]})")
+        except Exception:
+            API_HEALTH_STATUS["replicate"] = "error"
+
+    # 3. Runway Gen-3 / Gen-4
+    runway_k = (cfg.get("runway_api_secret") or os.getenv("RUNWAY_API_SECRET") or "").strip()
+    if runway_k:
+        try:
+            headers_rw = {
+                "Authorization": f"Bearer {runway_k}",
+                "X-Runway-Version": "2024-11-06",
+                "Content-Type": "application/json",
+            }
+            rw_r = requests.post(
+                "https://api.dev.runwayml.com/v1/image_to_video",
+                headers=headers_rw,
+                json={
+                    "model": "gen3a_turbo",
+                    "promptImage": data_uri,
+                    "promptText": clean_prompt[:300],
+                    "ratio": "768:1280" if is_vert else "1280:768",
+                    "duration": 5,
+                },
+                timeout=20,
+            )
+            if rw_r.status_code in (200, 201):
+                task_id = (rw_r.json() or {}).get("id")
+                if task_id:
+                    for _ in range(32):
+                        time.sleep(3.0)
+                        tj = requests.get(f"https://api.dev.runwayml.com/v1/tasks/{task_id}", headers=headers_rw, timeout=10).json() or {}
+                        if tj.get("status") == "SUCCEEDED":
+                            outs = tj.get("output") or []
+                            if outs and _download_mp4(outs[0]):
+                                API_HEALTH_STATUS["runway"] = "active"
+                                return (out_mp4_path, "Runway Gen-3/4 I2V")
+                            break
+                        if tj.get("status") in ("FAILED", "CANCELLED"):
+                            break
+        except Exception:
+            API_HEALTH_STATUS["runway"] = "error"
+
+    # 4. Luma Ray-2
+    luma_k = (cfg.get("luma_api_key") or os.getenv("LUMA_API_KEY") or "").strip()
+    if luma_k:
+        try:
+            headers_lu = {"Authorization": f"Bearer {luma_k}", "Content-Type": "application/json"}
+            lu_r = requests.post(
+                "https://api.lumalabs.ai/dream-machine/v1/generations",
+                headers=headers_lu,
+                json={"model": "ray-2", "prompt": clean_prompt[:300], "aspect_ratio": aspect_str},
+                timeout=20,
+            )
+            if lu_r.status_code in (200, 201):
+                gen_id = (lu_r.json() or {}).get("id")
+                if gen_id:
+                    for _ in range(32):
+                        time.sleep(3.0)
+                        gj = requests.get(f"https://api.lumalabs.ai/dream-machine/v1/generations/{gen_id}", headers=headers_lu, timeout=10).json() or {}
+                        if gj.get("state") == "completed":
+                            v_url = (gj.get("assets") or {}).get("video")
+                            if v_url and _download_mp4(v_url):
+                                API_HEALTH_STATUS["luma"] = "active"
+                                return (out_mp4_path, "Luma Ray-2 I2V")
+                            break
+                        if gj.get("state") == "failed":
+                            break
+        except Exception:
+            API_HEALTH_STATUS["luma"] = "error"
+
+    return (None, "")
+
+
 def generate_free_ai_video_clip(
     raw_img_path: str,
     framed_img_path: str,
@@ -5612,6 +6003,20 @@ def generate_free_ai_video_clip(
             return False
 
     try:
+        # 0. PAID REAL-VIDEO MODE (STRICTLY runs ONLY if Admin enabled `ENABLE_PAID_VIDEO_ENGINE = ON`!)
+        paid_tmp_mp4 = f"{out_mp4}_paid_i2v.mp4"
+        if os.path.exists(framed_img_path) and get_runtime_ai_config().get("enable_paid_video_engine", False):
+            paid_vid, paid_label = _try_paid_real_video_i2v(
+                framed_img_path,
+                visual_action_prompt or dialogue_text,
+                aspect_ratio,
+                paid_tmp_mp4,
+            )
+            if paid_vid and os.path.exists(paid_vid):
+                extra_keyframes.append(paid_vid)
+                if _mux_video_with_audio_and_sub(paid_vid):
+                    return f"💎 Paid Real-Video · {paid_label}"
+
         # 1. Try Free Multi-Engine AI Video Auto-Rotation (Wan 2.1 -> LTX-Video -> CogVideoX-5B -> HunyuanVideo)
         # Strictly pass framed_img_path (AI haveli frame / face-swapped Hero), NEVER raw user bedroom selfie!
         if os.path.exists(framed_img_path):
@@ -6284,7 +6689,8 @@ async def autonomous_movie_worker(project_id: str):
                             master_cast[ck] = target_p
                             break
                 if ck not in master_cast or not os.path.exists(master_cast.get(ck, "")):
-                    _render_rich_cinematic_palace_actor_fallback(target_p, role=ck, width=cast_w, height=cast_h)
+                    avail_donors = [p for p in master_cast.values() if p and os.path.exists(p)]
+                    _failover_photorealistic_role_frame(target_p, role=ck, width=cast_w, height=cast_h, donor_paths=avail_donors)
                     master_cast[ck] = target_p
 
         chapters = state["outline"]["chapters"]
@@ -6627,7 +7033,8 @@ async def autonomous_movie_worker(project_id: str):
                                             cached_fb.save(f_img, "JPEG", quality=92)
                                             recovered = _is_valid_non_black_image_file(f_img)
                                     if not recovered:
-                                        _render_rich_cinematic_palace_actor_fallback(f_img, role=c_name, width=w_fb, height=h_fb)
+                                        avail_donors = [p for p in master_cast.values() if p and os.path.exists(p)]
+                                        _failover_photorealistic_role_frame(f_img, role=c_name, width=w_fb, height=h_fb, donor_paths=avail_donors)
                                 await asyncio.to_thread(
                                     _render_pro_motion_vfx_clip,
                                     f_img,

@@ -6311,7 +6311,7 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
   final TextEditingController _userSearchCtrl = TextEditingController();
   String _searchQuery = "";
 
-  // Tab 2 All-in-One Auto-Failover API Vault & Business Controls
+  // Tab 2 Master ON/OFF Control Center & Auto-Failover API Vault
   final TextEditingController _geminiKeyCtrl = TextEditingController();
   final TextEditingController _groqKeyCtrl = TextEditingController();
   final TextEditingController _cfAccountCtrl = TextEditingController();
@@ -6320,8 +6320,13 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
   final TextEditingController _customVideoSpaceCtrl = TextEditingController();
   final TextEditingController _customFaceSwapSpaceCtrl = TextEditingController();
   final TextEditingController _hfTokenCtrl = TextEditingController();
-  final TextEditingController _freeTrialCtrl = TextEditingController(text: "2");
-  final TextEditingController _pack50Ctrl = TextEditingController(text: "5");
+  // Paid Real-Video Mode Keys (Master Switch defaults to OFF!)
+  final TextEditingController _falKeyCtrl = TextEditingController();
+  final TextEditingController _replicateTokenCtrl = TextEditingController();
+  final TextEditingController _runwaySecretCtrl = TextEditingController();
+  final TextEditingController _lumaKeyCtrl = TextEditingController();
+  final TextEditingController _freeTrialCtrl = TextEditingController(text: "1");
+  final TextEditingController _pack50Ctrl = TextEditingController(text: "1");
   final TextEditingController _upiCtrl =
       TextEditingController(text: "8269045143@ybl");
   final TextEditingController _announcementCtrl = TextEditingController();
@@ -6331,9 +6336,22 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
   bool _hideCfToken = true;
   bool _hideTogetherKey = true;
   bool _hideHfToken = true;
+  bool _hideFalKey = true;
+  bool _hideReplicateToken = true;
+  bool _hideRunwaySecret = true;
+  bool _hideLumaKey = true;
+
+  // Individual Master ON/OFF Switches
+  bool _enablePaidVideoEngine = false; // Default = OFF (zero accidental billing)
+  String _falVideoModel = "fal-ai/kling-video/v2/master/image-to-video";
+  String _replicateVideoModel = "wavespeedai/wan-2.1-i2v-480p";
+  bool _enableFreeViralMotion = true;
+  bool _enableFaceSwapEngine = true;
+  bool _enableAutoFoleyDucking = true;
+
   bool _enableCustomHf = true;
   bool _enablePollinations = true;
-  String _pollinationsModel = "flux";
+  String _pollinationsModel = "turbo";
   bool _enablePublicHf = true;
   bool _enableLtx = true;
   bool _enableWan21 = true;
@@ -6361,6 +6379,10 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
     _customVideoSpaceCtrl.dispose();
     _customFaceSwapSpaceCtrl.dispose();
     _hfTokenCtrl.dispose();
+    _falKeyCtrl.dispose();
+    _replicateTokenCtrl.dispose();
+    _runwaySecretCtrl.dispose();
+    _lumaKeyCtrl.dispose();
     _freeTrialCtrl.dispose();
     _pack50Ctrl.dispose();
     _upiCtrl.dispose();
@@ -6414,18 +6436,42 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
             _customFaceSwapSpaceCtrl.text =
                 (aiCfg['custom_faceswap_space'] ?? "").toString();
             _hfTokenCtrl.text = (aiCfg['hf_token'] ?? "").toString();
+            _falKeyCtrl.text = (aiCfg['fal_key'] ?? "").toString();
+            _replicateTokenCtrl.text =
+                (aiCfg['replicate_api_token'] ?? "").toString();
+            _runwaySecretCtrl.text =
+                (aiCfg['runway_api_secret'] ?? "").toString();
+            _lumaKeyCtrl.text = (aiCfg['luma_api_key'] ?? "").toString();
+            _enablePaidVideoEngine = aiCfg['enable_paid_video_engine'] == true;
+            final fm = (aiCfg['fal_video_model'] ??
+                    "fal-ai/kling-video/v2/master/image-to-video")
+                .toString();
+            _falVideoModel = (fm == "fal-ai/wan-i2v" ||
+                    fm == "fal-ai/minimax-video/image-to-video")
+                ? fm
+                : "fal-ai/kling-video/v2/master/image-to-video";
+            final rm = (aiCfg['replicate_video_model'] ??
+                    "wavespeedai/wan-2.1-i2v-480p")
+                .toString();
+            _replicateVideoModel = rm == "kwaivgi/kling-v1.6-pro"
+                ? rm
+                : "wavespeedai/wan-2.1-i2v-480p";
+            _enableFreeViralMotion = aiCfg['enable_free_viral_motion'] != false;
+            _enableFaceSwapEngine = aiCfg['enable_face_swap_engine'] != false;
+            _enableAutoFoleyDucking =
+                aiCfg['enable_auto_foley_ducking'] != false;
             _freeTrialCtrl.text =
-                (aiCfg['free_trial_passes'] ?? 2).toString();
-            _pack50Ctrl.text = (aiCfg['pack_50_passes'] ?? 5).toString();
+                (aiCfg['free_trial_passes'] ?? 1).toString();
+            _pack50Ctrl.text = (aiCfg['pack_50_passes'] ?? 1).toString();
             _upiCtrl.text =
                 (aiCfg['upi_id'] ?? "8269045143@ybl").toString();
             _announcementCtrl.text =
                 (aiCfg['announcement_banner'] ?? "").toString();
             _enableCustomHf = aiCfg['enable_custom_hf'] != false;
             _enablePollinations = aiCfg['enable_pollinations'] != false;
-            final m = (aiCfg['pollinations_model'] ?? "flux").toString();
+            final m = (aiCfg['pollinations_model'] ?? "turbo").toString();
             _pollinationsModel =
-                (m == "turbo" || m == "flux-realism") ? m : "flux";
+                (m == "flux" || m == "flux-realism") ? m : "turbo";
             _enablePublicHf = aiCfg['enable_public_hf_spaces'] != false;
             _enableLtx = aiCfg['enable_ltx_video'] != false;
             _enableWan21 = aiCfg['enable_wan21'] != false;
@@ -6485,8 +6531,18 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
           "custom_video_space": _customVideoSpaceCtrl.text.trim(),
           "custom_faceswap_space": _customFaceSwapSpaceCtrl.text.trim(),
           "hf_token": _hfTokenCtrl.text.trim(),
-          "free_trial_passes": int.tryParse(_freeTrialCtrl.text.trim()) ?? 2,
-          "pack_50_passes": int.tryParse(_pack50Ctrl.text.trim()) ?? 5,
+          "enable_paid_video_engine": _enablePaidVideoEngine,
+          "fal_key": _falKeyCtrl.text.trim(),
+          "fal_video_model": _falVideoModel,
+          "replicate_api_token": _replicateTokenCtrl.text.trim(),
+          "replicate_video_model": _replicateVideoModel,
+          "runway_api_secret": _runwaySecretCtrl.text.trim(),
+          "luma_api_key": _lumaKeyCtrl.text.trim(),
+          "enable_free_viral_motion": _enableFreeViralMotion,
+          "enable_face_swap_engine": _enableFaceSwapEngine,
+          "enable_auto_foley_ducking": _enableAutoFoleyDucking,
+          "free_trial_passes": int.tryParse(_freeTrialCtrl.text.trim()) ?? 1,
+          "pack_50_passes": int.tryParse(_pack50Ctrl.text.trim()) ?? 1,
           "upi_id": _upiCtrl.text.trim(),
           "announcement_banner": _announcementCtrl.text.trim(),
           "enable_custom_hf": _enableCustomHf,
@@ -7810,25 +7866,274 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
                         ),
                       ),
                       const SizedBox(height: 14),
+                      // Master ON/OFF Control Center (Paid Real-Video + Free Viral Motion + Face-Swap + Foley Ducking)
                       Container(
                         padding: const EdgeInsets.all(14),
                         decoration: BoxDecoration(
                           color: const Color(0xFF1B1236),
                           borderRadius: BorderRadius.circular(16),
                           border: Border.all(
-                            color: Colors.white.withOpacity(0.14),
+                            color: _enablePaidVideoEngine
+                                ? const Color(0xFFFFD600)
+                                : const Color(0xFF00E5FF).withOpacity(0.55),
+                            width: 1.4,
                           ),
                         ),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             const Text(
-                              "⚙️ Engine Priority & Live Toggles",
+                              "🎛️ Master ON/OFF Control Center (Engine Switches)",
                               style: TextStyle(
                                 color: Color(0xFFFFD600),
                                 fontSize: 15,
                                 fontWeight: FontWeight.bold,
                               ),
+                            ),
+                            const SizedBox(height: 6),
+                            SwitchListTile(
+                              contentPadding: EdgeInsets.zero,
+                              activeColor: const Color(0xFFFFD600),
+                              title: const Text(
+                                "💎 Paid Real-Video Mode (ENABLE_PAID_VIDEO_ENGINE)",
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.bold,
+                                  color: Color(0xFFFFD600),
+                                ),
+                              ),
+                              subtitle: Text(
+                                _enablePaidVideoEngine
+                                    ? "ON: Kling / Wan I2V / Runway / Luma real video clips active"
+                                    : "OFF (Default): Safe mode — 0 billing, runs Free 3D Parallax Engine",
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: _enablePaidVideoEngine
+                                      ? Colors.amberAccent
+                                      : Colors.greenAccent,
+                                ),
+                              ),
+                              value: _enablePaidVideoEngine,
+                              onChanged: (v) => setState(
+                                  () => _enablePaidVideoEngine = v),
+                            ),
+                            const SizedBox(height: 6),
+                            TextField(
+                              controller: _falKeyCtrl,
+                              obscureText: _hideFalKey,
+                              decoration: InputDecoration(
+                                filled: true,
+                                fillColor: const Color(0xFF0E091D),
+                                border: const OutlineInputBorder(),
+                                labelText: "FAL_KEY (Kling v2 / Wan I2V / Minimax)",
+                                hintText: "fal_key_xxxxxxxx",
+                                suffixIcon: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      icon: Icon(
+                                        _hideFalKey
+                                            ? Icons.visibility
+                                            : Icons.visibility_off,
+                                        color: const Color(0xFFFFD600),
+                                      ),
+                                      onPressed: () => setState(
+                                          () => _hideFalKey = !_hideFalKey),
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(Icons.clear,
+                                          color: Colors.redAccent, size: 18),
+                                      onPressed: () =>
+                                          setState(() => _falKeyCtrl.clear()),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Wrap(
+                              spacing: 6,
+                              runSpacing: 4,
+                              children: [
+                                ("Kling v2", "fal-ai/kling-video/v2/master/image-to-video"),
+                                ("Wan I2V", "fal-ai/wan-i2v"),
+                                ("Minimax", "fal-ai/minimax-video/image-to-video"),
+                              ].map((pair) {
+                                final sel = _falVideoModel == pair.$2;
+                                return ChoiceChip(
+                                  label: Text(pair.$1),
+                                  selected: sel,
+                                  selectedColor: const Color(0xFFFFD600),
+                                  labelStyle: TextStyle(
+                                    color: sel ? Colors.black : Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 11,
+                                  ),
+                                  onSelected: (_) => setState(
+                                      () => _falVideoModel = pair.$2),
+                                );
+                              }).toList(),
+                            ),
+                            const SizedBox(height: 8),
+                            TextField(
+                              controller: _replicateTokenCtrl,
+                              obscureText: _hideReplicateToken,
+                              decoration: InputDecoration(
+                                filled: true,
+                                fillColor: const Color(0xFF0E091D),
+                                border: const OutlineInputBorder(),
+                                labelText: "REPLICATE_API_TOKEN (Wan 2.1 / Kling v1.6)",
+                                hintText: "r8_xxxxxxxx",
+                                suffixIcon: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      icon: Icon(
+                                        _hideReplicateToken
+                                            ? Icons.visibility
+                                            : Icons.visibility_off,
+                                        color: const Color(0xFFFFD600),
+                                      ),
+                                      onPressed: () => setState(() =>
+                                          _hideReplicateToken =
+                                              !_hideReplicateToken),
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(Icons.clear,
+                                          color: Colors.redAccent, size: 18),
+                                      onPressed: () => setState(
+                                          () => _replicateTokenCtrl.clear()),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Wrap(
+                              spacing: 6,
+                              children: [
+                                ("Wan 2.1 I2V", "wavespeedai/wan-2.1-i2v-480p"),
+                                ("Kling v1.6 Pro", "kwaivgi/kling-v1.6-pro"),
+                              ].map((pair) {
+                                final sel = _replicateVideoModel == pair.$2;
+                                return ChoiceChip(
+                                  label: Text(pair.$1),
+                                  selected: sel,
+                                  selectedColor: const Color(0xFF00E5FF),
+                                  labelStyle: TextStyle(
+                                    color: sel ? Colors.black : Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 11,
+                                  ),
+                                  onSelected: (_) => setState(
+                                      () => _replicateVideoModel = pair.$2),
+                                );
+                              }).toList(),
+                            ),
+                            const SizedBox(height: 8),
+                            TextField(
+                              controller: _runwaySecretCtrl,
+                              obscureText: _hideRunwaySecret,
+                              decoration: InputDecoration(
+                                filled: true,
+                                fillColor: const Color(0xFF0E091D),
+                                border: const OutlineInputBorder(),
+                                labelText: "RUNWAY_API_SECRET (Gen-3 / Gen-4)",
+                                hintText: "key_xxxxxxxx",
+                                suffixIcon: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      icon: Icon(
+                                        _hideRunwaySecret
+                                            ? Icons.visibility
+                                            : Icons.visibility_off,
+                                        color: const Color(0xFFFFD600),
+                                      ),
+                                      onPressed: () => setState(() =>
+                                          _hideRunwaySecret =
+                                              !_hideRunwaySecret),
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(Icons.clear,
+                                          color: Colors.redAccent, size: 18),
+                                      onPressed: () => setState(
+                                          () => _runwaySecretCtrl.clear()),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            TextField(
+                              controller: _lumaKeyCtrl,
+                              obscureText: _hideLumaKey,
+                              decoration: InputDecoration(
+                                filled: true,
+                                fillColor: const Color(0xFF0E091D),
+                                border: const OutlineInputBorder(),
+                                labelText: "LUMA_API_KEY (Ray-2)",
+                                hintText: "luma-xxxxxxxx",
+                                suffixIcon: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      icon: Icon(
+                                        _hideLumaKey
+                                            ? Icons.visibility
+                                            : Icons.visibility_off,
+                                        color: const Color(0xFFFFD600),
+                                      ),
+                                      onPressed: () => setState(
+                                          () => _hideLumaKey = !_hideLumaKey),
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(Icons.clear,
+                                          color: Colors.redAccent, size: 18),
+                                      onPressed: () =>
+                                          setState(() => _lumaKeyCtrl.clear()),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            const Divider(color: Colors.white24, height: 22),
+                            SwitchListTile(
+                              contentPadding: EdgeInsets.zero,
+                              activeColor: Colors.greenAccent,
+                              title: const Text(
+                                "🆓 Free Viral Motion & 3D Parallax VFX Engine",
+                                style: TextStyle(fontSize: 13),
+                              ),
+                              subtitle: const Text(
+                                "3D Parallax, Rain/Sparks/Gold-Dust VFX, 0.3s Shake, Clean Front-Face Lip-Sync",
+                                style: TextStyle(fontSize: 11, color: Colors.white60),
+                              ),
+                              value: _enableFreeViralMotion,
+                              onChanged: (v) =>
+                                  setState(() => _enableFreeViralMotion = v),
+                            ),
+                            SwitchListTile(
+                              contentPadding: EdgeInsets.zero,
+                              activeColor: const Color(0xFF00E5FF),
+                              title: const Text(
+                                "🎭 Face-Swap Engine (Hero Face Blend Only)",
+                                style: TextStyle(fontSize: 13),
+                              ),
+                              value: _enableFaceSwapEngine,
+                              onChanged: (v) =>
+                                  setState(() => _enableFaceSwapEngine = v),
+                            ),
+                            SwitchListTile(
+                              contentPadding: EdgeInsets.zero,
+                              activeColor: const Color(0xFF00E5FF),
+                              title: const Text(
+                                "🔊 Auto Foley SFX & BGM Ducking",
+                                style: TextStyle(fontSize: 13),
+                              ),
+                              value: _enableAutoFoleyDucking,
+                              onChanged: (v) =>
+                                  setState(() => _enableAutoFoleyDucking = v),
                             ),
                             SwitchListTile(
                               contentPadding: EdgeInsets.zero,
@@ -7845,7 +8150,7 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
                               contentPadding: EdgeInsets.zero,
                               activeColor: const Color(0xFF00E5FF),
                               title: const Text(
-                                "Priority 2A: Pollinations Parallel Engine",
+                                "Pollinations Staggered Engine (turbo / flux)",
                                 style: TextStyle(fontSize: 13),
                               ),
                               value: _enablePollinations,
@@ -7854,7 +8159,7 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
                             ),
                             Wrap(
                               spacing: 8,
-                              children: ["flux", "turbo", "flux-realism"]
+                              children: ["turbo", "flux", "flux-realism"]
                                   .map(
                                     (m) => ChoiceChip(
                                       label: Text(m),
@@ -7872,51 +8177,6 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
                                     ),
                                   )
                                   .toList(),
-                            ),
-                            SwitchListTile(
-                              contentPadding: EdgeInsets.zero,
-                              activeColor: const Color(0xFF00E5FF),
-                              title: const Text(
-                                "Priority 2B: Public HF Spaces (8s Cap)",
-                                style: TextStyle(fontSize: 13),
-                              ),
-                              value: _enablePublicHf,
-                              onChanged: (v) =>
-                                  setState(() => _enablePublicHf = v),
-                            ),
-                            Wrap(
-                              spacing: 8,
-                              children: [
-                                FilterChip(
-                                  label: const Text("LTX-Video"),
-                                  selected: _enableLtx,
-                                  onSelected: (v) =>
-                                      setState(() => _enableLtx = v),
-                                ),
-                                FilterChip(
-                                  label: const Text("Wan2.1"),
-                                  selected: _enableWan21,
-                                  onSelected: (v) =>
-                                      setState(() => _enableWan21 = v),
-                                ),
-                                FilterChip(
-                                  label: const Text("CogVideoX"),
-                                  selected: _enableCogVideo,
-                                  onSelected: (v) =>
-                                      setState(() => _enableCogVideo = v),
-                                ),
-                              ],
-                            ),
-                            SwitchListTile(
-                              contentPadding: EdgeInsets.zero,
-                              activeColor: Colors.greenAccent,
-                              title: const Text(
-                                "Priority 3: Fast Cinematic Fallback (Zero Hang)",
-                                style: TextStyle(fontSize: 13),
-                              ),
-                              value: _enableLocalFallback,
-                              onChanged: (v) =>
-                                  setState(() => _enableLocalFallback = v),
                             ),
                           ],
                         ),
@@ -7965,7 +8225,7 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
                               label: Text(
                                 _testingServers
                                     ? "Testing..."
-                                    : "⚡ Test All Servers",
+                                    : "⚡ Test All Keys",
                                 style: const TextStyle(
                                   fontWeight: FontWeight.w900,
                                 ),
